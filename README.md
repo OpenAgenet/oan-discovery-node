@@ -23,6 +23,5 @@ work directories; this repository does not own genesis private material.
 
 ## License
 
-This core service repository is licensed under `AGPL-3.0-only`. Commercial or
-alternative licensing may be available from the project maintainers. Brand and
+This core service repository is licensed under `Apache-2.0`. Brand and
 official-node identity rights are reserved separately.
