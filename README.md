@@ -20,3 +20,9 @@ cargo test --workspace -j 1
 Integration tests and benchmarks are run from `oan-examples`. Service-node
 identity material is copied from `oan-design-docs/genesis/nodes` into per-run
 work directories; this repository does not own genesis private material.
+
+## License
+
+This core service repository is licensed under `AGPL-3.0-only`. Commercial or
+alternative licensing may be available from the project maintainers. Brand and
+official-node identity rights are reserved separately.
