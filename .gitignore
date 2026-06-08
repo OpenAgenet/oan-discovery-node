@@ -1,0 +1,12 @@
+/target/
+/target-*/
+/.oan-runtime/
+/.oan-demo-*/
+/.oan-example-*/
+/.oan-benchmark-*/
+/.oan-benchmark-pids/
+/.oan-benchmark-reports/
+/.tmp/
+*.db
+*.db-shm
+*.db-wal
