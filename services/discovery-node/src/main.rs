@@ -193,6 +193,7 @@ struct AppState {
     postgres: Option<PostgresJsonStore>,
     client: reqwest::Client,
     resource_sync_lock: Arc<Mutex<()>>,
+    metrics_runtime: Arc<std::sync::Mutex<DiscoveryMetricsRuntimeState>>,
 }
 
 #[derive(Clone, Debug)]
@@ -219,6 +220,57 @@ struct DiscoveryQueryMetrics {
     returned_count: usize,
     elapsed_ms: u128,
     used_indexed_prefilter: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct DiscoveryMetricsRuntimeState {
+    sync: DiscoverySyncRuntimeMetrics,
+    query: DiscoveryQueryRuntimeMetrics,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct DiscoverySyncRuntimeMetrics {
+    success_count: u64,
+    failure_count: u64,
+    last_total_ms: u128,
+    last_cursor_read_ms: u128,
+    last_cdn_fetch_ms: u128,
+    last_cdn_decode_ms: u128,
+    last_validate_ms: u128,
+    last_db_upsert_ms: u128,
+    last_cursor_write_ms: u128,
+    last_history_write_ms: u128,
+    last_rejected_write_ms: u128,
+    last_items_fetched: usize,
+    last_synced_count: usize,
+    last_rejected_count: usize,
+    max_total_ms: u128,
+    max_cursor_read_ms: u128,
+    max_cdn_fetch_ms: u128,
+    max_cdn_decode_ms: u128,
+    max_validate_ms: u128,
+    max_db_upsert_ms: u128,
+    max_cursor_write_ms: u128,
+    max_history_write_ms: u128,
+    max_rejected_write_ms: u128,
+    last_error: Option<String>,
+    updated_at: Option<chrono::DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct DiscoveryQueryRuntimeMetrics {
+    success_count: u64,
+    failure_count: u64,
+    last_total_ms: u128,
+    last_db_query_ms: u128,
+    last_response_build_ms: u128,
+    last_candidate_count: usize,
+    last_returned_count: usize,
+    max_total_ms: u128,
+    max_db_query_ms: u128,
+    max_response_build_ms: u128,
+    last_error: Option<String>,
+    updated_at: Option<chrono::DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -310,6 +362,9 @@ async fn main() -> Result<()> {
         postgres,
         client: reqwest::Client::new(),
         resource_sync_lock: Arc::new(Mutex::new(())),
+        metrics_runtime: Arc::new(std::sync::Mutex::new(
+            DiscoveryMetricsRuntimeState::default(),
+        )),
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -698,10 +753,12 @@ async fn sync_resources_from_cdn_items(
     request: DiscoverySyncRequest,
     started: Instant,
 ) -> ApiResult<Value> {
+    let cursor_read_started = Instant::now();
     let start_cursor = read_sync_cursor(&state)
         .await
         .map_err(ApiError::internal)?
         .max(0);
+    let cursor_read_ms = cursor_read_started.elapsed().as_millis();
     let target_cursor = request.cursor_hint.unwrap_or_else(|| {
         request
             .items
@@ -714,6 +771,9 @@ async fn sync_resources_from_cdn_items(
     let mut rejected = Vec::new();
     let mut accepted = Vec::<(i64, ResourcePackage)>::new();
     let mut fetched_count = 0usize;
+    let mut cdn_fetch_ms = 0u128;
+    let mut cdn_decode_ms = 0u128;
+    let mut validate_ms = 0u128;
     let mut cursor = start_cursor;
     let mut blocked_cursor: Option<i64> = None;
 
@@ -732,12 +792,14 @@ async fn sync_resources_from_cdn_items(
         fetched_count += 1;
         let encoded_did =
             url::form_urlencoded::byte_serialize(item.resource_did.as_bytes()).collect::<String>();
+        let fetch_started = Instant::now();
         let response = state
             .client
             .get(format!("{cdn_base}/cdn/resources/{encoded_did}"))
             .send()
             .await
             .map_err(|err| ApiError::internal(err.into()))?;
+        cdn_fetch_ms = cdn_fetch_ms.saturating_add(fetch_started.elapsed().as_millis());
         if !response.status().is_success() {
             rejected.push(json!({
                 "resourceDid": item.resource_did,
@@ -747,11 +809,15 @@ async fn sync_resources_from_cdn_items(
             blocked_cursor = Some(item.publication_cursor);
             continue;
         }
+        let decode_started = Instant::now();
         let package: ResourcePackage = response
             .json()
             .await
             .map_err(|err| ApiError::internal(err.into()))?;
+        cdn_decode_ms = cdn_decode_ms.saturating_add(decode_started.elapsed().as_millis());
+        let validate_started = Instant::now();
         if let Err(reason) = validate_notified_resource_package(&item, &package) {
+            validate_ms = validate_ms.saturating_add(validate_started.elapsed().as_millis());
             rejected.push(json!({
                 "resourceDid": item.resource_did,
                 "cursor": item.publication_cursor,
@@ -761,6 +827,7 @@ async fn sync_resources_from_cdn_items(
             continue;
         }
         if let Err(reason) = validate_resource_package_for_index(&package) {
+            validate_ms = validate_ms.saturating_add(validate_started.elapsed().as_millis());
             rejected.push(json!({
                 "resourceDid": package.resource_did,
                 "cursor": item.publication_cursor,
@@ -769,17 +836,56 @@ async fn sync_resources_from_cdn_items(
             blocked_cursor = Some(item.publication_cursor);
             continue;
         }
+        validate_ms = validate_ms.saturating_add(validate_started.elapsed().as_millis());
         cursor = cursor.max(item.publication_cursor);
         accepted.push((item.publication_cursor, package));
     }
 
     let synced = accepted.len();
-    upsert_indexed_resource_packages_batch(&state, &accepted)
-        .await
-        .map_err(ApiError::internal)?;
-    write_sync_cursor(&state, cursor)
-        .await
-        .map_err(ApiError::internal)?;
+    let upsert_started = Instant::now();
+    if let Err(err) = upsert_indexed_resource_packages_batch(&state, &accepted).await {
+        record_discovery_sync_metrics(
+            &state,
+            started.elapsed().as_millis(),
+            cursor_read_ms,
+            cdn_fetch_ms,
+            cdn_decode_ms,
+            validate_ms,
+            upsert_started.elapsed().as_millis(),
+            0,
+            0,
+            0,
+            fetched_count,
+            synced,
+            rejected.len(),
+            Some(err.to_string()),
+        );
+        return Err(ApiError::internal(err));
+    }
+    let db_upsert_ms = upsert_started.elapsed().as_millis();
+    let cursor_write_started = Instant::now();
+    let cursor_write_ms = match write_sync_cursor(&state, cursor).await {
+        Ok(()) => cursor_write_started.elapsed().as_millis(),
+        Err(err) => {
+            record_discovery_sync_metrics(
+                &state,
+                started.elapsed().as_millis(),
+                cursor_read_ms,
+                cdn_fetch_ms,
+                cdn_decode_ms,
+                validate_ms,
+                db_upsert_ms,
+                cursor_write_started.elapsed().as_millis(),
+                0,
+                0,
+                fetched_count,
+                synced,
+                rejected.len(),
+                Some(err.to_string()),
+            );
+            return Err(ApiError::internal(err));
+        }
+    };
     let history = json!({
         "syncedAt": Utc::now(),
         "status": "synced",
@@ -797,12 +903,68 @@ async fn sync_resources_from_cdn_items(
         "backend": if state.postgres.is_some() { "postgres" } else if state.sqlite.is_some() { "sqlite" } else { "json" },
         "deltaUpsert": true
     });
-    write_sync_history_store(&state, history)
-        .await
-        .map_err(ApiError::internal)?;
-    write_rejected_packages(&state, &rejected)
-        .await
-        .map_err(ApiError::internal)?;
+    let history_write_started = Instant::now();
+    let history_write_ms = match write_sync_history_store(&state, history).await {
+        Ok(()) => history_write_started.elapsed().as_millis(),
+        Err(err) => {
+            record_discovery_sync_metrics(
+                &state,
+                started.elapsed().as_millis(),
+                cursor_read_ms,
+                cdn_fetch_ms,
+                cdn_decode_ms,
+                validate_ms,
+                db_upsert_ms,
+                cursor_write_ms,
+                history_write_started.elapsed().as_millis(),
+                0,
+                fetched_count,
+                synced,
+                rejected.len(),
+                Some(err.to_string()),
+            );
+            return Err(ApiError::internal(err));
+        }
+    };
+    let rejected_write_started = Instant::now();
+    let rejected_write_ms = match write_rejected_packages(&state, &rejected).await {
+        Ok(()) => rejected_write_started.elapsed().as_millis(),
+        Err(err) => {
+            record_discovery_sync_metrics(
+                &state,
+                started.elapsed().as_millis(),
+                cursor_read_ms,
+                cdn_fetch_ms,
+                cdn_decode_ms,
+                validate_ms,
+                db_upsert_ms,
+                cursor_write_ms,
+                history_write_ms,
+                rejected_write_started.elapsed().as_millis(),
+                fetched_count,
+                synced,
+                rejected.len(),
+                Some(err.to_string()),
+            );
+            return Err(ApiError::internal(err));
+        }
+    };
+    record_discovery_sync_metrics(
+        &state,
+        started.elapsed().as_millis(),
+        cursor_read_ms,
+        cdn_fetch_ms,
+        cdn_decode_ms,
+        validate_ms,
+        db_upsert_ms,
+        cursor_write_ms,
+        history_write_ms,
+        rejected_write_ms,
+        fetched_count,
+        synced,
+        rejected.len(),
+        None,
+    );
     Ok(Json(json!({
         "status": "synced",
         "syncMode": "authorized-summary",
@@ -897,10 +1059,25 @@ async fn resource_query(
     Json(query): Json<ResourceDiscoveryQuery>,
 ) -> ApiResult<ResourceDiscoveryResponse> {
     let started = Instant::now();
-    let (packages, prefiltered) = query_indexed_resource_packages(&state, &query)
-        .await
-        .map_err(ApiError::internal)?;
+    let db_query_started = Instant::now();
+    let (packages, prefiltered) = match query_indexed_resource_packages(&state, &query).await {
+        Ok(value) => value,
+        Err(err) => {
+            record_discovery_query_metrics(
+                &state,
+                started.elapsed().as_millis(),
+                db_query_started.elapsed().as_millis(),
+                0,
+                0,
+                0,
+                Some(err.to_string()),
+            );
+            return Err(ApiError::internal(err));
+        }
+    };
+    let db_query_ms = db_query_started.elapsed().as_millis();
     let candidate_count = packages.len();
+    let response_build_started = Instant::now();
     let mut candidates = packages
         .into_iter()
         .filter(|package| prefiltered || resource_matches_query(package, &query))
@@ -924,6 +1101,7 @@ async fn resource_query(
         .collect::<Vec<_>>();
     candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
     candidates.truncate(query.limit as usize);
+    let response_build_ms = response_build_started.elapsed().as_millis();
     let metrics = DiscoveryQueryMetrics {
         backend: if state.postgres.is_some() {
             "postgres".to_owned()
@@ -944,6 +1122,15 @@ async fn resource_query(
         metrics.candidate_count,
         metrics.returned_count,
         metrics.elapsed_ms
+    );
+    record_discovery_query_metrics(
+        &state,
+        started.elapsed().as_millis(),
+        db_query_ms,
+        response_build_ms,
+        candidate_count,
+        candidates.len(),
+        None,
     );
     Ok(Json(ResourceDiscoveryResponse {
         discovery_did: state.did,
@@ -985,8 +1172,99 @@ async fn api_status(State(state): State<AppState>) -> ApiResult<Value> {
         "cdnEndpoint": state.config.upstream.cdn_endpoint,
         "indexedResourceCount": indexed_resource_count,
         "lastSync": history.last(),
+        "metricsRuntime": discovery_metrics_runtime_json(&state),
         "rootAuthorizationStatus": bulletin.as_ref().map(|b| discovery_authorization_status(b, &state.did)).unwrap_or_else(|| "unknown".to_owned())
     })))
+}
+
+fn discovery_metrics_runtime_json(state: &AppState) -> Value {
+    state
+        .metrics_runtime
+        .lock()
+        .map(|runtime| serde_json::to_value(&*runtime).unwrap_or_else(|_| json!({})))
+        .unwrap_or_else(|_| json!({"status": "unavailable"}))
+}
+
+fn record_discovery_sync_metrics(
+    state: &AppState,
+    total_ms: u128,
+    cursor_read_ms: u128,
+    cdn_fetch_ms: u128,
+    cdn_decode_ms: u128,
+    validate_ms: u128,
+    db_upsert_ms: u128,
+    cursor_write_ms: u128,
+    history_write_ms: u128,
+    rejected_write_ms: u128,
+    items_fetched: usize,
+    synced_count: usize,
+    rejected_count: usize,
+    error: Option<String>,
+) {
+    if let Ok(mut runtime) = state.metrics_runtime.lock() {
+        if error.is_none() {
+            runtime.sync.success_count = runtime.sync.success_count.saturating_add(1);
+        } else {
+            runtime.sync.failure_count = runtime.sync.failure_count.saturating_add(1);
+        }
+        runtime.sync.last_total_ms = total_ms;
+        runtime.sync.last_cursor_read_ms = cursor_read_ms;
+        runtime.sync.last_cdn_fetch_ms = cdn_fetch_ms;
+        runtime.sync.last_cdn_decode_ms = cdn_decode_ms;
+        runtime.sync.last_validate_ms = validate_ms;
+        runtime.sync.last_db_upsert_ms = db_upsert_ms;
+        runtime.sync.last_cursor_write_ms = cursor_write_ms;
+        runtime.sync.last_history_write_ms = history_write_ms;
+        runtime.sync.last_rejected_write_ms = rejected_write_ms;
+        runtime.sync.last_items_fetched = items_fetched;
+        runtime.sync.last_synced_count = synced_count;
+        runtime.sync.last_rejected_count = rejected_count;
+        if items_fetched > 0 || synced_count > 0 || rejected_count > 0 || error.is_some() {
+            runtime.sync.max_total_ms = runtime.sync.max_total_ms.max(total_ms);
+            runtime.sync.max_cursor_read_ms = runtime.sync.max_cursor_read_ms.max(cursor_read_ms);
+            runtime.sync.max_cdn_fetch_ms = runtime.sync.max_cdn_fetch_ms.max(cdn_fetch_ms);
+            runtime.sync.max_cdn_decode_ms = runtime.sync.max_cdn_decode_ms.max(cdn_decode_ms);
+            runtime.sync.max_validate_ms = runtime.sync.max_validate_ms.max(validate_ms);
+            runtime.sync.max_db_upsert_ms = runtime.sync.max_db_upsert_ms.max(db_upsert_ms);
+            runtime.sync.max_cursor_write_ms =
+                runtime.sync.max_cursor_write_ms.max(cursor_write_ms);
+            runtime.sync.max_history_write_ms =
+                runtime.sync.max_history_write_ms.max(history_write_ms);
+            runtime.sync.max_rejected_write_ms =
+                runtime.sync.max_rejected_write_ms.max(rejected_write_ms);
+        }
+        runtime.sync.last_error = error;
+        runtime.sync.updated_at = Some(Utc::now());
+    }
+}
+
+fn record_discovery_query_metrics(
+    state: &AppState,
+    total_ms: u128,
+    db_query_ms: u128,
+    response_build_ms: u128,
+    candidate_count: usize,
+    returned_count: usize,
+    error: Option<String>,
+) {
+    if let Ok(mut runtime) = state.metrics_runtime.lock() {
+        if error.is_none() {
+            runtime.query.success_count = runtime.query.success_count.saturating_add(1);
+        } else {
+            runtime.query.failure_count = runtime.query.failure_count.saturating_add(1);
+        }
+        runtime.query.last_total_ms = total_ms;
+        runtime.query.last_db_query_ms = db_query_ms;
+        runtime.query.last_response_build_ms = response_build_ms;
+        runtime.query.last_candidate_count = candidate_count;
+        runtime.query.last_returned_count = returned_count;
+        runtime.query.max_total_ms = runtime.query.max_total_ms.max(total_ms);
+        runtime.query.max_db_query_ms = runtime.query.max_db_query_ms.max(db_query_ms);
+        runtime.query.max_response_build_ms =
+            runtime.query.max_response_build_ms.max(response_build_ms);
+        runtime.query.last_error = error;
+        runtime.query.updated_at = Some(Utc::now());
+    }
 }
 
 async fn api_root_authorization(State(state): State<AppState>) -> ApiResult<Value> {
@@ -2179,6 +2457,9 @@ mod tests {
             postgres: None,
             client: reqwest::Client::new(),
             resource_sync_lock: Arc::new(Mutex::new(())),
+            metrics_runtime: Arc::new(std::sync::Mutex::new(
+                DiscoveryMetricsRuntimeState::default(),
+            )),
         }
     }
 
@@ -3049,5 +3330,20 @@ mod tests {
                 .map(|metadata| metadata.resource_type.clone()),
             Some(ResourceType::InfrastructureNode)
         );
+    }
+
+    #[test]
+    fn discovery_runtime_metrics_keep_work_cycle_peaks() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        record_discovery_sync_metrics(&state, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None);
+        record_discovery_sync_metrics(&state, 42, 2, 13, 5, 7, 17, 1, 1, 0, 3, 3, 0, None);
+        record_discovery_sync_metrics(&state, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None);
+
+        let runtime = state.metrics_runtime.lock().unwrap().clone();
+        assert_eq!(runtime.sync.last_total_ms, 1);
+        assert_eq!(runtime.sync.max_total_ms, 42);
+        assert_eq!(runtime.sync.max_cdn_fetch_ms, 13);
+        assert_eq!(runtime.sync.max_db_upsert_ms, 17);
     }
 }
