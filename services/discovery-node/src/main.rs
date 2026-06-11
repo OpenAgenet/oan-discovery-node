@@ -3,9 +3,7 @@
 // Initial author: JINLIANG XU
 // Email: jlxufly@gmail.com
 
-use anyhow::{Context, Result};
-#[cfg(test)]
-use axum::extract::Query;
+use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::{Path as AxumPath, State},
     http::{HeaderValue, Method, StatusCode},
@@ -19,14 +17,14 @@ use oan_core::{CryptoSuite, DidDocument};
 use oan_crypto::signing_key_from_bytes;
 use oan_package::ResourcePackage;
 use oan_protocol::{
-    HealthResponse, ResourceCdnIndexResponse, ResourceDiscoveryCandidate, ResourceDiscoveryQuery,
-    ResourceDiscoveryResponse,
+    HealthResponse, ResourceDiscoveryCandidate, ResourceDiscoveryQuery, ResourceDiscoveryResponse,
 };
 use oan_storage::{DatabaseBackend, DatabaseConfig, JsonStore, PostgresJsonStore, SqliteJsonStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{Postgres, QueryBuilder, Row, Sqlite};
 use std::{
+    collections::BTreeMap,
     env,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -48,8 +46,6 @@ struct DiscoverySyncRequest {
     max_publications: Option<usize>,
     #[serde(rename = "cursorHint", default)]
     cursor_hint: Option<i64>,
-    #[serde(rename = "pageSize", default)]
-    page_size: Option<usize>,
     #[serde(default)]
     items: Vec<DiscoveryNotificationItem>,
 }
@@ -75,14 +71,18 @@ struct DiscoveryNotificationItem {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct IndexedResourceVisibilityRequest {
+    #[serde(rename = "resourceDids")]
+    resource_dids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct Config {
     server: ServerConfig,
     #[serde(default)]
     cors: CorsConfig,
     #[serde(default)]
     debug: DebugConfig,
-    #[serde(default)]
-    sync: SyncConfig,
     upstream: UpstreamConfig,
     paths: PathConfig,
 }
@@ -117,29 +117,6 @@ impl Default for DebugConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-struct SyncConfig {
-    #[serde(default)]
-    enabled: bool,
-    #[serde(default = "default_sync_interval_ms")]
-    interval_ms: u64,
-    #[serde(default = "default_sync_max_publications")]
-    max_publications: usize,
-    #[serde(default = "default_sync_page_size")]
-    page_size: usize,
-}
-
-impl Default for SyncConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            interval_ms: default_sync_interval_ms(),
-            max_publications: default_sync_max_publications(),
-            page_size: default_sync_page_size(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
 struct UpstreamConfig {
     root_endpoint: String,
     #[serde(default)]
@@ -157,18 +134,6 @@ struct PathConfig {
 
 fn default_debug_export_interval_ms() -> u64 {
     2_000
-}
-
-fn default_sync_interval_ms() -> u64 {
-    500
-}
-
-fn default_sync_max_publications() -> usize {
-    1_000
-}
-
-fn default_sync_page_size() -> usize {
-    1_000
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -319,16 +284,16 @@ async fn main() -> Result<()> {
         .route("/discovery/root-authorization", get(api_root_authorization))
         .route("/discovery/authorized-domains", get(api_authorized_domains))
         .route(
-            "/discovery/resources/sync",
-            post(sync_resources_from_cdn_fallback),
-        )
-        .route(
             "/discovery/resources/sync-authorized",
             post(sync_resources_from_authorized_summary),
         )
         .route("/discovery/sync/history", get(api_sync_history))
         .route("/discovery/index/stats", get(api_index_stats))
         .route("/discovery/index/resources", get(api_index_resources))
+        .route(
+            "/discovery/index/resources/visibility",
+            post(api_index_resource_visibility),
+        )
         .route(
             "/discovery/index/resources/{did}",
             get(api_index_resource_detail),
@@ -344,12 +309,6 @@ async fn main() -> Result<()> {
         let debug_state = state.clone();
         tokio::spawn(async move {
             discovery_debug_export_loop(debug_state).await;
-        });
-    }
-    if state.config.sync.enabled {
-        let sync_state = state.clone();
-        tokio::spawn(async move {
-            discovery_resource_sync_loop(sync_state).await;
         });
     }
 
@@ -518,161 +477,6 @@ async fn discovery_debug_export_loop(state: AppState) {
     }
 }
 
-async fn discovery_resource_sync_loop(state: AppState) {
-    let interval_ms = state.config.sync.interval_ms.max(100);
-    loop {
-        let request = DiscoverySyncRequest {
-            max_publications: Some(state.config.sync.max_publications.max(1)),
-            cursor_hint: None,
-            page_size: Some(state.config.sync.page_size.clamp(1, 5_000)),
-            items: Vec::new(),
-        };
-        if let Err(err) =
-            sync_resources_from_cdn_fallback(State(state.clone()), Some(Json(request))).await
-        {
-            eprintln!("discovery resource sync worker failed: {}", err.message);
-        }
-        sleep(TokioDuration::from_millis(interval_ms)).await;
-    }
-}
-
-async fn sync_resources_from_cdn_fallback(
-    State(state): State<AppState>,
-    payload: Option<Json<DiscoverySyncRequest>>,
-) -> ApiResult<Value> {
-    let _sync_guard = state.resource_sync_lock.lock().await;
-    let cdn_base = state
-        .config
-        .upstream
-        .cdn_endpoint
-        .clone()
-        .unwrap_or_else(|| state.config.upstream.root_endpoint.clone())
-        .trim_end_matches('/')
-        .to_owned();
-    let request = payload.map(|Json(value)| value).unwrap_or_default();
-    let started = Instant::now();
-    if !request.items.is_empty() {
-        return Err(ApiError::bad_request(
-            "authorized_summary_requires_sync_authorized_endpoint",
-        ));
-    }
-    let mut rejected = Vec::new();
-    let mut synced = 0usize;
-    let mut pages_fetched = 0usize;
-    let start_cursor = read_sync_cursor(&state)
-        .await
-        .map_err(ApiError::internal)?
-        .max(0);
-    let target_cursor = request.cursor_hint.unwrap_or(i64::MAX).max(start_cursor);
-    let max_publications = request.max_publications.unwrap_or(10_000).max(1);
-    let page_size = request
-        .page_size
-        .unwrap_or(max_publications.min(1_000))
-        .clamp(1, 5_000);
-    let mut cursor = start_cursor;
-    let mut accepted = Vec::new();
-
-    while synced + rejected.len() < max_publications && cursor < target_cursor {
-        let remaining = max_publications.saturating_sub(synced + rejected.len());
-        let limit = page_size.min(remaining).max(1);
-        let response = state
-            .client
-            .get(format!(
-                "{cdn_base}/cdn/resources/index?afterCursor={cursor}&limit={limit}"
-            ))
-            .send()
-            .await
-            .map_err(|err| ApiError::internal(err.into()))?;
-        if !response.status().is_success() {
-            return Err(ApiError {
-                status: response.status(),
-                message: "resource_index_unavailable".to_owned(),
-            });
-        }
-        let value: Value = response
-            .json()
-            .await
-            .map_err(|err| ApiError::internal(err.into()))?;
-        let page = decode_cdn_index_page(value, cursor).map_err(|err| ApiError {
-            status: StatusCode::BAD_GATEWAY,
-            message: format!("resource_index_decode_failed: {err}"),
-        })?;
-        pages_fetched += 1;
-        if page.items.is_empty() {
-            cursor = page.next_cursor.max(cursor);
-            break;
-        }
-        let mut page_accepted = Vec::new();
-        for item in page.items {
-            if item.cursor <= cursor {
-                continue;
-            }
-            if item.cursor > cursor.saturating_add(1) {
-                break;
-            }
-            if item.cursor > target_cursor {
-                break;
-            }
-            let bounded_cursor = item.cursor;
-            if let Err(reason) = validate_resource_package_for_index(&item.package) {
-                rejected.push(json!({
-                    "resourceDid": item.package.resource_did,
-                    "cursor": bounded_cursor,
-                    "reason": reason
-                }));
-                cursor = cursor.max(bounded_cursor);
-                continue;
-            }
-            page_accepted.push((bounded_cursor, item.package));
-            cursor = cursor.max(bounded_cursor);
-        }
-        synced += page_accepted.len();
-        accepted.extend(page_accepted);
-        if !page.has_more || cursor >= target_cursor {
-            break;
-        }
-    }
-    upsert_indexed_resource_packages_batch(&state, &accepted)
-        .await
-        .map_err(ApiError::internal)?;
-    write_sync_cursor(&state, cursor)
-        .await
-        .map_err(ApiError::internal)?;
-    let history = json!({
-        "syncedAt": Utc::now(),
-        "status": "synced",
-        "syncedResourceCount": synced,
-        "rejectedCount": rejected.len(),
-        "elapsedMs": started.elapsed().as_millis(),
-        "fromCursor": start_cursor,
-        "toCursor": cursor,
-        "targetCursor": if target_cursor == i64::MAX { Value::Null } else { json!(target_cursor) },
-        "pagesFetched": pages_fetched,
-        "cursorLag": if target_cursor == i64::MAX { Value::Null } else { json!((target_cursor - cursor).max(0)) },
-        "backend": if state.postgres.is_some() { "postgres" } else if state.sqlite.is_some() { "sqlite" } else { "json" },
-        "deltaUpsert": true
-    });
-    write_sync_history_store(&state, history)
-        .await
-        .map_err(ApiError::internal)?;
-    write_rejected_packages(&state, &rejected)
-        .await
-        .map_err(ApiError::internal)?;
-    Ok(Json(json!({
-        "status": "synced",
-        "syncedResourceCount": synced,
-        "rejectedCount": rejected.len(),
-        "elapsedMs": started.elapsed().as_millis(),
-        "fromCursor": start_cursor,
-        "toCursor": cursor,
-        "targetCursor": if target_cursor == i64::MAX { Value::Null } else { json!(target_cursor) },
-        "pagesFetched": pages_fetched,
-        "cursorLag": if target_cursor == i64::MAX { Value::Null } else { json!((target_cursor - cursor).max(0)) },
-        "deltaUpsert": true,
-        "rejected": rejected
-    })))
-}
-
 async fn sync_resources_from_authorized_summary(
     State(state): State<AppState>,
     Json(request): Json<DiscoverySyncRequest>,
@@ -719,7 +523,16 @@ async fn sync_resources_from_cdn_items(
 
     let mut items = request.items;
     items.sort_by_key(|item| item.publication_cursor);
-    for item in items.into_iter().take(max_publications) {
+    let candidate_items = items
+        .into_iter()
+        .take(max_publications)
+        .filter(|item| item.publication_cursor > start_cursor)
+        .take_while(|item| item.publication_cursor <= target_cursor)
+        .collect::<Vec<_>>();
+    let batch_packages = fetch_cdn_resource_packages_batch(&state, &cdn_base, &candidate_items)
+        .await
+        .unwrap_or_default();
+    for item in candidate_items {
         if item.publication_cursor <= start_cursor {
             continue;
         }
@@ -730,27 +543,32 @@ async fn sync_resources_from_cdn_items(
             break;
         }
         fetched_count += 1;
-        let encoded_did =
-            url::form_urlencoded::byte_serialize(item.resource_did.as_bytes()).collect::<String>();
-        let response = state
-            .client
-            .get(format!("{cdn_base}/cdn/resources/{encoded_did}"))
-            .send()
-            .await
-            .map_err(|err| ApiError::internal(err.into()))?;
-        if !response.status().is_success() {
+        let package = if let Some(package) = batch_packages.get(&item.resource_did) {
+            package.clone()
+        } else {
+            match fetch_cdn_resource_package(&state, &cdn_base, &item.resource_did).await {
+                Ok(Some(package)) => package,
+                Ok(None) => {
+                    rejected.push(json!({
+                        "resourceDid": item.resource_did,
+                        "cursor": item.publication_cursor,
+                        "reason": "resource_package_unavailable"
+                    }));
+                    blocked_cursor = Some(item.publication_cursor);
+                    continue;
+                }
+                Err(err) => return Err(ApiError::internal(err)),
+            }
+        };
+        if package.resource_did != item.resource_did {
             rejected.push(json!({
                 "resourceDid": item.resource_did,
                 "cursor": item.publication_cursor,
-                "reason": "resource_package_unavailable"
+                "reason": "resource_did_mismatch"
             }));
             blocked_cursor = Some(item.publication_cursor);
             continue;
         }
-        let package: ResourcePackage = response
-            .json()
-            .await
-            .map_err(|err| ApiError::internal(err.into()))?;
         if let Err(reason) = validate_notified_resource_package(&item, &package) {
             rejected.push(json!({
                 "resourceDid": item.resource_did,
@@ -821,6 +639,71 @@ async fn sync_resources_from_cdn_items(
     })))
 }
 
+async fn fetch_cdn_resource_packages_batch(
+    state: &AppState,
+    cdn_base: &str,
+    items: &[DiscoveryNotificationItem],
+) -> Result<BTreeMap<String, ResourcePackage>> {
+    if items.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let resource_dids = items
+        .iter()
+        .map(|item| item.resource_did.clone())
+        .collect::<Vec<_>>();
+    let response = state
+        .client
+        .post(format!("{cdn_base}/cdn/resources/batch-get"))
+        .json(&json!({ "resourceDids": resource_dids }))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Ok(BTreeMap::new());
+    }
+    let value: Value = response.json().await?;
+    let mut packages = BTreeMap::new();
+    for item in value
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let Some(resource_did) = item.get("resourceDid").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(package_value) = item.get("package") else {
+            continue;
+        };
+        let package = serde_json::from_value::<ResourcePackage>(package_value.clone())?;
+        packages.insert(resource_did.to_owned(), package);
+    }
+    Ok(packages)
+}
+
+async fn fetch_cdn_resource_package(
+    state: &AppState,
+    cdn_base: &str,
+    resource_did: &str,
+) -> Result<Option<ResourcePackage>> {
+    let encoded_did =
+        url::form_urlencoded::byte_serialize(resource_did.as_bytes()).collect::<String>();
+    let response = state
+        .client
+        .get(format!("{cdn_base}/cdn/resources/{encoded_did}"))
+        .send()
+        .await?;
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(anyhow!(
+            "resource_package_unavailable:{}",
+            response.status()
+        ));
+    }
+    Ok(Some(response.json::<ResourcePackage>().await?))
+}
+
 fn validate_notified_resource_package(
     item: &DiscoveryNotificationItem,
     package: &ResourcePackage,
@@ -854,42 +737,6 @@ fn validate_notified_resource_package(
         return Err("capability_tags_mismatch".to_owned());
     }
     Ok(())
-}
-
-fn decode_cdn_index_page(value: Value, after_cursor: i64) -> Result<ResourceCdnIndexResponse> {
-    if value.get("nextCursor").is_some() {
-        return Ok(serde_json::from_value(value)?);
-    }
-    let packages = serde_json::from_value::<Vec<ResourcePackage>>(
-        value["items"]
-            .as_array()
-            .cloned()
-            .map(Value::Array)
-            .unwrap_or_else(|| {
-                Value::Array(
-                    value["resources"]
-                        .as_object()
-                        .map(|map| map.values().cloned().collect())
-                        .unwrap_or_default(),
-                )
-            }),
-    )?;
-    let items = packages
-        .into_iter()
-        .enumerate()
-        .map(|(index, package)| oan_protocol::ResourceCdnIndexItem {
-            cursor: after_cursor + index as i64 + 1,
-            package,
-        })
-        .collect::<Vec<_>>();
-    let next_cursor = items.last().map(|item| item.cursor).unwrap_or(after_cursor);
-    Ok(ResourceCdnIndexResponse {
-        count: items.len(),
-        items,
-        after_cursor,
-        next_cursor,
-        has_more: false,
-    })
 }
 
 async fn resource_query(
@@ -1056,8 +903,7 @@ async fn api_index_stats(State(state): State<AppState>) -> ApiResult<Value> {
             "capabilityTagCounts": tag_counts,
             "backend": "postgres",
             "indexedStats": true,
-            "syncCursor": sync_cursor,
-            "syncWorkerEnabled": state.config.sync.enabled
+            "syncCursor": sync_cursor
         })));
     }
     let packages = read_indexed_resource_packages(&state)
@@ -1084,8 +930,7 @@ async fn api_index_stats(State(state): State<AppState>) -> ApiResult<Value> {
         "capabilityTagCounts": tag_counts,
         "backend": if state.sqlite.is_some() { "sqlite" } else { "json" },
         "indexedStats": state.sqlite.is_some(),
-        "syncCursor": sync_cursor,
-        "syncWorkerEnabled": state.config.sync.enabled
+        "syncCursor": sync_cursor
     })))
 }
 
@@ -1112,16 +957,27 @@ async fn api_index_resources(State(state): State<AppState>) -> ApiResult<Value> 
     Ok(Json(json!({ "items": items, "count": items.len() })))
 }
 
+async fn api_index_resource_visibility(
+    State(state): State<AppState>,
+    Json(request): Json<IndexedResourceVisibilityRequest>,
+) -> ApiResult<Value> {
+    let visible = indexed_resource_visibility(&state, &request.resource_dids)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "resourceDids": request.resource_dids,
+        "visible": visible,
+        "visibleCount": visible.len()
+    })))
+}
+
 async fn api_index_resource_detail(
     State(state): State<AppState>,
     AxumPath(did): AxumPath<String>,
 ) -> ApiResult<Value> {
-    let packages = read_indexed_resource_packages(&state)
+    let package = read_indexed_resource_package(&state, &did)
         .await
         .map_err(ApiError::internal)?;
-    let package = packages
-        .into_iter()
-        .find(|package| package.resource_did == did);
     Ok(Json(json!({ "resourceDid": did, "package": package })))
 }
 
@@ -1477,6 +1333,52 @@ async fn read_indexed_resource_package(
         .unwrap_or_default()
         .into_iter()
         .find(|package| package.resource_did == did))
+}
+
+async fn indexed_resource_visibility(state: &AppState, dids: &[String]) -> Result<Vec<String>> {
+    if dids.is_empty() {
+        return Ok(Vec::new());
+    }
+    if let Some(sqlite) = &state.sqlite {
+        let mut visible = Vec::new();
+        for chunk in dids.chunks(500) {
+            let mut builder = QueryBuilder::<Sqlite>::new(format!(
+                "SELECT resource_did FROM {DISCOVERY_PACKAGE_TABLE} WHERE resource_did IN ("
+            ));
+            let mut separated = builder.separated(", ");
+            for did in chunk {
+                separated.push_bind(did);
+            }
+            separated.push_unseparated(")");
+            let rows = builder.build().fetch_all(sqlite.pool()).await?;
+            visible.extend(rows.into_iter().map(|row| row.get::<String, _>(0)));
+        }
+        return Ok(visible);
+    }
+    if let Some(postgres) = &state.postgres {
+        let rows = sqlx::query(&format!(
+            "SELECT resource_did FROM {DISCOVERY_PACKAGE_TABLE} WHERE resource_did = ANY($1)"
+        ))
+        .bind(dids)
+        .fetch_all(postgres.pool())
+        .await?;
+        return Ok(rows
+            .into_iter()
+            .map(|row| row.get::<String, _>(0))
+            .collect());
+    }
+    let visible = state
+        .index
+        .read::<Vec<ResourcePackage>>("resource-capabilities.json")
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|package| {
+            dids.iter()
+                .any(|did| did == &package.resource_did)
+                .then_some(package.resource_did)
+        })
+        .collect();
+    Ok(visible)
 }
 
 async fn query_indexed_resource_packages(
@@ -2162,7 +2064,6 @@ mod tests {
                 },
                 cors: CorsConfig::default(),
                 debug: DebugConfig::default(),
-                sync: SyncConfig::default(),
                 upstream: UpstreamConfig {
                     root_endpoint: "http://127.0.0.1:8001".to_owned(),
                     cdn_endpoint: Some("http://127.0.0.1:8003".to_owned()),
@@ -2328,7 +2229,6 @@ mod tests {
         assert_eq!(stats.0["indexedResourceCount"], 1);
         assert_eq!(stats.0["resourceTypeCounts"]["skill"], 1);
         assert_eq!(stats.0["syncCursor"], 0);
-        assert_eq!(stats.0["syncWorkerEnabled"], false);
     }
 
     #[tokio::test]
@@ -2467,6 +2367,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_index_resource_visibility_returns_only_indexed_dids() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        let package = sample_resource_package();
+        upsert_indexed_resource_package(&state, 9, &package)
+            .await
+            .unwrap();
+
+        let response = api_index_resource_visibility(
+            State(state),
+            Json(IndexedResourceVisibilityRequest {
+                resource_dids: vec![
+                    package.resource_did.clone(),
+                    "did:oan:SKLG:not-found".to_owned(),
+                ],
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0["visibleCount"], 1);
+        assert_eq!(response.0["visible"][0], package.resource_did);
+    }
+
+    #[tokio::test]
     async fn resource_query_reports_no_candidates_for_indexed_mismatch() {
         let dir = tempdir().unwrap();
         let state = app_state_with_sqlite(dir.path()).await;
@@ -2518,76 +2443,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_resources_from_cdn_accepts_valid_resources_and_rejects_invalid_ones() {
-        let dir = tempdir().unwrap();
-        let valid = sample_resource_package();
-        let mut invalid = sample_resource_package();
-        invalid.resource_did = "did:oan:SKLG:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned();
-        invalid.metadata.resource_did = invalid.resource_did.clone();
-        invalid.did_document.id = invalid.resource_did.clone();
-
-        let app = Router::new().route(
-            "/cdn/resources/index",
-            get({
-                let valid = valid.clone();
-                let invalid = invalid.clone();
-                move || async move { Json(json!({"items": [valid, invalid]})) }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let mut state = app_state(dir.path());
-        state.config.upstream.cdn_endpoint = Some(format!("http://{addr}"));
-        let response = sync_resources_from_cdn_fallback(State(state.clone()), None)
-            .await
-            .unwrap();
-
-        assert_eq!(response.0["syncedResourceCount"], 1);
-        assert_eq!(response.0["rejectedCount"], 1);
-        assert_eq!(response.0["deltaUpsert"], true);
-        assert!(response.0["elapsedMs"].as_u64().is_some());
-        let indexed = read_indexed_resource_packages(&state).await.unwrap();
-        assert_eq!(indexed.len(), 1);
-        assert_eq!(indexed[0].resource_did, resource_did());
-    }
-
-    #[tokio::test]
-    async fn sync_resources_from_cdn_fallback_rejects_authorized_summary_items() {
-        let dir = tempdir().unwrap();
-        let package = sample_resource_package();
-        let state = app_state_with_sqlite(dir.path()).await;
-        let error = sync_resources_from_cdn_fallback(
-            State(state),
-            Some(Json(DiscoverySyncRequest {
-                max_publications: Some(10),
-                cursor_hint: Some(1),
-                page_size: None,
-                items: vec![DiscoveryNotificationItem {
-                    resource_did: package.resource_did,
-                    package_version: package.package_version,
-                    publication_cursor: 1,
-                    package_hash: package.package_hash,
-                    metadata_hash: package.metadata_hash,
-                    did_document_hash: package.did_document_hash,
-                    resource_type: Some("skill".to_owned()),
-                    capability_tags: package.metadata.capability_tags,
-                }],
-            })),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            error.message,
-            "authorized_summary_requires_sync_authorized_endpoint"
-        );
-    }
-
-    #[tokio::test]
     async fn sync_resources_from_authorized_summary_fetches_only_notified_items() {
         let dir = tempdir().unwrap();
         let package = sample_resource_package();
@@ -2602,16 +2457,31 @@ mod tests {
                 }),
             )
             .route(
-                "/cdn/resources/{*did}",
-                get({
+                "/cdn/resources/batch-get",
+                post({
                     let package = package.clone();
-                    move |AxumPath(did): AxumPath<String>| {
+                    move || {
                         let package = package.clone();
                         async move {
-                            assert_eq!(did.trim_start_matches('/'), package.resource_did);
-                            Json(package)
+                            Json(json!({
+                                "requestedCount": 1,
+                                "foundCount": 1,
+                                "items": [{
+                                    "resourceDid": package.resource_did,
+                                    "package": package
+                                }]
+                            }))
                         }
                     }
+                }),
+            )
+            .route(
+                "/cdn/resources/{*did}",
+                get(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "single_resource_get_should_not_be_called"})),
+                    )
                 }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2627,7 +2497,6 @@ mod tests {
             Json(DiscoverySyncRequest {
                 max_publications: Some(10),
                 cursor_hint: Some(7),
-                page_size: None,
                 items: vec![DiscoveryNotificationItem {
                     resource_did: package.resource_did.clone(),
                     package_version: package.package_version.clone(),
@@ -2681,7 +2550,6 @@ mod tests {
             Json(DiscoverySyncRequest {
                 max_publications: Some(10),
                 cursor_hint: Some(9),
-                page_size: None,
                 items: vec![DiscoveryNotificationItem {
                     resource_did: package.resource_did.clone(),
                     package_version: package.package_version.clone(),
@@ -2743,7 +2611,6 @@ mod tests {
             Json(DiscoverySyncRequest {
                 max_publications: Some(10),
                 cursor_hint: Some(2),
-                page_size: None,
                 items: vec![
                     DiscoveryNotificationItem {
                         resource_did: first.resource_did.clone(),
@@ -2781,197 +2648,6 @@ mod tests {
         assert_eq!(response.0["toCursor"], 1);
         assert_eq!(response.0["blockedCursor"], 2);
         assert_eq!(read_sync_cursor(&state).await.unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn sync_resources_from_cdn_uses_paginated_cursor_state() {
-        let dir = tempdir().unwrap();
-        let first = sample_resource_package();
-        let second =
-            sample_resource_package_with_did("did:oan:SKLG:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu");
-        let app = Router::new().route(
-            "/cdn/resources/index",
-            get({
-                let first = first.clone();
-                let second = second.clone();
-                move |Query(query): Query<std::collections::BTreeMap<String, String>>| {
-                    let first = first.clone();
-                    let second = second.clone();
-                    async move {
-                        let after = query
-                            .get("afterCursor")
-                            .and_then(|value| value.parse::<i64>().ok())
-                            .unwrap_or(0);
-                        if after < 1 {
-                            Json(json!({
-                                "items": [{"cursor": 1, "package": first}],
-                                "count": 1,
-                                "afterCursor": after,
-                                "nextCursor": 1,
-                                "hasMore": true
-                            }))
-                        } else {
-                            Json(json!({
-                                "items": [{"cursor": 2, "package": second}],
-                                "count": 1,
-                                "afterCursor": after,
-                                "nextCursor": 2,
-                                "hasMore": false
-                            }))
-                        }
-                    }
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let mut state = app_state_with_sqlite(dir.path()).await;
-        state.config.upstream.cdn_endpoint = Some(format!("http://{addr}"));
-        let response = sync_resources_from_cdn_fallback(
-            State(state.clone()),
-            Some(Json(DiscoverySyncRequest {
-                max_publications: Some(10),
-                cursor_hint: Some(2),
-                page_size: Some(1),
-                items: Vec::new(),
-            })),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(response.0["syncedResourceCount"], 2);
-        assert_eq!(response.0["pagesFetched"], 2);
-        assert_eq!(response.0["fromCursor"], 0);
-        assert_eq!(response.0["toCursor"], 2);
-        assert_eq!(read_sync_cursor(&state).await.unwrap(), 2);
-        assert_eq!(count_indexed_resource_packages(&state).await.unwrap(), 2);
-    }
-
-    #[tokio::test]
-    async fn sync_resources_from_cdn_does_not_index_beyond_root_target_cursor() {
-        let dir = tempdir().unwrap();
-        let first = sample_resource_package();
-        let second =
-            sample_resource_package_with_did("did:oan:SKLG:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu");
-        let second_did = second.resource_did.clone();
-        let app = Router::new().route(
-            "/cdn/resources/index",
-            get(
-                move |Query(query): Query<std::collections::BTreeMap<String, String>>| {
-                    let first = first.clone();
-                    let second = second.clone();
-                    async move {
-                        let after = query
-                            .get("afterCursor")
-                            .and_then(|value| value.parse::<i64>().ok())
-                            .unwrap_or(0);
-                        Json(json!({
-                            "items": [
-                                {"cursor": 1, "package": first},
-                                {"cursor": 2, "package": second}
-                            ],
-                            "count": 2,
-                            "afterCursor": after,
-                            "nextCursor": 2,
-                            "hasMore": false
-                        }))
-                    }
-                },
-            ),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let mut state = app_state_with_sqlite(dir.path()).await;
-        state.config.upstream.cdn_endpoint = Some(format!("http://{addr}"));
-        let response = sync_resources_from_cdn_fallback(
-            State(state.clone()),
-            Some(Json(DiscoverySyncRequest {
-                max_publications: Some(10),
-                cursor_hint: Some(1),
-                page_size: Some(10),
-                items: Vec::new(),
-            })),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(response.0["syncedResourceCount"], 1);
-        assert_eq!(response.0["toCursor"], 1);
-        assert_eq!(read_sync_cursor(&state).await.unwrap(), 1);
-        assert!(read_indexed_resource_package(&state, &second_did)
-            .await
-            .unwrap()
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn sync_resources_from_cdn_stops_before_publication_cursor_gap() {
-        let dir = tempdir().unwrap();
-        let first = sample_resource_package();
-        let third =
-            sample_resource_package_with_did("did:oan:SKLG:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu");
-        let third_did = third.resource_did.clone();
-        let app = Router::new().route(
-            "/cdn/resources/index",
-            get(
-                move |Query(query): Query<std::collections::BTreeMap<String, String>>| {
-                    let first = first.clone();
-                    let third = third.clone();
-                    async move {
-                        let after = query
-                            .get("afterCursor")
-                            .and_then(|value| value.parse::<i64>().ok())
-                            .unwrap_or(0);
-                        Json(json!({
-                            "items": [
-                                {"cursor": 1, "package": first},
-                                {"cursor": 3, "package": third}
-                            ],
-                            "count": 2,
-                            "afterCursor": after,
-                            "nextCursor": 3,
-                            "hasMore": false
-                        }))
-                    }
-                },
-            ),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let mut state = app_state_with_sqlite(dir.path()).await;
-        state.config.upstream.cdn_endpoint = Some(format!("http://{addr}"));
-        let response = sync_resources_from_cdn_fallback(
-            State(state.clone()),
-            Some(Json(DiscoverySyncRequest {
-                max_publications: Some(10),
-                cursor_hint: Some(3),
-                page_size: Some(10),
-                items: Vec::new(),
-            })),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(response.0["syncedResourceCount"], 1);
-        assert_eq!(response.0["toCursor"], 1);
-        assert_eq!(response.0["cursorLag"], 2);
-        assert_eq!(read_sync_cursor(&state).await.unwrap(), 1);
-        assert!(read_indexed_resource_package(&state, &third_did)
-            .await
-            .unwrap()
-            .is_none());
     }
 
     #[tokio::test]
