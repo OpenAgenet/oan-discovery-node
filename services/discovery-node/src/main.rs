@@ -29,7 +29,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration as StdDuration, Instant},
 };
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration as TokioDuration};
@@ -38,6 +38,7 @@ use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 const DISCOVERY_SYNC_STATE_TABLE: &str = "discovery_sync_state";
 const DISCOVERY_PACKAGE_TABLE: &str = "discovery_packages";
 const DISCOVERY_REJECTED_TABLE: &str = "discovery_rejected_packages";
+const DISCOVERY_INDEX_STATS_CACHE_TTL_MS: u64 = 500;
 const DISCOVERY_CDN_CURSOR_KEY: &str = "cdn_publication_cursor";
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -158,6 +159,13 @@ struct AppState {
     postgres: Option<PostgresJsonStore>,
     client: reqwest::Client,
     resource_sync_lock: Arc<Mutex<()>>,
+    index_stats_cache: Arc<Mutex<Option<CachedIndexStats>>>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedIndexStats {
+    captured_at: Instant,
+    body: Value,
 }
 
 #[derive(Clone, Debug)]
@@ -275,6 +283,7 @@ async fn main() -> Result<()> {
         postgres,
         client: reqwest::Client::new(),
         resource_sync_lock: Arc::new(Mutex::new(())),
+        index_stats_cache: Arc::new(Mutex::new(None)),
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -871,8 +880,17 @@ async fn api_sync_history(State(state): State<AppState>) -> ApiResult<Value> {
 }
 
 async fn api_index_stats(State(state): State<AppState>) -> ApiResult<Value> {
+    if let Ok(cache) = state.index_stats_cache.try_lock() {
+        if let Some(cached) = cache.as_ref() {
+            if cached.captured_at.elapsed()
+                <= StdDuration::from_millis(DISCOVERY_INDEX_STATS_CACHE_TTL_MS)
+            {
+                return Ok(Json(cached.body.clone()));
+            }
+        }
+    }
     let sync_cursor = read_sync_cursor(&state).await.map_err(ApiError::internal)?;
-    if let Some(postgres) = &state.postgres {
+    let body = if let Some(postgres) = &state.postgres {
         let total_row = sqlx::query(&format!("SELECT COUNT(*) FROM {DISCOVERY_PACKAGE_TABLE}"))
             .fetch_one(postgres.pool())
             .await
@@ -897,41 +915,49 @@ async fn api_index_stats(State(state): State<AppState>) -> ApiResult<Value> {
         for row in tag_rows {
             tag_counts.insert(row.get::<String, _>(0), json!(row.get::<i64, _>(1)));
         }
-        return Ok(Json(json!({
+        json!({
             "indexedResourceCount": total_row.get::<i64, _>(0),
             "resourceTypeCounts": resource_type_counts,
             "capabilityTagCounts": tag_counts,
             "backend": "postgres",
             "indexedStats": true,
             "syncCursor": sync_cursor
-        })));
-    }
-    let packages = read_indexed_resource_packages(&state)
-        .await
-        .map_err(ApiError::internal)?;
-    let mut tag_counts = serde_json::Map::new();
-    let mut resource_type_counts = serde_json::Map::new();
-    for package in &packages {
-        let resource_type = package.resource_type.as_str();
-        let next_type = resource_type_counts
-            .get(resource_type)
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-            + 1;
-        resource_type_counts.insert(resource_type.to_owned(), json!(next_type));
-        for tag in &package.metadata.capability_tags {
-            let next = tag_counts.get(tag).and_then(Value::as_u64).unwrap_or(0) + 1;
-            tag_counts.insert(tag.clone(), json!(next));
+        })
+    } else {
+        let packages = read_indexed_resource_packages(&state)
+            .await
+            .map_err(ApiError::internal)?;
+        let mut tag_counts = serde_json::Map::new();
+        let mut resource_type_counts = serde_json::Map::new();
+        for package in &packages {
+            let resource_type = package.resource_type.as_str();
+            let next_type = resource_type_counts
+                .get(resource_type)
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                + 1;
+            resource_type_counts.insert(resource_type.to_owned(), json!(next_type));
+            for tag in &package.metadata.capability_tags {
+                let next = tag_counts.get(tag).and_then(Value::as_u64).unwrap_or(0) + 1;
+                tag_counts.insert(tag.clone(), json!(next));
+            }
         }
+        json!({
+            "indexedResourceCount": packages.len(),
+            "resourceTypeCounts": resource_type_counts,
+            "capabilityTagCounts": tag_counts,
+            "backend": if state.sqlite.is_some() { "sqlite" } else { "json" },
+            "indexedStats": state.sqlite.is_some(),
+            "syncCursor": sync_cursor
+        })
+    };
+    if let Ok(mut cache) = state.index_stats_cache.try_lock() {
+        *cache = Some(CachedIndexStats {
+            captured_at: Instant::now(),
+            body: body.clone(),
+        });
     }
-    Ok(Json(json!({
-        "indexedResourceCount": packages.len(),
-        "resourceTypeCounts": resource_type_counts,
-        "capabilityTagCounts": tag_counts,
-        "backend": if state.sqlite.is_some() { "sqlite" } else { "json" },
-        "indexedStats": state.sqlite.is_some(),
-        "syncCursor": sync_cursor
-    })))
+    Ok(Json(body))
 }
 
 async fn api_index_resources(State(state): State<AppState>) -> ApiResult<Value> {
@@ -2080,6 +2106,7 @@ mod tests {
             postgres: None,
             client: reqwest::Client::new(),
             resource_sync_lock: Arc::new(Mutex::new(())),
+            index_stats_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2229,6 +2256,35 @@ mod tests {
         assert_eq!(stats.0["indexedResourceCount"], 1);
         assert_eq!(stats.0["resourceTypeCounts"]["skill"], 1);
         assert_eq!(stats.0["syncCursor"], 0);
+    }
+
+    #[tokio::test]
+    async fn api_index_stats_reuses_short_lived_cache() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let first = sample_resource_package_with_did("did:oan:resource:first");
+        write_indexed_resource_packages(&state, std::slice::from_ref(&first))
+            .await
+            .unwrap();
+
+        let initial = api_index_stats(State(state.clone())).await.unwrap();
+        assert_eq!(initial.0["indexedResourceCount"], 1);
+
+        let second = sample_resource_package_with_did("did:oan:resource:second");
+        write_indexed_resource_packages(&state, &[first, second])
+            .await
+            .unwrap();
+
+        let cached = api_index_stats(State(state.clone())).await.unwrap();
+        assert_eq!(cached.0["indexedResourceCount"], 1);
+
+        sleep(TokioDuration::from_millis(
+            DISCOVERY_INDEX_STATS_CACHE_TTL_MS + 50,
+        ))
+        .await;
+
+        let refreshed = api_index_stats(State(state)).await.unwrap();
+        assert_eq!(refreshed.0["indexedResourceCount"], 2);
     }
 
     #[tokio::test]
