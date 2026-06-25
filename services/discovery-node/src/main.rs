@@ -14,7 +14,7 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
 use oan_core::{CryptoSuite, DidDocument};
-use oan_crypto::signing_key_from_bytes;
+use oan_crypto::{sha256_hex, signing_key_from_bytes};
 use oan_package::ResourcePackage;
 use oan_protocol::{
     HealthResponse, ResourceDiscoveryCandidate, ResourceDiscoveryQuery, ResourceDiscoveryResponse,
@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{Postgres, QueryBuilder, Row, Sqlite};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     env,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -38,8 +38,10 @@ use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 const DISCOVERY_SYNC_STATE_TABLE: &str = "discovery_sync_state";
 const DISCOVERY_PACKAGE_TABLE: &str = "discovery_packages";
 const DISCOVERY_REJECTED_TABLE: &str = "discovery_rejected_packages";
+const DISCOVERY_SEMANTIC_INDEX_TABLE: &str = "discovery_semantic_index";
 const DISCOVERY_INDEX_STATS_CACHE_TTL_MS: u64 = 500;
 const DISCOVERY_CDN_CURSOR_KEY: &str = "cdn_publication_cursor";
+const DEFAULT_SEMANTIC_DIMENSION: usize = 64;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct DiscoverySyncRequest {
@@ -84,6 +86,8 @@ struct Config {
     cors: CorsConfig,
     #[serde(default)]
     debug: DebugConfig,
+    #[serde(default, rename = "semanticSearch")]
+    semantic_search: SemanticSearchConfig,
     upstream: UpstreamConfig,
     paths: PathConfig,
 }
@@ -138,6 +142,167 @@ fn default_debug_export_interval_ms() -> u64 {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct SemanticSearchConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_semantic_engine")]
+    engine: String,
+    #[serde(default = "default_semantic_fallback")]
+    fallback: String,
+    #[serde(default = "default_semantic_mode", rename = "defaultMode")]
+    default_mode: String,
+    #[serde(
+        default = "default_semantic_candidate_multiplier",
+        rename = "candidateMultiplier"
+    )]
+    candidate_multiplier: u32,
+    #[serde(default = "default_semantic_max_candidates", rename = "maxCandidates")]
+    max_candidates: u32,
+    #[serde(
+        default = "default_semantic_explain_enabled",
+        rename = "explainEnabled"
+    )]
+    explain_enabled: bool,
+    #[serde(default)]
+    embedding: SemanticEmbeddingConfig,
+    #[serde(default)]
+    filters: SemanticFilterConfig,
+}
+
+impl Default for SemanticSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            engine: default_semantic_engine(),
+            fallback: default_semantic_fallback(),
+            default_mode: default_semantic_mode(),
+            candidate_multiplier: default_semantic_candidate_multiplier(),
+            max_candidates: default_semantic_max_candidates(),
+            explain_enabled: default_semantic_explain_enabled(),
+            embedding: SemanticEmbeddingConfig::default(),
+            filters: SemanticFilterConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SemanticEmbeddingConfig {
+    #[serde(default = "default_semantic_embedding_provider")]
+    provider: String,
+    #[serde(default, rename = "modelPath")]
+    model_path: Option<String>,
+    #[serde(default = "default_semantic_embedding_model", rename = "modelName")]
+    model_name: String,
+    #[serde(default = "default_semantic_dimension")]
+    dimension: usize,
+    #[serde(
+        default = "default_semantic_embedding_timeout_ms",
+        rename = "timeoutMs"
+    )]
+    timeout_ms: u64,
+    #[serde(
+        default = "default_semantic_embedding_batch_size",
+        rename = "batchSize"
+    )]
+    batch_size: usize,
+}
+
+impl Default for SemanticEmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_semantic_embedding_provider(),
+            model_path: None,
+            model_name: default_semantic_embedding_model(),
+            dimension: default_semantic_dimension(),
+            timeout_ms: default_semantic_embedding_timeout_ms(),
+            batch_size: default_semantic_embedding_batch_size(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SemanticFilterConfig {
+    #[serde(
+        default = "default_semantic_resource_type_filter",
+        rename = "resourceType"
+    )]
+    resource_type: String,
+    #[serde(
+        default = "default_semantic_capability_tags_filter",
+        rename = "capabilityTags"
+    )]
+    capability_tags: String,
+    #[serde(default = "default_semantic_protocol_filter")]
+    protocol: String,
+}
+
+impl Default for SemanticFilterConfig {
+    fn default() -> Self {
+        Self {
+            resource_type: default_semantic_resource_type_filter(),
+            capability_tags: default_semantic_capability_tags_filter(),
+            protocol: default_semantic_protocol_filter(),
+        }
+    }
+}
+
+fn default_semantic_engine() -> String {
+    "pgvector".to_owned()
+}
+
+fn default_semantic_fallback() -> String {
+    "keyword".to_owned()
+}
+
+fn default_semantic_mode() -> String {
+    "hybrid".to_owned()
+}
+
+fn default_semantic_candidate_multiplier() -> u32 {
+    8
+}
+
+fn default_semantic_max_candidates() -> u32 {
+    500
+}
+
+fn default_semantic_explain_enabled() -> bool {
+    true
+}
+
+fn default_semantic_embedding_provider() -> String {
+    "deterministic-local".to_owned()
+}
+
+fn default_semantic_embedding_model() -> String {
+    "oan-deterministic-local-v1".to_owned()
+}
+
+fn default_semantic_dimension() -> usize {
+    DEFAULT_SEMANTIC_DIMENSION
+}
+
+fn default_semantic_embedding_timeout_ms() -> u64 {
+    2_000
+}
+
+fn default_semantic_embedding_batch_size() -> usize {
+    32
+}
+
+fn default_semantic_resource_type_filter() -> String {
+    "hard".to_owned()
+}
+
+fn default_semantic_capability_tags_filter() -> String {
+    "soft".to_owned()
+}
+
+fn default_semantic_protocol_filter() -> String {
+    "soft".to_owned()
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct DevKeyFile {
     algorithm: String,
     #[serde(rename = "privateKeyJwk")]
@@ -157,9 +322,101 @@ struct AppState {
     did: String,
     sqlite: Option<SqliteJsonStore>,
     postgres: Option<PostgresJsonStore>,
+    semantic: SemanticRuntimeState,
     client: reqwest::Client,
     resource_sync_lock: Arc<Mutex<()>>,
     index_stats_cache: Arc<Mutex<Option<CachedIndexStats>>>,
+}
+
+#[derive(Clone, Debug)]
+struct SemanticRuntimeState {
+    enabled: bool,
+    healthy: bool,
+    backend: String,
+    fallback_reason: Option<String>,
+    embedding_model: String,
+    embedding_version: String,
+    dimension: usize,
+}
+
+impl SemanticRuntimeState {
+    fn disabled(reason: impl Into<String>, config: &SemanticSearchConfig) -> Self {
+        Self {
+            enabled: false,
+            healthy: false,
+            backend: config.engine.clone(),
+            fallback_reason: Some(reason.into()),
+            embedding_model: config.embedding.model_name.clone(),
+            embedding_version: semantic_embedding_version(config),
+            dimension: config.embedding.dimension,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiscoverySearchEngine {
+    PgVector,
+}
+
+impl DiscoverySearchEngine {
+    fn from_config(config: &SemanticSearchConfig) -> Result<Self> {
+        match config.engine.as_str() {
+            "pgvector" => Ok(Self::PgVector),
+            "grail" => Err(anyhow!("grail_engine_not_implemented")),
+            value => Err(anyhow!("unsupported_semantic_engine:{value}")),
+        }
+    }
+
+    async fn initialize(
+        &self,
+        postgres: &PostgresJsonStore,
+        config: &SemanticSearchConfig,
+    ) -> Result<()> {
+        match self {
+            Self::PgVector => initialize_semantic_postgres(postgres, config).await,
+        }
+    }
+
+    async fn upsert_batch(
+        &self,
+        state: &AppState,
+        projected: &[DiscoveryProjectedPackage<'_>],
+    ) -> Result<()> {
+        match self {
+            Self::PgVector => upsert_pgvector_semantic_index_batch(state, projected).await,
+        }
+    }
+
+    async fn query(
+        &self,
+        state: &AppState,
+        query: &ResourceDiscoveryQuery,
+    ) -> Result<Option<Vec<SemanticQueryHit>>> {
+        match self {
+            Self::PgVector => query_pgvector_semantic_index(state, query).await,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmbeddingProviderKind {
+    DeterministicLocal,
+}
+
+impl EmbeddingProviderKind {
+    fn from_config(config: &SemanticEmbeddingConfig) -> Result<Self> {
+        match config.provider.as_str() {
+            "deterministic-local" => Ok(Self::DeterministicLocal),
+            "local" | "local-model" => Err(anyhow!("local_embedding_provider_not_wired")),
+            value => Err(anyhow!("unsupported_embedding_provider:{value}")),
+        }
+    }
+
+    fn embed(&self, text: &str, dimension: usize) -> Result<Vec<f32>> {
+        match self {
+            Self::DeterministicLocal => Ok(deterministic_embedding(text, dimension)),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -183,6 +440,47 @@ struct DiscoveryProjectedPackage<'a> {
     package: &'a ResourcePackage,
     package_json: Value,
     projection: DiscoveryPackageProjection,
+}
+
+#[derive(Clone, Debug)]
+struct SearchDocument {
+    resource_did: String,
+    cursor: i64,
+    package_version: String,
+    did_document_hash: String,
+    metadata_hash: String,
+    package_hash: String,
+    resource_type: String,
+    lifecycle_state: String,
+    capability_tags: Vec<String>,
+    protocols: Vec<String>,
+    service_endpoints: Vec<String>,
+    name: String,
+    description: String,
+    examples: Vec<String>,
+    use_cases: Vec<String>,
+    search_text: String,
+    semantic_source_hash: String,
+}
+
+#[derive(Clone, Debug)]
+struct SemanticQueryHit {
+    package: ResourcePackage,
+    semantic_score: f32,
+    structured_score: f32,
+    final_score: f32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SemanticSearchDiagnostics {
+    enabled: bool,
+    healthy: bool,
+    backend: String,
+    embedding_model: String,
+    embedding_version: String,
+    dimension: usize,
+    fallback_used: bool,
+    fallback_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -256,6 +554,7 @@ async fn main() -> Result<()> {
         crypto_suite,
         &URL_SAFE_NO_PAD.decode(key.private_key_jwk.d)?,
     )?;
+    let mut semantic = SemanticRuntimeState::disabled("semantic_disabled", &config.semantic_search);
     let (sqlite, postgres) = match config.paths.database_url.as_deref() {
         Some(url) if !url.is_empty() => {
             let database = DatabaseConfig::parse(url)?;
@@ -263,16 +562,31 @@ async fn main() -> Result<()> {
                 DatabaseBackend::Sqlite => {
                     let sqlite = SqliteJsonStore::connect(url).await?;
                     initialize_discovery_sqlite(&sqlite).await?;
+                    if config.semantic_search.enabled {
+                        semantic = SemanticRuntimeState::disabled(
+                            "semantic_search_requires_postgres",
+                            &config.semantic_search,
+                        );
+                    }
                     (Some(sqlite), None)
                 }
                 DatabaseBackend::Postgres => {
                     let postgres = PostgresJsonStore::connect(url).await?;
                     initialize_discovery_postgres(&postgres).await?;
+                    semantic = initialize_semantic_runtime(&config, Some(&postgres)).await;
                     (None, Some(postgres))
                 }
             }
         }
-        _ => (None, None),
+        _ => {
+            if config.semantic_search.enabled {
+                semantic = SemanticRuntimeState::disabled(
+                    "semantic_search_requires_postgres",
+                    &config.semantic_search,
+                );
+            }
+            (None, None)
+        }
     };
     let state = AppState {
         data: JsonStore::new(&config.paths.data_dir),
@@ -281,6 +595,7 @@ async fn main() -> Result<()> {
         did: did_doc.id,
         sqlite,
         postgres,
+        semantic,
         client: reqwest::Client::new(),
         resource_sync_lock: Arc::new(Mutex::new(())),
         index_stats_cache: Arc::new(Mutex::new(None)),
@@ -444,6 +759,409 @@ async fn initialize_discovery_postgres(postgres: &PostgresJsonStore) -> Result<(
         ))
         .await?;
     Ok(())
+}
+
+async fn initialize_semantic_runtime(
+    config: &Config,
+    postgres: Option<&PostgresJsonStore>,
+) -> SemanticRuntimeState {
+    if !config.semantic_search.enabled {
+        return SemanticRuntimeState::disabled("semantic_disabled", &config.semantic_search);
+    }
+    let engine = match DiscoverySearchEngine::from_config(&config.semantic_search) {
+        Ok(engine) => engine,
+        Err(err) => {
+            return SemanticRuntimeState::disabled(err.to_string(), &config.semantic_search);
+        }
+    };
+    if let Err(err) = EmbeddingProviderKind::from_config(&config.semantic_search.embedding) {
+        return SemanticRuntimeState::disabled(err.to_string(), &config.semantic_search);
+    }
+    let Some(postgres) = postgres else {
+        return SemanticRuntimeState::disabled(
+            "semantic_search_requires_postgres",
+            &config.semantic_search,
+        );
+    };
+    match engine.initialize(postgres, &config.semantic_search).await {
+        Ok(()) => SemanticRuntimeState {
+            enabled: true,
+            healthy: true,
+            backend: config.semantic_search.engine.clone(),
+            fallback_reason: None,
+            embedding_model: config.semantic_search.embedding.model_name.clone(),
+            embedding_version: semantic_embedding_version(&config.semantic_search),
+            dimension: config.semantic_search.embedding.dimension,
+        },
+        Err(err) => {
+            eprintln!("semantic search disabled: {err}");
+            SemanticRuntimeState::disabled(
+                format!("semantic_initialization_failed:{err}"),
+                &config.semantic_search,
+            )
+        }
+    }
+}
+
+async fn initialize_semantic_postgres(
+    postgres: &PostgresJsonStore,
+    config: &SemanticSearchConfig,
+) -> Result<()> {
+    let dimension = config.embedding.dimension;
+    if dimension == 0 || dimension > 4096 {
+        return Err(anyhow!("invalid_semantic_embedding_dimension"));
+    }
+    postgres
+        .execute_batch("CREATE EXTENSION IF NOT EXISTS vector;")
+        .await?;
+    postgres
+        .execute_batch(&format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS {DISCOVERY_SEMANTIC_INDEX_TABLE} (
+                resource_did TEXT PRIMARY KEY,
+                cursor BIGINT NOT NULL,
+                package_version TEXT NOT NULL,
+                did_document_hash TEXT NOT NULL,
+                metadata_hash TEXT NOT NULL,
+                package_hash TEXT NOT NULL,
+                resource_type TEXT NOT NULL,
+                lifecycle_state TEXT NOT NULL,
+                capability_tags TEXT[] NOT NULL DEFAULT '{{}}',
+                protocols TEXT[] NOT NULL DEFAULT '{{}}',
+                service_endpoints TEXT[] NOT NULL DEFAULT '{{}}',
+                name TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                examples JSONB NOT NULL DEFAULT '[]'::jsonb,
+                use_cases JSONB NOT NULL DEFAULT '[]'::jsonb,
+                search_text TEXT NOT NULL DEFAULT '',
+                semantic_source_hash TEXT NOT NULL,
+                embedding VECTOR({dimension}),
+                embedding_model TEXT NOT NULL,
+                embedding_version TEXT NOT NULL DEFAULT '1',
+                updated_at TIMESTAMPTZ NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_discovery_semantic_cursor
+            ON {DISCOVERY_SEMANTIC_INDEX_TABLE}(cursor DESC);
+            CREATE INDEX IF NOT EXISTS idx_discovery_semantic_type_state
+            ON {DISCOVERY_SEMANTIC_INDEX_TABLE}(resource_type, lifecycle_state);
+            CREATE INDEX IF NOT EXISTS idx_discovery_semantic_tags
+            ON {DISCOVERY_SEMANTIC_INDEX_TABLE} USING GIN(capability_tags);
+            CREATE INDEX IF NOT EXISTS idx_discovery_semantic_protocols
+            ON {DISCOVERY_SEMANTIC_INDEX_TABLE} USING GIN(protocols);
+            CREATE INDEX IF NOT EXISTS idx_discovery_semantic_search_text
+            ON {DISCOVERY_SEMANTIC_INDEX_TABLE} USING GIN(to_tsvector('simple', search_text));
+            CREATE INDEX IF NOT EXISTS idx_discovery_semantic_embedding
+            ON {DISCOVERY_SEMANTIC_INDEX_TABLE}
+            USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = 100);
+            "#,
+        ))
+        .await?;
+    Ok(())
+}
+
+fn semantic_embedding_version(config: &SemanticSearchConfig) -> String {
+    format!(
+        "1:{}:{}",
+        config.embedding.provider, config.embedding.dimension
+    )
+}
+
+fn semantic_search_available(state: &AppState) -> bool {
+    state.config.semantic_search.enabled
+        && state.semantic.enabled
+        && state.semantic.healthy
+        && state.postgres.is_some()
+}
+
+fn semantic_diagnostics(
+    state: &AppState,
+    fallback_used: bool,
+    fallback_reason: Option<String>,
+) -> SemanticSearchDiagnostics {
+    SemanticSearchDiagnostics {
+        enabled: state.semantic.enabled,
+        healthy: state.semantic.healthy,
+        backend: state.semantic.backend.clone(),
+        embedding_model: state.semantic.embedding_model.clone(),
+        embedding_version: state.semantic.embedding_version.clone(),
+        dimension: state.semantic.dimension,
+        fallback_used,
+        fallback_reason: fallback_reason.or_else(|| state.semantic.fallback_reason.clone()),
+    }
+}
+
+fn semantic_status_json(
+    state: &AppState,
+    fallback_used: bool,
+    fallback_reason: Option<String>,
+) -> Value {
+    let diagnostics = semantic_diagnostics(state, fallback_used, fallback_reason);
+    json!({
+        "enabled": diagnostics.enabled,
+        "healthy": diagnostics.healthy,
+        "backend": diagnostics.backend,
+        "fallback": state.config.semantic_search.fallback,
+        "defaultMode": state.config.semantic_search.default_mode,
+        "explainEnabled": state.config.semantic_search.explain_enabled,
+        "embeddingProvider": state.config.semantic_search.embedding.provider,
+        "embeddingModel": diagnostics.embedding_model,
+        "embeddingVersion": diagnostics.embedding_version,
+        "modelPath": state.config.semantic_search.embedding.model_path,
+        "dimension": diagnostics.dimension,
+        "timeoutMs": state.config.semantic_search.embedding.timeout_ms,
+        "batchSize": state.config.semantic_search.embedding.batch_size,
+        "filters": {
+            "resourceType": state.config.semantic_search.filters.resource_type,
+            "capabilityTags": state.config.semantic_search.filters.capability_tags,
+            "protocol": state.config.semantic_search.filters.protocol
+        },
+        "fallbackUsed": diagnostics.fallback_used,
+        "fallbackReason": diagnostics.fallback_reason,
+    })
+}
+
+fn normalize_semantic_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_owned()
+}
+
+fn push_unique_text(values: &mut Vec<String>, value: impl AsRef<str>) {
+    let normalized = normalize_semantic_text(value.as_ref());
+    if !normalized.is_empty() && !values.iter().any(|existing| existing == &normalized) {
+        values.push(normalized);
+    }
+}
+
+fn json_example_to_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let normalized = normalize_semantic_text(text);
+            (!normalized.is_empty()).then_some(normalized)
+        }
+        Value::Object(_) | Value::Array(_) => {
+            let text = value.to_string();
+            let normalized = normalize_semantic_text(&text);
+            (!normalized.is_empty()).then_some(normalized.chars().take(1_000).collect())
+        }
+        _ => None,
+    }
+}
+
+fn search_document_from_package(
+    cursor: i64,
+    package: &ResourcePackage,
+    projection: &DiscoveryPackageProjection,
+) -> SearchDocument {
+    let mut descriptions = Vec::new();
+    push_unique_text(&mut descriptions, &package.metadata.description);
+    let mut examples = Vec::new();
+    let mut use_cases = Vec::new();
+    let mut tags = package.metadata.capability_tags.clone();
+
+    if let Some(metadata) = &package.did_document.oan_metadata {
+        tags.extend(metadata.capability_tags.iter().cloned());
+        if let Some(description) = &metadata.resource_description {
+            if let Some(name) = &description.name {
+                push_unique_text(&mut descriptions, name);
+            }
+            if let Some(text) = &description.description {
+                push_unique_text(&mut descriptions, text);
+            }
+            if let Some(text) = &description.capability_description {
+                push_unique_text(&mut descriptions, text);
+            }
+            tags.extend(description.capability_tags.iter().cloned());
+            for item in description.use_case_examples.iter().take(20) {
+                push_unique_text(&mut use_cases, item);
+            }
+            for value in description.examples.iter().take(20) {
+                if let Some(text) = json_example_to_text(value) {
+                    push_unique_text(&mut examples, text);
+                }
+            }
+        }
+        if let Some(description) = &metadata.agent_description {
+            push_unique_text(&mut descriptions, &description.capability_description);
+            tags.extend(description.capability_tags.iter().cloned());
+            for item in description.use_case_examples.iter().take(20) {
+                push_unique_text(&mut use_cases, item);
+            }
+        }
+    }
+
+    tags.sort();
+    tags.dedup();
+    let description = descriptions.join("\n");
+    let name = package
+        .did_document
+        .oan_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.resource_description.as_ref())
+        .and_then(|description| description.name.clone())
+        .unwrap_or_else(|| package.metadata.name.clone());
+    let embedding_text = semantic_embedding_text(
+        &name,
+        &projection.resource_type,
+        &description,
+        &tags,
+        &projection.protocols,
+        &projection.service_endpoints,
+        &examples,
+        &use_cases,
+    );
+    SearchDocument {
+        resource_did: package.resource_did.clone(),
+        cursor,
+        package_version: package.package_version.clone(),
+        did_document_hash: package.did_document_hash.clone(),
+        metadata_hash: package.metadata_hash.clone(),
+        package_hash: package.package_hash.clone(),
+        resource_type: projection.resource_type.clone(),
+        lifecycle_state: projection.lifecycle_state.clone(),
+        capability_tags: tags,
+        protocols: projection.protocols.clone(),
+        service_endpoints: projection.service_endpoints.clone(),
+        name,
+        description,
+        examples,
+        use_cases,
+        search_text: projection.search_text.clone(),
+        semantic_source_hash: format!("sha256:{}", sha256_hex(embedding_text.as_bytes())),
+    }
+}
+
+fn semantic_embedding_text(
+    name: &str,
+    resource_type: &str,
+    description: &str,
+    capability_tags: &[String],
+    protocols: &[String],
+    service_endpoints: &[String],
+    examples: &[String],
+    use_cases: &[String],
+) -> String {
+    let mut text = String::new();
+    text.push_str("Name:\n");
+    text.push_str(name);
+    text.push_str("\n\nResource type:\n");
+    text.push_str(resource_type);
+    text.push_str("\n\nDescription:\n");
+    text.push_str(description);
+    text.push_str("\n\nCapability tags:\n");
+    text.push_str(&capability_tags.join(", "));
+    text.push_str("\n\nProtocols:\n");
+    text.push_str(&protocols.join(", "));
+    text.push_str("\n\nServices:\n");
+    text.push_str(&service_endpoints.join("\n"));
+    text.push_str("\n\nExamples:\n");
+    text.push_str(&examples.join("\n"));
+    text.push_str("\n\nUse cases:\n");
+    text.push_str(&use_cases.join("\n"));
+    text.chars().take(8_000).collect()
+}
+
+fn semantic_document_text(doc: &SearchDocument) -> String {
+    semantic_embedding_text(
+        &doc.name,
+        &doc.resource_type,
+        &doc.description,
+        &doc.capability_tags,
+        &doc.protocols,
+        &doc.service_endpoints,
+        &doc.examples,
+        &doc.use_cases,
+    )
+}
+
+fn deterministic_embedding(text: &str, dimension: usize) -> Vec<f32> {
+    let dimension = dimension.max(1);
+    let mut vector = vec![0.0_f32; dimension];
+    let mut seen = HashSet::new();
+    for token in semantic_tokens(text) {
+        if !seen.insert(token.clone()) {
+            continue;
+        }
+        let hash = sha256_hex(token.as_bytes());
+        let index = usize::from_str_radix(&hash[0..8], 16).unwrap_or(0) % dimension;
+        vector[index] += 1.0;
+    }
+    normalize_vector(vector)
+}
+
+fn embed_semantic_text(config: &SemanticSearchConfig, text: &str) -> Result<Vec<f32>> {
+    EmbeddingProviderKind::from_config(&config.embedding)?.embed(text, config.embedding.dimension)
+}
+
+fn semantic_tokens(text: &str) -> Vec<String> {
+    text.to_ascii_lowercase()
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '.')
+        .filter_map(|token| {
+            let trimmed = token.trim();
+            (trimmed.len() >= 2).then(|| trimmed.to_owned())
+        })
+        .collect()
+}
+
+fn normalize_vector(mut vector: Vec<f32>) -> Vec<f32> {
+    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for value in &mut vector {
+            *value /= norm;
+        }
+    }
+    vector
+}
+
+fn pgvector_literal(vector: &[f32]) -> String {
+    format!(
+        "[{}]",
+        vector
+            .iter()
+            .map(|value| format!("{value:.8}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn semantic_structured_score(package: &ResourcePackage, query: &ResourceDiscoveryQuery) -> f32 {
+    let mut score = 0.0;
+    if query
+        .resource_type
+        .as_ref()
+        .is_some_and(|resource_type| resource_type == &package.resource_type)
+    {
+        score += 0.10;
+    }
+    if !query.capability_tags.is_empty() {
+        let overlap = query
+            .capability_tags
+            .iter()
+            .filter(|tag| package.metadata.capability_tags.contains(tag))
+            .count();
+        score += (overlap as f32 / query.capability_tags.len() as f32) * 0.15;
+    }
+    if query.protocol.as_ref().is_some_and(|protocol| {
+        package.metadata.services.iter().any(|service| {
+            service
+                .protocol
+                .as_ref()
+                .map(|candidate| candidate.eq_ignore_ascii_case(protocol))
+                .unwrap_or(false)
+        }) || package.metadata.protocol_bindings.iter().any(|binding| {
+            binding["protocol"]
+                .as_str()
+                .map(|candidate| candidate.eq_ignore_ascii_case(protocol))
+                .unwrap_or(false)
+        })
+    }) {
+        score += 0.05;
+    }
+    score
 }
 
 fn build_cors_layer(config: &CorsConfig) -> Result<CorsLayer> {
@@ -753,41 +1471,61 @@ async fn resource_query(
     Json(query): Json<ResourceDiscoveryQuery>,
 ) -> ApiResult<ResourceDiscoveryResponse> {
     let started = Instant::now();
-    let (packages, prefiltered) = query_indexed_resource_packages(&state, &query)
-        .await
-        .map_err(ApiError::internal)?;
-    let candidate_count = packages.len();
-    let mut candidates = packages
-        .into_iter()
-        .filter(|package| prefiltered || resource_matches_query(package, &query))
-        .map(|package| ResourceDiscoveryCandidate {
-            resource_did: package.resource_did.clone(),
-            resource_type: package.resource_type.clone(),
-            score: resource_score(&package, &query),
-            version: Some(package.package_version.clone()),
-            lifecycle_state: Some(package.metadata.lifecycle_state.clone()),
-            capability_tags: package.metadata.capability_tags.clone(),
-            services: package.metadata.services.clone(),
-            protocol_bindings: package.metadata.protocol_bindings.clone(),
-            package_info: package
-                .did_document
-                .oan_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.package_info.as_ref())
-                .and_then(|info| serde_json::to_value(info).ok()),
-            root_proof: serde_json::to_value(&package.root_proof).ok(),
-        })
-        .collect::<Vec<_>>();
+    let semantic_result = query_semantic_index(&state, &query).await;
+    let (mut candidates, candidate_count, prefiltered, backend) = match semantic_result {
+        Ok(Some(hits)) if !hits.is_empty() => {
+            let candidate_count = hits.len();
+            (
+                hits.into_iter()
+                    .map(|hit| discovery_candidate_from_package(hit.package, hit.final_score))
+                    .collect::<Vec<_>>(),
+                candidate_count,
+                true,
+                "semantic-pgvector".to_owned(),
+            )
+        }
+        Ok(Some(_)) => {
+            let (candidates, candidate_count, prefiltered) =
+                keyword_discovery_candidates(&state, &query)
+                    .await
+                    .map_err(ApiError::internal)?;
+            (
+                candidates,
+                candidate_count,
+                prefiltered,
+                discovery_backend_name(&state),
+            )
+        }
+        Ok(None) => {
+            let (candidates, candidate_count, prefiltered) =
+                keyword_discovery_candidates(&state, &query)
+                    .await
+                    .map_err(ApiError::internal)?;
+            (
+                candidates,
+                candidate_count,
+                prefiltered,
+                discovery_backend_name(&state),
+            )
+        }
+        Err(err) => {
+            eprintln!("semantic query failed: {err}");
+            let (candidates, candidate_count, prefiltered) =
+                keyword_discovery_candidates(&state, &query)
+                    .await
+                    .map_err(ApiError::internal)?;
+            (
+                candidates,
+                candidate_count,
+                prefiltered,
+                discovery_backend_name(&state),
+            )
+        }
+    };
     candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
     candidates.truncate(query.limit as usize);
     let metrics = DiscoveryQueryMetrics {
-        backend: if state.postgres.is_some() {
-            "postgres".to_owned()
-        } else if state.sqlite.is_some() {
-            "sqlite".to_owned()
-        } else {
-            "json".to_owned()
-        },
+        backend,
         candidate_count,
         returned_count: candidates.len(),
         elapsed_ms: started.elapsed().as_millis(),
@@ -807,6 +1545,56 @@ async fn resource_query(
         created_at: Utc::now(),
         proof: None,
     }))
+}
+
+async fn keyword_discovery_candidates(
+    state: &AppState,
+    query: &ResourceDiscoveryQuery,
+) -> Result<(Vec<ResourceDiscoveryCandidate>, usize, bool)> {
+    let (packages, prefiltered) = query_indexed_resource_packages(state, query).await?;
+    let candidate_count = packages.len();
+    let candidates = packages
+        .into_iter()
+        .filter(|package| prefiltered || resource_matches_query(package, query))
+        .map(|package| {
+            let score = resource_score(&package, query);
+            discovery_candidate_from_package(package, score)
+        })
+        .collect::<Vec<_>>();
+    Ok((candidates, candidate_count, prefiltered))
+}
+
+fn discovery_candidate_from_package(
+    package: ResourcePackage,
+    score: f32,
+) -> ResourceDiscoveryCandidate {
+    ResourceDiscoveryCandidate {
+        resource_did: package.resource_did.clone(),
+        resource_type: package.resource_type.clone(),
+        score,
+        version: Some(package.package_version.clone()),
+        lifecycle_state: Some(package.metadata.lifecycle_state.clone()),
+        capability_tags: package.metadata.capability_tags.clone(),
+        services: package.metadata.services.clone(),
+        protocol_bindings: package.metadata.protocol_bindings.clone(),
+        package_info: package
+            .did_document
+            .oan_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.package_info.as_ref())
+            .and_then(|info| serde_json::to_value(info).ok()),
+        root_proof: serde_json::to_value(&package.root_proof).ok(),
+    }
+}
+
+fn discovery_backend_name(state: &AppState) -> String {
+    if state.postgres.is_some() {
+        "postgres".to_owned()
+    } else if state.sqlite.is_some() {
+        "sqlite".to_owned()
+    } else {
+        "json".to_owned()
+    }
 }
 
 async fn route_lookup(
@@ -841,7 +1629,8 @@ async fn api_status(State(state): State<AppState>) -> ApiResult<Value> {
         "cdnEndpoint": state.config.upstream.cdn_endpoint,
         "indexedResourceCount": indexed_resource_count,
         "lastSync": history.last(),
-        "rootAuthorizationStatus": bulletin.as_ref().map(|b| discovery_authorization_status(b, &state.did)).unwrap_or_else(|| "unknown".to_owned())
+        "rootAuthorizationStatus": bulletin.as_ref().map(|b| discovery_authorization_status(b, &state.did)).unwrap_or_else(|| "unknown".to_owned()),
+        "semanticSearch": semantic_status_json(&state, false, None)
     })))
 }
 
@@ -890,7 +1679,7 @@ async fn api_index_stats(State(state): State<AppState>) -> ApiResult<Value> {
         }
     }
     let sync_cursor = read_sync_cursor(&state).await.map_err(ApiError::internal)?;
-    let body = if let Some(postgres) = &state.postgres {
+    let mut body = if let Some(postgres) = &state.postgres {
         let total_row = sqlx::query(&format!("SELECT COUNT(*) FROM {DISCOVERY_PACKAGE_TABLE}"))
             .fetch_one(postgres.pool())
             .await
@@ -951,6 +1740,20 @@ async fn api_index_stats(State(state): State<AppState>) -> ApiResult<Value> {
             "syncCursor": sync_cursor
         })
     };
+    if let Value::Object(map) = &mut body {
+        map.insert(
+            "semanticSearch".to_owned(),
+            semantic_status_json(&state, false, None),
+        );
+        map.insert(
+            "semanticIndexedCount".to_owned(),
+            match count_semantic_indexed_resources(&state).await {
+                Ok(Some(count)) => json!(count),
+                Ok(None) => Value::Null,
+                Err(err) => json!({ "error": err.to_string() }),
+            },
+        );
+    }
     if let Ok(mut cache) = state.index_stats_cache.try_lock() {
         *cache = Some(CachedIndexStats {
             captured_at: Instant::now(),
@@ -1011,6 +1814,60 @@ async fn api_query_explain(
     State(state): State<AppState>,
     Json(query): Json<ResourceDiscoveryQuery>,
 ) -> ApiResult<Value> {
+    if state.config.semantic_search.explain_enabled {
+        match query_semantic_index(&state, &query).await {
+            Ok(Some(hits)) if !hits.is_empty() => {
+                let items = hits
+                    .iter()
+                    .map(|hit| {
+                        json!({
+                            "resourceDid": hit.package.resource_did,
+                            "resourceType": hit.package.resource_type,
+                            "matched": true,
+                            "score": hit.final_score,
+                            "semanticScore": hit.semantic_score,
+                            "structuredScore": hit.structured_score,
+                            "finalScore": hit.final_score,
+                            "capabilityTagOverlap": query.capability_tags.iter()
+                                .filter(|tag| hit.package.metadata.capability_tags.iter().any(|candidate| candidate == *tag))
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                            "resourceTypeMatched": query.resource_type.as_ref().map(|resource_type| {
+                                resource_type == &hit.package.resource_type
+                            }),
+                            "protocolMatched": query.protocol.as_ref().map(|protocol| {
+                                hit.package.metadata.services.iter().any(|service| {
+                                    service
+                                        .protocol
+                                        .as_ref()
+                                        .map(|candidate| candidate.eq_ignore_ascii_case(protocol))
+                                        .unwrap_or(false)
+                                }) || hit.package.metadata.protocol_bindings.iter().any(|binding| {
+                                    binding["protocol"]
+                                        .as_str()
+                                        .map(|candidate| candidate.eq_ignore_ascii_case(protocol))
+                                        .unwrap_or(false)
+                                })
+                            }),
+                            "matchReason": "Matched by local semantic vector ranking over verified Discovery packages."
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(Json(json!({
+                    "query": query,
+                    "items": items,
+                    "candidateCount": items.len(),
+                    "usedIndexedPrefilter": true,
+                    "semanticSearch": semantic_status_json(&state, false, None)
+                })));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("semantic explain failed: {err}");
+            }
+        }
+    }
     let (packages, prefiltered) = query_indexed_resource_packages(&state, &query)
         .await
         .map_err(ApiError::internal)?;
@@ -1045,7 +1902,9 @@ async fn api_query_explain(
                             .map(|candidate| candidate.eq_ignore_ascii_case(protocol))
                             .unwrap_or(false)
                     })
-                })
+                }),
+                "semanticScore": None::<f32>,
+                "structuredScore": Some(resource_score(package, &query)),
             })
         })
         .collect::<Vec<_>>();
@@ -1053,7 +1912,8 @@ async fn api_query_explain(
         "query": query,
         "items": explanations,
         "candidateCount": packages.len(),
-        "usedIndexedPrefilter": prefiltered
+        "usedIndexedPrefilter": prefiltered,
+        "semanticSearch": semantic_status_json(&state, true, Some("keyword_explain_fallback".to_owned()))
     })))
 }
 
@@ -1241,6 +2101,11 @@ async fn upsert_indexed_resource_packages_batch(
             builder.build().execute(&mut *tx).await?;
         }
         tx.commit().await?;
+        if semantic_search_available(state) {
+            if let Err(err) = upsert_semantic_index_batch(state, &projected).await {
+                eprintln!("semantic index upsert failed: {err}");
+            }
+        }
         return Ok(());
     }
     let mut indexed = read_indexed_resource_packages(state).await?;
@@ -1250,6 +2115,162 @@ async fn upsert_indexed_resource_packages_batch(
     }
     state.index.write("resource-capabilities.json", &indexed)?;
     Ok(())
+}
+
+async fn upsert_semantic_index_batch(
+    state: &AppState,
+    projected: &[DiscoveryProjectedPackage<'_>],
+) -> Result<()> {
+    let engine = DiscoverySearchEngine::from_config(&state.config.semantic_search)?;
+    engine.upsert_batch(state, projected).await
+}
+
+async fn upsert_pgvector_semantic_index_batch(
+    state: &AppState,
+    projected: &[DiscoveryProjectedPackage<'_>],
+) -> Result<()> {
+    let Some(postgres) = &state.postgres else {
+        return Ok(());
+    };
+    if !semantic_search_available(state) || projected.is_empty() {
+        return Ok(());
+    }
+
+    let updated_at = Utc::now();
+    let docs = projected
+        .iter()
+        .map(|item| search_document_from_package(item.cursor, item.package, &item.projection))
+        .collect::<Vec<_>>();
+    let existing_hashes = read_semantic_source_hashes(state, &docs).await?;
+
+    for chunk in docs.chunks(100) {
+        let changed = chunk
+            .iter()
+            .filter(|doc| {
+                existing_hashes
+                    .get(&doc.resource_did)
+                    .map(|hash| hash != &doc.semantic_source_hash)
+                    .unwrap_or(true)
+            })
+            .collect::<Vec<_>>();
+        if changed.is_empty() {
+            continue;
+        }
+        let embedded = changed
+            .into_iter()
+            .map(|doc| {
+                embed_semantic_text(&state.config.semantic_search, &semantic_document_text(doc))
+                    .map(|embedding| (doc, embedding))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut builder = QueryBuilder::<Postgres>::new(format!(
+            r#"
+            INSERT INTO {DISCOVERY_SEMANTIC_INDEX_TABLE}(
+                resource_did, cursor, package_version, did_document_hash, metadata_hash,
+                package_hash, resource_type, lifecycle_state, capability_tags, protocols,
+                service_endpoints, name, description, examples, use_cases, search_text,
+                semantic_source_hash, embedding, embedding_model, embedding_version, updated_at
+            )
+            "#
+        ));
+        builder.push_values(embedded, |mut row, (doc, embedding)| {
+            row.push_bind(&doc.resource_did)
+                .push_bind(doc.cursor)
+                .push_bind(&doc.package_version)
+                .push_bind(&doc.did_document_hash)
+                .push_bind(&doc.metadata_hash)
+                .push_bind(&doc.package_hash)
+                .push_bind(&doc.resource_type)
+                .push_bind(&doc.lifecycle_state)
+                .push_bind(&doc.capability_tags)
+                .push_bind(&doc.protocols)
+                .push_bind(&doc.service_endpoints)
+                .push_bind(&doc.name)
+                .push_bind(&doc.description)
+                .push_bind(serde_json::to_value(&doc.examples).unwrap_or_else(|_| json!([])))
+                .push_bind(serde_json::to_value(&doc.use_cases).unwrap_or_else(|_| json!([])))
+                .push_bind(&doc.search_text)
+                .push_bind(&doc.semantic_source_hash)
+                .push(format!("{}::vector", pgvector_literal(&embedding)))
+                .push_bind(&state.semantic.embedding_model)
+                .push_bind(&state.semantic.embedding_version)
+                .push_bind(updated_at);
+        });
+        builder.push(
+            r#"
+            ON CONFLICT(resource_did)
+            DO UPDATE SET
+                cursor = excluded.cursor,
+                package_version = excluded.package_version,
+                did_document_hash = excluded.did_document_hash,
+                metadata_hash = excluded.metadata_hash,
+                package_hash = excluded.package_hash,
+                resource_type = excluded.resource_type,
+                lifecycle_state = excluded.lifecycle_state,
+                capability_tags = excluded.capability_tags,
+                protocols = excluded.protocols,
+                service_endpoints = excluded.service_endpoints,
+                name = excluded.name,
+                description = excluded.description,
+                examples = excluded.examples,
+                use_cases = excluded.use_cases,
+                search_text = excluded.search_text,
+                semantic_source_hash = excluded.semantic_source_hash,
+                embedding = excluded.embedding,
+                embedding_model = excluded.embedding_model,
+                embedding_version = excluded.embedding_version,
+                updated_at = excluded.updated_at
+            "#,
+        );
+        builder.build().execute(postgres.pool()).await?;
+    }
+    Ok(())
+}
+
+async fn read_semantic_source_hashes(
+    state: &AppState,
+    docs: &[SearchDocument],
+) -> Result<BTreeMap<String, String>> {
+    let Some(postgres) = &state.postgres else {
+        return Ok(BTreeMap::new());
+    };
+    if docs.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let dids = docs
+        .iter()
+        .map(|doc| doc.resource_did.clone())
+        .collect::<Vec<_>>();
+    let rows = sqlx::query(&format!(
+        "SELECT resource_did, semantic_source_hash FROM {DISCOVERY_SEMANTIC_INDEX_TABLE} WHERE resource_did = ANY($1) AND embedding_model = $2 AND embedding_version = $3"
+    ))
+    .bind(&dids)
+    .bind(&state.semantic.embedding_model)
+    .bind(&state.semantic.embedding_version)
+    .fetch_all(postgres.pool())
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.get::<String, _>(0), row.get::<String, _>(1)))
+        .collect())
+}
+
+async fn count_semantic_indexed_resources(state: &AppState) -> Result<Option<i64>> {
+    let Some(postgres) = &state.postgres else {
+        return Ok(None);
+    };
+    if !state.semantic.enabled {
+        return Ok(None);
+    }
+    let row = sqlx::query(&format!(
+        "SELECT COUNT(*) FROM {DISCOVERY_SEMANTIC_INDEX_TABLE} WHERE embedding_model = $1 AND embedding_version = $2"
+    ))
+    .bind(&state.semantic.embedding_model)
+    .bind(&state.semantic.embedding_version)
+    .fetch_one(postgres.pool())
+    .await?;
+    Ok(Some(row.get::<i64, _>(0)))
 }
 
 fn discovery_package_projection(package: &ResourcePackage) -> DiscoveryPackageProjection {
@@ -1457,6 +2478,124 @@ async fn query_indexed_resource_packages(
     read_indexed_resource_packages(state)
         .await
         .map(|packages| (packages, false))
+}
+
+async fn query_semantic_index(
+    state: &AppState,
+    query: &ResourceDiscoveryQuery,
+) -> Result<Option<Vec<SemanticQueryHit>>> {
+    if !semantic_search_available(state) {
+        return Ok(None);
+    }
+    let engine = DiscoverySearchEngine::from_config(&state.config.semantic_search)?;
+    engine.query(state, query).await
+}
+
+async fn query_pgvector_semantic_index(
+    state: &AppState,
+    query: &ResourceDiscoveryQuery,
+) -> Result<Option<Vec<SemanticQueryHit>>> {
+    if !semantic_search_available(state) {
+        return Ok(None);
+    }
+    let Some(text) = query
+        .query
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(postgres) = &state.postgres else {
+        return Ok(None);
+    };
+
+    let query_embedding = embed_semantic_text(&state.config.semantic_search, text)?;
+    let candidate_limit = semantic_candidate_limit(query.limit, &state.config.semantic_search);
+    let mut builder = QueryBuilder::<Postgres>::new(format!(
+        r#"
+        SELECT
+            p.package_json::text,
+            (1 - (s.embedding <=> {}::vector))::float4 AS semantic_score
+        FROM {DISCOVERY_SEMANTIC_INDEX_TABLE} s
+        JOIN {DISCOVERY_PACKAGE_TABLE} p ON p.resource_did = s.resource_did
+        WHERE p.lifecycle_state = 
+        "#,
+        pgvector_literal(&query_embedding),
+    ));
+    builder.push_bind("active");
+    builder.push(" AND s.lifecycle_state = ");
+    builder.push_bind("active");
+    builder.push(" AND s.embedding_model = ");
+    builder.push_bind(&state.semantic.embedding_model);
+    builder.push(" AND s.embedding_version = ");
+    builder.push_bind(&state.semantic.embedding_version);
+
+    if let Some(resource_type) = &query.resource_type {
+        builder.push(" AND p.resource_type = ");
+        builder.push_bind(resource_type.as_str());
+    }
+    if let Some(version) = &query.version {
+        builder.push(" AND p.version = ");
+        builder.push_bind(version);
+    }
+    if !query.capability_tags.is_empty()
+        && state
+            .config
+            .semantic_search
+            .filters
+            .capability_tags
+            .eq_ignore_ascii_case("hard")
+    {
+        builder.push(" AND p.capability_tags && ");
+        builder.push_bind(query.capability_tags.clone());
+    }
+    if let Some(protocol) = &query.protocol {
+        if state
+            .config
+            .semantic_search
+            .filters
+            .protocol
+            .eq_ignore_ascii_case("hard")
+        {
+            builder.push(" AND p.protocols && ");
+            builder.push_bind(vec![protocol.to_ascii_lowercase()]);
+        }
+    }
+    builder.push(format!(
+        " ORDER BY s.embedding <=> {}::vector LIMIT ",
+        pgvector_literal(&query_embedding)
+    ));
+    builder.push_bind(candidate_limit);
+
+    let rows = builder.build().fetch_all(postgres.pool()).await?;
+    let mut hits = rows
+        .into_iter()
+        .map(|row| {
+            let package = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(0))?;
+            let semantic_score = row.get::<f32, _>(1).clamp(0.0, 1.0);
+            let structured_score = semantic_structured_score(&package, query);
+            let final_score = (0.65 * semantic_score) + structured_score + 0.05;
+            Ok::<_, anyhow::Error>(SemanticQueryHit {
+                package,
+                semantic_score,
+                structured_score,
+                final_score,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    hits.sort_by(|a, b| b.final_score.total_cmp(&a.final_score));
+    hits.truncate(query.limit as usize);
+    Ok(Some(hits))
+}
+
+fn semantic_candidate_limit(query_limit: u32, config: &SemanticSearchConfig) -> i64 {
+    let requested = query_limit.max(1);
+    let expanded = requested.saturating_mul(config.candidate_multiplier.max(1));
+    expanded
+        .max(25)
+        .min(config.max_candidates.max(requested))
+        .max(requested) as i64
 }
 
 fn discovery_sql_candidate_limit(query_limit: u32) -> i64 {
@@ -1943,8 +3082,15 @@ mod tests {
                 resource_description: Some(ResourceDescription {
                     name: Some("Contract Review Skill".to_owned()),
                     description: Some("Review contracts and highlight risky clauses".to_owned()),
+                    capability_description: Some(
+                        "Detect payment, termination, liability, and compliance risks.".to_owned(),
+                    ),
                     capability_tags: vec!["legal.contract.review".to_owned()],
                     use_case_examples: vec!["Find payment and termination risks".to_owned()],
+                    examples: vec![json!({
+                        "task": "Review a commercial contract",
+                        "output": "Risk checklist"
+                    })],
                     ..Default::default()
                 }),
                 agent_description: None,
@@ -2090,6 +3236,7 @@ mod tests {
                 },
                 cors: CorsConfig::default(),
                 debug: DebugConfig::default(),
+                semantic_search: SemanticSearchConfig::default(),
                 upstream: UpstreamConfig {
                     root_endpoint: "http://127.0.0.1:8001".to_owned(),
                     cdn_endpoint: Some("http://127.0.0.1:8003".to_owned()),
@@ -2104,6 +3251,10 @@ mod tests {
             did: discovery_did(),
             sqlite: None,
             postgres: None,
+            semantic: SemanticRuntimeState::disabled(
+                "semantic_disabled",
+                &SemanticSearchConfig::default(),
+            ),
             client: reqwest::Client::new(),
             resource_sync_lock: Arc::new(Mutex::new(())),
             index_stats_cache: Arc::new(Mutex::new(None)),
@@ -2119,6 +3270,42 @@ mod tests {
         let mut state = app_state(dir);
         state.sqlite = Some(sqlite);
         state
+    }
+
+    async fn app_state_with_semantic_postgres(dir: &std::path::Path) -> Option<AppState> {
+        let url = env::var("OAN_DISCOVERY_SEMANTIC_TEST_DATABASE_URL").ok()?;
+        let postgres = PostgresJsonStore::connect(&url).await.ok()?;
+        if initialize_discovery_postgres(&postgres).await.is_err() {
+            return None;
+        }
+        let mut state = app_state(dir);
+        state.config.semantic_search.enabled = true;
+        state.config.semantic_search.embedding.dimension = 16;
+        if initialize_semantic_postgres(&postgres, &state.config.semantic_search)
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        sqlx::query(&format!("DELETE FROM {DISCOVERY_SEMANTIC_INDEX_TABLE}"))
+            .execute(postgres.pool())
+            .await
+            .ok()?;
+        sqlx::query(&format!("DELETE FROM {DISCOVERY_PACKAGE_TABLE}"))
+            .execute(postgres.pool())
+            .await
+            .ok()?;
+        state.semantic = SemanticRuntimeState {
+            enabled: true,
+            healthy: true,
+            backend: "pgvector".to_owned(),
+            fallback_reason: None,
+            embedding_model: state.config.semantic_search.embedding.model_name.clone(),
+            embedding_version: semantic_embedding_version(&state.config.semantic_search),
+            dimension: state.config.semantic_search.embedding.dimension,
+        };
+        state.postgres = Some(postgres);
+        Some(state)
     }
 
     fn root_document_with_key(did: &str, signing_key: &ed25519_dalek::SigningKey) -> DidDocument {
@@ -2373,6 +3560,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_pgvector_semantic_query_ranks_verified_packages_when_available() {
+        let dir = tempdir().unwrap();
+        let Some(state) = app_state_with_semantic_postgres(dir.path()).await else {
+            eprintln!(
+                "skipping pgvector semantic integration test; set OAN_DISCOVERY_SEMANTIC_TEST_DATABASE_URL"
+            );
+            return;
+        };
+        let first = sample_resource_package();
+        let mut second = sample_resource_package_with_did("did:oan:resource:weather");
+        second.metadata.name = "Weather Forecast Skill".to_owned();
+        second.metadata.description =
+            "Forecast rainfall and temperature for travel planning".to_owned();
+        second.metadata.capability_tags = vec!["weather.forecast".to_owned()];
+        if let Some(metadata) = second.did_document.oan_metadata.as_mut() {
+            metadata.capability_tags = second.metadata.capability_tags.clone();
+            if let Some(description) = metadata.resource_description.as_mut() {
+                description.name = Some(second.metadata.name.clone());
+                description.description = Some(second.metadata.description.clone());
+                description.capability_description =
+                    Some("Predict local weather conditions".to_owned());
+                description.capability_tags = second.metadata.capability_tags.clone();
+                description.use_case_examples =
+                    vec!["Plan a trip around rain probability".to_owned()];
+                description.examples = vec![json!("Will it rain tomorrow?")];
+            }
+        }
+        refresh_hashes(&mut second);
+
+        upsert_indexed_resource_packages_batch(&state, &[(1, first.clone()), (2, second)])
+            .await
+            .unwrap();
+        assert_eq!(
+            count_semantic_indexed_resources(&state).await.unwrap(),
+            Some(2)
+        );
+
+        let hits = query_semantic_index(
+            &state,
+            &ResourceDiscoveryQuery {
+                query: Some("commercial contract risk review".to_owned()),
+                resource_type: None,
+                capability_tags: vec![],
+                protocol: None,
+                version: None,
+                version_mode: "latest".to_owned(),
+                limit: 2,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(hits[0].package.resource_did, first.resource_did);
+        assert!(hits[0].semantic_score >= hits[1].semantic_score);
+
+        let explain = api_query_explain(
+            State(state),
+            Json(ResourceDiscoveryQuery {
+                query: Some("commercial contract risk review".to_owned()),
+                resource_type: None,
+                capability_tags: vec![],
+                protocol: None,
+                version: None,
+                version_mode: "latest".to_owned(),
+                limit: 2,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(explain.0["semanticSearch"]["fallbackUsed"], false);
+        assert!(explain.0["items"][0]["semanticScore"].as_f64().is_some());
+    }
+
+    #[tokio::test]
     async fn sqlite_query_prefilter_falls_back_to_api_equivalent_filtering() {
         let dir = tempdir().unwrap();
         let state = app_state_with_sqlite(dir.path()).await;
@@ -2486,6 +3748,94 @@ mod tests {
         assert!(projection.protocols.contains(&"https".to_owned()));
         assert!(projection.search_text.contains("contract review skill"));
         assert!(projection.search_text.contains("legal.contract.review"));
+    }
+
+    #[test]
+    fn semantic_search_document_extracts_did_metadata_without_package_examples() {
+        let package = sample_resource_package();
+        let projection = discovery_package_projection(&package);
+        let doc = search_document_from_package(42, &package, &projection);
+
+        assert_eq!(doc.resource_did, package.resource_did);
+        assert_eq!(doc.cursor, 42);
+        assert_eq!(doc.resource_type, "skill");
+        assert!(doc
+            .description
+            .contains("Detect payment, termination, liability"));
+        assert!(doc
+            .capability_tags
+            .contains(&"legal.contract.review".to_owned()));
+        assert!(doc.protocols.contains(&"https".to_owned()));
+        assert!(doc
+            .use_cases
+            .contains(&"Find payment and termination risks".to_owned()));
+        assert!(doc
+            .examples
+            .iter()
+            .any(|example| example.contains("commercial contract")));
+        assert!(doc.semantic_source_hash.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn deterministic_embedding_is_stable_and_normalized() {
+        let first = deterministic_embedding("contract risk review", 16);
+        let second = deterministic_embedding("contract risk review", 16);
+        let unrelated = deterministic_embedding("weather forecast", 16);
+
+        assert_eq!(first, second);
+        assert_ne!(first, unrelated);
+        let norm = first.iter().map(|value| value * value).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 0.0001);
+        assert_eq!(pgvector_literal(&first).matches(',').count(), 15);
+    }
+
+    #[test]
+    fn semantic_engine_and_embedding_provider_have_explicit_extension_points() {
+        let mut config = SemanticSearchConfig::default();
+        config.enabled = true;
+        assert_eq!(
+            DiscoverySearchEngine::from_config(&config).unwrap(),
+            DiscoverySearchEngine::PgVector
+        );
+        assert_eq!(
+            EmbeddingProviderKind::from_config(&config.embedding).unwrap(),
+            EmbeddingProviderKind::DeterministicLocal
+        );
+        assert!(embed_semantic_text(&config, "contract risk")
+            .unwrap()
+            .iter()
+            .any(|value| *value > 0.0));
+
+        config.engine = "grail".to_owned();
+        assert!(DiscoverySearchEngine::from_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("grail_engine_not_implemented"));
+    }
+
+    #[test]
+    fn semantic_candidate_limit_respects_headroom_and_caps() {
+        let config = SemanticSearchConfig {
+            candidate_multiplier: 8,
+            max_candidates: 500,
+            ..SemanticSearchConfig::default()
+        };
+        assert_eq!(semantic_candidate_limit(0, &config), 25);
+        assert_eq!(semantic_candidate_limit(1, &config), 25);
+        assert_eq!(semantic_candidate_limit(10, &config), 80);
+        assert_eq!(semantic_candidate_limit(100, &config), 500);
+    }
+
+    #[test]
+    fn semantic_status_is_disabled_by_default_for_json_storage() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let status = semantic_status_json(&state, true, Some("test_fallback".to_owned()));
+
+        assert_eq!(status["enabled"], false);
+        assert_eq!(status["healthy"], false);
+        assert_eq!(status["fallbackReason"], "test_fallback");
+        assert_eq!(status["filters"]["resourceType"], "hard");
     }
 
     #[test]

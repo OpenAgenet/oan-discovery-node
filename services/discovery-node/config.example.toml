@@ -25,3 +25,24 @@ data_dir = "../../data/discovery"
 index_dir = "../../data/discovery/index"
 database_url = "postgres://postgres:postgres@127.0.0.1:5432/oan_discovery"
 keys_dir = "../../data/discovery/keys"
+
+[semanticSearch]
+enabled = false
+engine = "pgvector"
+fallback = "keyword"
+defaultMode = "hybrid"
+candidateMultiplier = 8
+maxCandidates = 500
+explainEnabled = true
+
+[semanticSearch.embedding]
+provider = "deterministic-local"
+modelName = "oan-deterministic-local-v1"
+dimension = 64
+timeoutMs = 2000
+batchSize = 32
+
+[semanticSearch.filters]
+resourceType = "hard"
+capabilityTags = "soft"
+protocol = "soft"
