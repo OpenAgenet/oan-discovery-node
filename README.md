@@ -17,9 +17,11 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace -j 1
 ```
 
-Integration tests and benchmarks are run from `oan-examples`. Service-node
-identity material is copied from `oan-design-docs/genesis/nodes` into per-run
-work directories; this repository does not own genesis private material.
+Official integration tests and benchmarks are run through
+`oan-official-skill/skills/oan-system-test-ops/fixtures/oan-ops-harness`.
+Service-node identity material is copied from `oan-design-docs/genesis/nodes`
+into per-run work directories; this repository does not own genesis private
+material.
 
 ## License
 

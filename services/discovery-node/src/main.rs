@@ -1004,16 +1004,16 @@ fn search_document_from_package(
         .and_then(|metadata| metadata.resource_description.as_ref())
         .and_then(|description| description.name.clone())
         .unwrap_or_else(|| package.metadata.name.clone());
-    let embedding_text = semantic_embedding_text(
-        &name,
-        &projection.resource_type,
-        &description,
-        &tags,
-        &projection.protocols,
-        &projection.service_endpoints,
-        &examples,
-        &use_cases,
-    );
+    let embedding_text = semantic_embedding_text(&SemanticEmbeddingTextInput {
+        name: &name,
+        resource_type: &projection.resource_type,
+        description: &description,
+        capability_tags: &tags,
+        protocols: &projection.protocols,
+        service_endpoints: &projection.service_endpoints,
+        examples: &examples,
+        use_cases: &use_cases,
+    });
     SearchDocument {
         resource_did: package.resource_did.clone(),
         cursor,
@@ -1035,47 +1035,49 @@ fn search_document_from_package(
     }
 }
 
-fn semantic_embedding_text(
-    name: &str,
-    resource_type: &str,
-    description: &str,
-    capability_tags: &[String],
-    protocols: &[String],
-    service_endpoints: &[String],
-    examples: &[String],
-    use_cases: &[String],
-) -> String {
+struct SemanticEmbeddingTextInput<'a> {
+    name: &'a str,
+    resource_type: &'a str,
+    description: &'a str,
+    capability_tags: &'a [String],
+    protocols: &'a [String],
+    service_endpoints: &'a [String],
+    examples: &'a [String],
+    use_cases: &'a [String],
+}
+
+fn semantic_embedding_text(input: &SemanticEmbeddingTextInput<'_>) -> String {
     let mut text = String::new();
     text.push_str("Name:\n");
-    text.push_str(name);
+    text.push_str(input.name);
     text.push_str("\n\nResource type:\n");
-    text.push_str(resource_type);
+    text.push_str(input.resource_type);
     text.push_str("\n\nDescription:\n");
-    text.push_str(description);
+    text.push_str(input.description);
     text.push_str("\n\nCapability tags:\n");
-    text.push_str(&capability_tags.join(", "));
+    text.push_str(&input.capability_tags.join(", "));
     text.push_str("\n\nProtocols:\n");
-    text.push_str(&protocols.join(", "));
+    text.push_str(&input.protocols.join(", "));
     text.push_str("\n\nServices:\n");
-    text.push_str(&service_endpoints.join("\n"));
+    text.push_str(&input.service_endpoints.join("\n"));
     text.push_str("\n\nExamples:\n");
-    text.push_str(&examples.join("\n"));
+    text.push_str(&input.examples.join("\n"));
     text.push_str("\n\nUse cases:\n");
-    text.push_str(&use_cases.join("\n"));
+    text.push_str(&input.use_cases.join("\n"));
     text.chars().take(8_000).collect()
 }
 
 fn semantic_document_text(doc: &SearchDocument) -> String {
-    semantic_embedding_text(
-        &doc.name,
-        &doc.resource_type,
-        &doc.description,
-        &doc.capability_tags,
-        &doc.protocols,
-        &doc.service_endpoints,
-        &doc.examples,
-        &doc.use_cases,
-    )
+    semantic_embedding_text(&SemanticEmbeddingTextInput {
+        name: &doc.name,
+        resource_type: &doc.resource_type,
+        description: &doc.description,
+        capability_tags: &doc.capability_tags,
+        protocols: &doc.protocols,
+        service_endpoints: &doc.service_endpoints,
+        examples: &doc.examples,
+        use_cases: &doc.use_cases,
+    })
 }
 
 fn deterministic_embedding(text: &str, dimension: usize) -> Vec<f32> {
@@ -3791,8 +3793,10 @@ mod tests {
 
     #[test]
     fn semantic_engine_and_embedding_provider_have_explicit_extension_points() {
-        let mut config = SemanticSearchConfig::default();
-        config.enabled = true;
+        let mut config = SemanticSearchConfig {
+            enabled: true,
+            ..SemanticSearchConfig::default()
+        };
         assert_eq!(
             DiscoverySearchEngine::from_config(&config).unwrap(),
             DiscoverySearchEngine::PgVector
