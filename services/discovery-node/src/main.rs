@@ -71,6 +71,8 @@ struct DiscoveryNotificationItem {
     resource_type: Option<String>,
     #[serde(rename = "capabilityTags", default)]
     capability_tags: Vec<String>,
+    #[serde(rename = "authorizedDomains", default)]
+    authorized_domains: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1249,6 +1251,8 @@ async fn sync_resources_from_cdn_items(
     let mut fetched_count = 0usize;
     let mut cursor = start_cursor;
     let mut blocked_cursor: Option<i64> = None;
+    let discovery_domains =
+        local_discovery_authorized_domains(&state).map_err(ApiError::internal)?;
 
     let mut items = request.items;
     items.sort_by_key(|item| item.publication_cursor);
@@ -1303,6 +1307,15 @@ async fn sync_resources_from_cdn_items(
                 "resourceDid": item.resource_did,
                 "cursor": item.publication_cursor,
                 "reason": reason
+            }));
+            blocked_cursor = Some(item.publication_cursor);
+            continue;
+        }
+        if !authorized_domains_cover(&discovery_domains, &package.metadata.authorized_domains) {
+            rejected.push(json!({
+                "resourceDid": package.resource_did,
+                "cursor": item.publication_cursor,
+                "reason": "unauthorized_domains"
             }));
             blocked_cursor = Some(item.publication_cursor);
             continue;
@@ -1465,6 +1478,13 @@ fn validate_notified_resource_package(
     {
         return Err("capability_tags_mismatch".to_owned());
     }
+    if item.authorized_domains.is_empty() {
+        return Err("resource_domains_required".to_owned());
+    }
+    validate_authorized_domain_list(&item.authorized_domains)?;
+    if package.metadata.authorized_domains != item.authorized_domains {
+        return Err("authorized_domains_mismatch".to_owned());
+    }
     Ok(())
 }
 
@@ -1554,6 +1574,13 @@ async fn keyword_discovery_candidates(
     query: &ResourceDiscoveryQuery,
 ) -> Result<(Vec<ResourceDiscoveryCandidate>, usize, bool)> {
     let (packages, prefiltered) = query_indexed_resource_packages(state, query).await?;
+    let allowed_domains = local_discovery_authorized_domains(state)?;
+    let packages = packages
+        .into_iter()
+        .filter(|package| {
+            authorized_domains_cover(&allowed_domains, &package.metadata.authorized_domains)
+        })
+        .collect::<Vec<_>>();
     let candidate_count = packages.len();
     let candidates = packages
         .into_iter()
@@ -1577,6 +1604,7 @@ fn discovery_candidate_from_package(
         version: Some(package.package_version.clone()),
         lifecycle_state: Some(package.metadata.lifecycle_state.clone()),
         capability_tags: package.metadata.capability_tags.clone(),
+        authorized_domains: package.metadata.authorized_domains.clone(),
         services: package.metadata.services.clone(),
         protocol_bindings: package.metadata.protocol_bindings.clone(),
         package_info: package
@@ -2475,11 +2503,11 @@ async fn query_indexed_resource_packages(
             .into_iter()
             .map(|row| serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(0)))
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        return Ok((packages, true));
+        return Ok((filter_packages_for_local_discovery(state, packages)?, true));
     }
     read_indexed_resource_packages(state)
         .await
-        .map(|packages| (packages, false))
+        .and_then(|packages| Ok((filter_packages_for_local_discovery(state, packages)?, false)))
 }
 
 async fn query_semantic_index(
@@ -2586,9 +2614,85 @@ async fn query_pgvector_semantic_index(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let allowed_domains = local_discovery_authorized_domains(state)?;
+    hits.retain(|hit| {
+        authorized_domains_cover(&allowed_domains, &hit.package.metadata.authorized_domains)
+    });
     hits.sort_by(|a, b| b.final_score.total_cmp(&a.final_score));
     hits.truncate(query.limit as usize);
     Ok(Some(hits))
+}
+
+fn filter_packages_for_local_discovery(
+    state: &AppState,
+    packages: Vec<ResourcePackage>,
+) -> Result<Vec<ResourcePackage>> {
+    let allowed_domains = local_discovery_authorized_domains(state)?;
+    Ok(packages
+        .into_iter()
+        .filter(|package| {
+            authorized_domains_cover(&allowed_domains, &package.metadata.authorized_domains)
+        })
+        .collect())
+}
+
+fn local_discovery_authorized_domains(state: &AppState) -> Result<Vec<String>> {
+    let document: DidDocument = state.data.read("did-document.json")?;
+    let domains = document
+        .oan_metadata
+        .as_ref()
+        .map(|metadata| metadata.authorized_domains.clone())
+        .unwrap_or_default();
+    validate_authorized_domain_list(&domains).map_err(anyhow::Error::msg)?;
+    Ok(domains)
+}
+
+fn validate_authorized_domain_list(domains: &[String]) -> std::result::Result<(), String> {
+    if domains.iter().any(|domain| domain == "*") {
+        return if domains.len() == 1 {
+            Ok(())
+        } else {
+            Err("invalid_authorized_domains".to_owned())
+        };
+    }
+    for domain in domains {
+        if domain.trim().is_empty()
+            || domain != domain.trim()
+            || domain.contains("..")
+            || domain.starts_with('.')
+            || domain.ends_with('.')
+        {
+            return Err("invalid_authorized_domains".to_owned());
+        }
+    }
+    if domains.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err("invalid_authorized_domains".to_owned());
+    }
+    Ok(())
+}
+
+fn authorized_domain_covers(granted: &str, requested: &str) -> bool {
+    granted == requested
+        || requested
+            .strip_prefix(granted)
+            .is_some_and(|suffix| suffix.starts_with('.'))
+}
+
+fn authorized_domains_cover(granted: &[String], requested: &[String]) -> bool {
+    if requested.is_empty() {
+        return false;
+    }
+    if granted.iter().any(|domain| domain == "*") {
+        return true;
+    }
+    if granted.is_empty() {
+        return false;
+    }
+    requested.iter().all(|requested_domain| {
+        granted
+            .iter()
+            .any(|granted_domain| authorized_domain_covers(granted_domain, requested_domain))
+    })
 }
 
 fn semantic_candidate_limit(query_limit: u32, config: &SemanticSearchConfig) -> i64 {
@@ -2914,6 +3018,10 @@ fn validate_resource_package_for_index(
     if package.metadata.lifecycle_state != "active" {
         return Err("resource_not_active".to_owned());
     }
+    if package.metadata.authorized_domains.is_empty() {
+        return Err("resource_domains_required".to_owned());
+    }
+    validate_authorized_domain_list(&package.metadata.authorized_domains)?;
     Ok(())
 }
 
@@ -3020,7 +3128,7 @@ fn discovery_authorized_domains(bulletin: &Value, discovery_did: &str) -> Vec<St
                 .filter_map(|value| value.as_str().map(ToOwned::to_owned))
                 .collect()
         })
-        .unwrap_or_else(|| vec!["*".to_owned()])
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -3097,6 +3205,7 @@ mod tests {
                 }),
                 agent_description: None,
                 capability_tags: vec!["legal.contract.review".to_owned()],
+                authorized_domains: vec!["legal".to_owned()],
                 protocol_bindings: vec![ProtocolBinding {
                     id: format!("{did}#binding-https"),
                     protocol: "https".to_owned(),
@@ -3139,6 +3248,7 @@ mod tests {
                 name: "Contract Review Skill".to_owned(),
                 description: "Review contracts and highlight risky clauses".to_owned(),
                 capability_tags: vec!["legal.contract.review".to_owned()],
+                authorized_domains: vec!["legal".to_owned()],
                 protocol_bindings: vec![json!({"protocol": "https", "role": "download"})],
                 services: vec![ServiceEndpoint {
                     id: format!("{}#download", resource_did()),
@@ -3207,6 +3317,7 @@ mod tests {
                 package_hash: package.package_hash.clone(),
                 hash_algorithm: package.hash_algorithm.clone(),
                 lifecycle_state: package.metadata.lifecycle_state.clone(),
+                authorized_domains: package.metadata.authorized_domains.clone(),
                 bulletin_ref: None,
             })
             .unwrap(),
@@ -3228,7 +3339,7 @@ mod tests {
     }
 
     fn app_state(dir: &std::path::Path) -> AppState {
-        AppState {
+        let state = AppState {
             data: JsonStore::new(dir.join("data")),
             index: JsonStore::new(dir.join("index")),
             config: Config {
@@ -3260,7 +3371,55 @@ mod tests {
             client: reqwest::Client::new(),
             resource_sync_lock: Arc::new(Mutex::new(())),
             index_stats_cache: Arc::new(Mutex::new(None)),
-        }
+        };
+        write_discovery_document(&state, vec!["*".to_owned()]);
+        state
+    }
+
+    fn write_discovery_document(state: &AppState, domains: Vec<String>) {
+        let did = discovery_did();
+        let document = DidDocument {
+            context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+            id: did.clone(),
+            verification_method: vec![],
+            authentication: vec![],
+            assertion_method: vec![],
+            service: vec![],
+            oan_metadata: Some(OanMetadata {
+                subject_type: ResourceType::InfrastructureNode,
+                resource_type: ResourceType::InfrastructureNode,
+                node_role: Some("discovery".to_owned()),
+                identity_type: Some("discovery".to_owned()),
+                controller_did: None,
+                publisher_did: None,
+                issuer_did: None,
+                ttl: None,
+                resource_description: None,
+                agent_description: None,
+                capability_tags: vec![],
+                authorized_domains: domains,
+                protocol_bindings: vec![],
+                implementation_links: vec![],
+                credential_requirements: vec![],
+                package_info: None,
+                service_policy: None,
+                network_scope: Some("oan-local".to_owned()),
+                lifecycle_state: Some("active".to_owned()),
+                extra: Default::default(),
+            }),
+        };
+        state.data.write("did-document.json", &document).unwrap();
+    }
+
+    fn set_package_authorized_domains(package: &mut ResourcePackage, domains: Vec<String>) {
+        package.metadata.authorized_domains = domains.clone();
+        package
+            .did_document
+            .oan_metadata
+            .as_mut()
+            .unwrap()
+            .authorized_domains = domains;
+        refresh_hashes(package);
     }
 
     async fn app_state_with_sqlite(dir: &std::path::Path) -> AppState {
@@ -3343,6 +3502,7 @@ mod tests {
                 resource_description: None,
                 agent_description: None,
                 capability_tags: vec![],
+                authorized_domains: vec!["*".to_owned()],
                 protocol_bindings: vec![],
                 implementation_links: vec![],
                 credential_requirements: vec![],
@@ -3368,6 +3528,17 @@ mod tests {
         assert_eq!(
             validate_resource_package_for_index(&package).unwrap_err(),
             "metadata hash mismatch"
+        );
+    }
+
+    #[test]
+    fn resource_package_validation_rejects_missing_authorized_domains() {
+        let mut package = sample_resource_package();
+        set_package_authorized_domains(&mut package, vec![]);
+
+        assert_eq!(
+            validate_resource_package_for_index(&package).unwrap_err(),
+            "resource_domains_required"
         );
     }
 
@@ -3663,6 +3834,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resource_query_filters_indexed_packages_outside_discovery_grant() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        write_discovery_document(&state, vec!["legal".to_owned()]);
+        let legal = sample_resource_package();
+        let mut finance =
+            sample_resource_package_with_did("did:oan:SKLG:33333333333333333333333333333333");
+        set_package_authorized_domains(&mut finance, vec!["finance".to_owned()]);
+        upsert_indexed_resource_package(&state, 1, &legal)
+            .await
+            .unwrap();
+        upsert_indexed_resource_package(&state, 2, &finance)
+            .await
+            .unwrap();
+
+        let response = resource_query(
+            State(state),
+            Json(ResourceDiscoveryQuery {
+                query: None,
+                resource_type: Some(ResourceType::Skill),
+                capability_tags: vec![],
+                protocol: None,
+                version: None,
+                version_mode: "latest".to_owned(),
+                limit: 10,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0.candidates.len(), 1);
+        assert_eq!(response.0.candidates[0].resource_did, legal.resource_did);
+        assert_eq!(
+            response.0.candidates[0].authorized_domains,
+            vec!["legal".to_owned()]
+        );
+    }
+
+    #[tokio::test]
     async fn database_index_count_and_point_lookup_do_not_require_full_scan() {
         let dir = tempdir().unwrap();
         let state = app_state_with_sqlite(dir.path()).await;
@@ -3916,6 +4126,7 @@ mod tests {
                     did_document_hash: package.did_document_hash.clone(),
                     resource_type: Some("skill".to_owned()),
                     capability_tags: package.metadata.capability_tags.clone(),
+                    authorized_domains: package.metadata.authorized_domains.clone(),
                 }],
             }),
         )
@@ -3969,6 +4180,7 @@ mod tests {
                     did_document_hash: package.did_document_hash.clone(),
                     resource_type: Some("skill".to_owned()),
                     capability_tags: package.metadata.capability_tags.clone(),
+                    authorized_domains: package.metadata.authorized_domains.clone(),
                 }],
             }),
         )
@@ -3979,6 +4191,171 @@ mod tests {
         assert_eq!(response.0["syncedResourceCount"], 0);
         assert_eq!(response.0["rejectedCount"], 1);
         assert_eq!(response.0["rejected"][0]["reason"], "package_hash_mismatch");
+        assert_eq!(
+            read_indexed_resource_packages(&state).await.unwrap().len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_resources_from_authorized_summary_rejects_authorized_domains_mismatch() {
+        let dir = tempdir().unwrap();
+        let package = sample_resource_package();
+        let app = Router::new().route(
+            "/cdn/resources/{*did}",
+            get({
+                let package = package.clone();
+                move || {
+                    let package = package.clone();
+                    async move { Json(package) }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut state = app_state_with_sqlite(dir.path()).await;
+        state.config.upstream.cdn_endpoint = Some(format!("http://{addr}"));
+        let response = sync_resources_from_authorized_summary(
+            State(state.clone()),
+            Json(DiscoverySyncRequest {
+                max_publications: Some(10),
+                cursor_hint: Some(9),
+                items: vec![DiscoveryNotificationItem {
+                    resource_did: package.resource_did.clone(),
+                    package_version: package.package_version.clone(),
+                    publication_cursor: 9,
+                    package_hash: package.package_hash.clone(),
+                    metadata_hash: package.metadata_hash.clone(),
+                    did_document_hash: package.did_document_hash.clone(),
+                    resource_type: Some("skill".to_owned()),
+                    capability_tags: package.metadata.capability_tags.clone(),
+                    authorized_domains: vec!["finance".to_owned()],
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0["syncMode"], "authorized-summary");
+        assert_eq!(response.0["syncedResourceCount"], 0);
+        assert_eq!(response.0["rejectedCount"], 1);
+        assert_eq!(
+            response.0["rejected"][0]["reason"],
+            "authorized_domains_mismatch"
+        );
+        assert_eq!(
+            read_indexed_resource_packages(&state).await.unwrap().len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_resources_from_authorized_summary_rejects_missing_authorized_domains_item() {
+        let dir = tempdir().unwrap();
+        let package = sample_resource_package();
+        let app = Router::new().route(
+            "/cdn/resources/{*did}",
+            get({
+                let package = package.clone();
+                move || {
+                    let package = package.clone();
+                    async move { Json(package) }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut state = app_state_with_sqlite(dir.path()).await;
+        state.config.upstream.cdn_endpoint = Some(format!("http://{addr}"));
+        let response = sync_resources_from_authorized_summary(
+            State(state.clone()),
+            Json(DiscoverySyncRequest {
+                max_publications: Some(10),
+                cursor_hint: Some(9),
+                items: vec![DiscoveryNotificationItem {
+                    resource_did: package.resource_did.clone(),
+                    package_version: package.package_version.clone(),
+                    publication_cursor: 9,
+                    package_hash: package.package_hash.clone(),
+                    metadata_hash: package.metadata_hash.clone(),
+                    did_document_hash: package.did_document_hash.clone(),
+                    resource_type: Some("skill".to_owned()),
+                    capability_tags: package.metadata.capability_tags.clone(),
+                    authorized_domains: vec![],
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0["syncedResourceCount"], 0);
+        assert_eq!(response.0["rejectedCount"], 1);
+        assert_eq!(
+            response.0["rejected"][0]["reason"],
+            "resource_domains_required"
+        );
+        assert_eq!(
+            read_indexed_resource_packages(&state).await.unwrap().len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_resources_from_authorized_summary_rejects_domains_outside_discovery_grant() {
+        let dir = tempdir().unwrap();
+        let mut package = sample_resource_package();
+        set_package_authorized_domains(&mut package, vec!["finance".to_owned()]);
+        let app = Router::new().route(
+            "/cdn/resources/{*did}",
+            get({
+                let package = package.clone();
+                move || {
+                    let package = package.clone();
+                    async move { Json(package) }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut state = app_state_with_sqlite(dir.path()).await;
+        write_discovery_document(&state, vec!["legal".to_owned()]);
+        state.config.upstream.cdn_endpoint = Some(format!("http://{addr}"));
+        let response = sync_resources_from_authorized_summary(
+            State(state.clone()),
+            Json(DiscoverySyncRequest {
+                max_publications: Some(10),
+                cursor_hint: Some(9),
+                items: vec![DiscoveryNotificationItem {
+                    resource_did: package.resource_did.clone(),
+                    package_version: package.package_version.clone(),
+                    publication_cursor: 9,
+                    package_hash: package.package_hash.clone(),
+                    metadata_hash: package.metadata_hash.clone(),
+                    did_document_hash: package.did_document_hash.clone(),
+                    resource_type: Some("skill".to_owned()),
+                    capability_tags: package.metadata.capability_tags.clone(),
+                    authorized_domains: package.metadata.authorized_domains.clone(),
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0["syncedResourceCount"], 0);
+        assert_eq!(response.0["rejectedCount"], 1);
+        assert_eq!(response.0["rejected"][0]["reason"], "unauthorized_domains");
         assert_eq!(
             read_indexed_resource_packages(&state).await.unwrap().len(),
             0
@@ -4031,6 +4408,7 @@ mod tests {
                         did_document_hash: first.did_document_hash.clone(),
                         resource_type: Some("skill".to_owned()),
                         capability_tags: first.metadata.capability_tags.clone(),
+                        authorized_domains: first.metadata.authorized_domains.clone(),
                     },
                     DiscoveryNotificationItem {
                         resource_did: missing_did,
@@ -4041,6 +4419,7 @@ mod tests {
                         did_document_hash: "sha256:missing".to_owned(),
                         resource_type: Some("skill".to_owned()),
                         capability_tags: vec![],
+                        authorized_domains: vec![],
                     },
                 ],
             }),
@@ -4104,11 +4483,11 @@ mod tests {
     }
 
     #[test]
-    fn discovery_authorized_domains_defaults_to_wildcard_and_uses_latest_update() {
+    fn discovery_authorized_domains_defaults_to_empty_and_uses_latest_update() {
         let did = discovery_did();
         assert_eq!(
             discovery_authorized_domains(&json!({"events": []}), &did),
-            vec!["*".to_owned()]
+            Vec::<String>::new()
         );
         let bulletin = json!({
             "events": [
