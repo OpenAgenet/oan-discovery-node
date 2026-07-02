@@ -19,6 +19,9 @@ use oan_package::ResourcePackage;
 use oan_protocol::{
     HealthResponse, ResourceDiscoveryCandidate, ResourceDiscoveryQuery, ResourceDiscoveryResponse,
 };
+use oan_semantic_recommender::{
+    DiscoverySuggestionContext, DiscoverySuggestionInput, SemanticRecommender,
+};
 use oan_storage::{DatabaseBackend, DatabaseConfig, JsonStore, PostgresJsonStore, SqliteJsonStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -325,6 +328,7 @@ struct AppState {
     sqlite: Option<SqliteJsonStore>,
     postgres: Option<PostgresJsonStore>,
     semantic: SemanticRuntimeState,
+    recommender: Arc<SemanticRecommender>,
     client: reqwest::Client,
     resource_sync_lock: Arc<Mutex<()>>,
     index_stats_cache: Arc<Mutex<Option<CachedIndexStats>>>,
@@ -598,6 +602,7 @@ async fn main() -> Result<()> {
         sqlite,
         postgres,
         semantic,
+        recommender: Arc::new(SemanticRecommender::new()?),
         client: reqwest::Client::new(),
         resource_sync_lock: Arc::new(Mutex::new(())),
         index_stats_cache: Arc::new(Mutex::new(None)),
@@ -625,6 +630,7 @@ async fn main() -> Result<()> {
             get(api_index_resource_detail),
         )
         .route("/discovery/resources/query", post(resource_query))
+        .route("/discovery/query/suggestions", post(api_query_suggestions))
         .route("/discovery/query/explain", post(api_query_explain))
         .route("/discovery/rejected-packages", get(api_rejected_packages))
         .route("/discovery/capability-tree", get(api_capability_tree))
@@ -1838,6 +1844,28 @@ async fn api_index_resource_detail(
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(json!({ "resourceDid": did, "package": package })))
+}
+
+async fn api_query_suggestions(
+    State(state): State<AppState>,
+    Json(input): Json<DiscoverySuggestionInput>,
+) -> ApiResult<Value> {
+    let result = state
+        .recommender
+        .suggest_discovery_query(
+            input,
+            DiscoverySuggestionContext {
+                discovery_did: state.did.clone(),
+                searchable_domains: local_discovery_authorized_domains(&state)
+                    .map_err(ApiError::internal)?,
+                max_authorized_domain_hints: 8,
+                max_capability_tag_candidates: 12,
+            },
+        )
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    Ok(Json(
+        serde_json::to_value(result).map_err(|err| ApiError::internal(anyhow!(err)))?,
+    ))
 }
 
 async fn api_query_explain(
@@ -3368,6 +3396,7 @@ mod tests {
                 "semantic_disabled",
                 &SemanticSearchConfig::default(),
             ),
+            recommender: Arc::new(SemanticRecommender::new().unwrap()),
             client: reqwest::Client::new(),
             resource_sync_lock: Arc::new(Mutex::new(())),
             index_stats_cache: Arc::new(Mutex::new(None)),

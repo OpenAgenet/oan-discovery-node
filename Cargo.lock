@@ -425,6 +425,7 @@ dependencies = [
  "oan-crypto",
  "oan-package",
  "oan-protocol",
+ "oan-semantic-recommender",
  "oan-storage",
  "reqwest",
  "serde",
@@ -1345,6 +1346,17 @@ dependencies = [
  "oan-package",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "oan-semantic-recommender"
+version = "0.1.0"
+dependencies = [
+ "oan-core",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

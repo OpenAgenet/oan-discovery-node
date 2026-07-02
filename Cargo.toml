@@ -31,4 +31,5 @@ oan-core = { path = "../oan-protocol-common/crates/oan-core" }
 oan-crypto = { path = "../oan-protocol-common/crates/oan-crypto" }
 oan-package = { path = "../oan-protocol-common/crates/oan-package" }
 oan-protocol = { path = "../oan-protocol-common/crates/oan-protocol" }
+oan-semantic-recommender = { path = "../oan-protocol-common/crates/oan-semantic-recommender" }
 oan-storage = { path = "../oan-protocol-common/crates/oan-storage" }
