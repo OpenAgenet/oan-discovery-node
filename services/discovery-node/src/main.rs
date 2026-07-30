@@ -1129,7 +1129,7 @@ fn normalize_vector(mut vector: Vec<f32>) -> Vec<f32> {
 
 fn pgvector_literal(vector: &[f32]) -> String {
     format!(
-        "[{}]",
+        "'[{}]'",
         vector
             .iter()
             .map(|value| format!("{value:.8}"))
@@ -4028,6 +4028,8 @@ mod tests {
         let norm = first.iter().map(|value| value * value).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 0.0001);
         assert_eq!(pgvector_literal(&first).matches(',').count(), 15);
+        assert!(pgvector_literal(&first).starts_with("'["));
+        assert!(pgvector_literal(&first).ends_with("]'"));
     }
 
     #[test]
