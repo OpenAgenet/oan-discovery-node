@@ -1499,6 +1499,28 @@ async fn resource_query(
     Json(query): Json<ResourceDiscoveryQuery>,
 ) -> ApiResult<ResourceDiscoveryResponse> {
     let started = Instant::now();
+    if let Some(resource_did) = query_resource_did(&query) {
+        let package = read_indexed_resource_package(&state, resource_did)
+            .await
+            .map_err(ApiError::internal)?;
+        let candidates = package
+            .filter(|package| resource_matches_exact_did_query(package, &query))
+            .map(|package| discovery_candidate_from_package(package, 1.0))
+            .into_iter()
+            .collect::<Vec<_>>();
+        println!(
+            "discovery_query backend=exact-did indexed=true candidates={} returned={} elapsed_ms={}",
+            candidates.len(),
+            candidates.len(),
+            started.elapsed().as_millis()
+        );
+        return Ok(Json(ResourceDiscoveryResponse {
+            discovery_did: state.did,
+            candidates,
+            created_at: Utc::now(),
+            proof: None,
+        }));
+    }
     let semantic_result = query_semantic_index(&state, &query).await;
     let (mut candidates, candidate_count, prefiltered, backend) = match semantic_result {
         Ok(Some(hits)) if !hits.is_empty() => {
@@ -1573,6 +1595,15 @@ async fn resource_query(
         created_at: Utc::now(),
         proof: None,
     }))
+}
+
+fn query_resource_did(query: &ResourceDiscoveryQuery) -> Option<&str> {
+    let value = query.query.as_ref()?.trim();
+    if value.starts_with("did:oan:") && !value.chars().any(char::is_whitespace) {
+        Some(value)
+    } else {
+        None
+    }
 }
 
 async fn keyword_discovery_candidates(
@@ -3109,6 +3140,15 @@ fn resource_matches_query(package: &ResourcePackage, query: &ResourceDiscoveryQu
     true
 }
 
+fn resource_matches_exact_did_query(
+    package: &ResourcePackage,
+    query: &ResourceDiscoveryQuery,
+) -> bool {
+    let mut query_without_text = query.clone();
+    query_without_text.query = None;
+    resource_matches_query(package, &query_without_text)
+}
+
 fn resource_score(package: &ResourcePackage, query: &ResourceDiscoveryQuery) -> f32 {
     let mut score = 0.5;
     if query
@@ -3624,6 +3664,52 @@ mod tests {
         let value = serde_json::to_value(&response.0).unwrap();
         assert_eq!(value["candidates"].as_array().unwrap().len(), 1);
         assert_eq!(value["candidates"][0]["resourceDid"], resource_did());
+    }
+
+    #[tokio::test]
+    async fn resource_query_treats_complete_did_as_exact_lookup() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let target = sample_resource_package();
+        let other = sample_resource_package_with_did("did:oan:SKLG:33333333333333333333333333333333");
+        write_indexed_resource_packages(&state, &[target.clone(), other])
+            .await
+            .unwrap();
+
+        let response = resource_query(
+            State(state.clone()),
+            Json(ResourceDiscoveryQuery {
+                query: Some(target.resource_did.clone()),
+                resource_type: Some(ResourceType::Skill),
+                capability_tags: vec![],
+                protocol: None,
+                version: None,
+                version_mode: "latest".to_owned(),
+                limit: 5,
+            }),
+        )
+        .await
+        .unwrap();
+        let candidates = response.0.candidates;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].resource_did, target.resource_did);
+        assert_eq!(candidates[0].score, 1.0);
+
+        let response = resource_query(
+            State(state),
+            Json(ResourceDiscoveryQuery {
+                query: Some(target.resource_did),
+                resource_type: Some(ResourceType::McpServer),
+                capability_tags: vec![],
+                protocol: None,
+                version: None,
+                version_mode: "latest".to_owned(),
+                limit: 5,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(response.0.candidates.is_empty());
     }
 
     #[tokio::test]
