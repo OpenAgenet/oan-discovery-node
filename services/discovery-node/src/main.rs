@@ -60,14 +60,20 @@ struct DiscoverySyncRequest {
 struct DiscoveryNotificationItem {
     #[serde(rename = "resourceDid")]
     resource_did: String,
+    // Kept in the notification contract for audit/compatibility. The discovery
+    // node indexes the current CDN package and validates the package itself.
+    #[allow(dead_code)]
     #[serde(rename = "packageVersion")]
     package_version: String,
     #[serde(rename = "publicationCursor")]
     publication_cursor: i64,
+    #[allow(dead_code)]
     #[serde(rename = "packageHash")]
     package_hash: String,
+    #[allow(dead_code)]
     #[serde(rename = "metadataHash")]
     metadata_hash: String,
+    #[allow(dead_code)]
     #[serde(rename = "didDocumentHash")]
     did_document_hash: String,
     #[serde(rename = "resourceType", default)]
@@ -1278,10 +1284,8 @@ async fn sync_resources_from_cdn_items(
         if item.publication_cursor > target_cursor {
             break;
         }
-        if blocked_cursor.is_some() {
-            break;
-        }
         fetched_count += 1;
+        cursor = cursor.max(item.publication_cursor);
         let package = if let Some(package) = batch_packages.get(&item.resource_did) {
             package.clone()
         } else {
@@ -1293,7 +1297,7 @@ async fn sync_resources_from_cdn_items(
                         "cursor": item.publication_cursor,
                         "reason": "resource_package_unavailable"
                     }));
-                    blocked_cursor = Some(item.publication_cursor);
+                    blocked_cursor.get_or_insert(item.publication_cursor);
                     continue;
                 }
                 Err(err) => return Err(ApiError::internal(err)),
@@ -1305,7 +1309,7 @@ async fn sync_resources_from_cdn_items(
                 "cursor": item.publication_cursor,
                 "reason": "resource_did_mismatch"
             }));
-            blocked_cursor = Some(item.publication_cursor);
+            blocked_cursor.get_or_insert(item.publication_cursor);
             continue;
         }
         if let Err(reason) = validate_notified_resource_package(&item, &package) {
@@ -1314,7 +1318,7 @@ async fn sync_resources_from_cdn_items(
                 "cursor": item.publication_cursor,
                 "reason": reason
             }));
-            blocked_cursor = Some(item.publication_cursor);
+            blocked_cursor.get_or_insert(item.publication_cursor);
             continue;
         }
         if !authorized_domains_cover(&discovery_domains, &package.metadata.authorized_domains) {
@@ -1323,7 +1327,7 @@ async fn sync_resources_from_cdn_items(
                 "cursor": item.publication_cursor,
                 "reason": "unauthorized_domains"
             }));
-            blocked_cursor = Some(item.publication_cursor);
+            blocked_cursor.get_or_insert(item.publication_cursor);
             continue;
         }
         if let Err(reason) = validate_resource_package_for_index(&package) {
@@ -1332,10 +1336,9 @@ async fn sync_resources_from_cdn_items(
                 "cursor": item.publication_cursor,
                 "reason": reason
             }));
-            blocked_cursor = Some(item.publication_cursor);
+            blocked_cursor.get_or_insert(item.publication_cursor);
             continue;
         }
-        cursor = cursor.max(item.publication_cursor);
         accepted.push((item.publication_cursor, package));
     }
 
@@ -1458,18 +1461,6 @@ fn validate_notified_resource_package(
 ) -> std::result::Result<(), String> {
     if package.resource_did != item.resource_did {
         return Err("resource_did_mismatch".to_owned());
-    }
-    if package.package_version != item.package_version {
-        return Err("package_version_mismatch".to_owned());
-    }
-    if package.package_hash != item.package_hash {
-        return Err("package_hash_mismatch".to_owned());
-    }
-    if package.metadata_hash != item.metadata_hash {
-        return Err("metadata_hash_mismatch".to_owned());
-    }
-    if package.did_document_hash != item.did_document_hash {
-        return Err("did_document_hash_mismatch".to_owned());
     }
     if let Some(resource_type) = item.resource_type.as_deref() {
         let package_resource_type = serde_json::to_value(&package.resource_type)
@@ -2091,6 +2082,7 @@ async fn upsert_indexed_resource_packages_batch(
     if packages.is_empty() {
         return Ok(());
     }
+    let packages = latest_resource_packages_by_did(packages);
     let updated_at = Utc::now();
     let updated_at_text = updated_at.to_rfc3339();
     if let Some(sqlite) = &state.sqlite {
@@ -2204,6 +2196,23 @@ async fn upsert_indexed_resource_packages_batch(
     }
     state.index.write("resource-capabilities.json", &indexed)?;
     Ok(())
+}
+
+fn latest_resource_packages_by_did(
+    packages: &[(i64, ResourcePackage)],
+) -> Vec<(i64, ResourcePackage)> {
+    let mut latest = BTreeMap::<String, (i64, ResourcePackage)>::new();
+    for (cursor, package) in packages {
+        latest
+            .entry(package.resource_did.clone())
+            .and_modify(|existing| {
+                if *cursor >= existing.0 {
+                    *existing = (*cursor, package.clone());
+                }
+            })
+            .or_insert_with(|| (*cursor, package.clone()));
+    }
+    latest.into_values().collect()
 }
 
 async fn upsert_semantic_index_batch(
@@ -3144,9 +3153,10 @@ fn resource_matches_exact_did_query(
     package: &ResourcePackage,
     query: &ResourceDiscoveryQuery,
 ) -> bool {
-    let mut query_without_text = query.clone();
-    query_without_text.query = None;
-    resource_matches_query(package, &query_without_text)
+    query
+        .version
+        .as_ref()
+        .map_or(true, |version| version == &package.package_version)
 }
 
 fn resource_score(package: &ResourcePackage, query: &ResourceDiscoveryQuery) -> f32 {
@@ -3671,7 +3681,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let state = app_state(dir.path());
         let target = sample_resource_package();
-        let other = sample_resource_package_with_did("did:oan:SKLG:33333333333333333333333333333333");
+        let mut other = sample_resource_package_with_did("did:oan:MCDM:33333333333333333333333333333333");
+        other.resource_type = ResourceType::McpServer;
         write_indexed_resource_packages(&state, &[target.clone(), other])
             .await
             .unwrap();
@@ -3698,8 +3709,8 @@ mod tests {
         let response = resource_query(
             State(state),
             Json(ResourceDiscoveryQuery {
-                query: Some(target.resource_did),
-                resource_type: Some(ResourceType::McpServer),
+                query: Some("did:oan:MCDM:33333333333333333333333333333333".to_owned()),
+                resource_type: Some(ResourceType::Skill),
                 capability_tags: vec![],
                 protocol: None,
                 version: None,
@@ -3709,7 +3720,13 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(response.0.candidates.is_empty());
+        let candidates = response.0.candidates;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].resource_did,
+            "did:oan:MCDM:33333333333333333333333333333333"
+        );
+        assert_eq!(candidates[0].resource_type, ResourceType::McpServer);
     }
 
     #[tokio::test]
@@ -3845,6 +3862,31 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(found_second.metadata.name, "Invoice Review Skill");
+    }
+
+    #[tokio::test]
+    async fn sqlite_resource_index_batch_upsert_keeps_latest_duplicate_did() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        let mut first = sample_resource_package();
+        first.package_version = "1.0.0".to_owned();
+        first.metadata.package_version = first.package_version.clone();
+        first.metadata.description = "older package".to_owned();
+        refresh_hashes(&mut first);
+        let mut second = first.clone();
+        second.package_version = "1.1.0".to_owned();
+        second.metadata.package_version = second.package_version.clone();
+        second.metadata.description = "newer package".to_owned();
+        refresh_hashes(&mut second);
+
+        upsert_indexed_resource_packages_batch(&state, &[(10, first), (11, second)])
+            .await
+            .unwrap();
+
+        let packages = read_indexed_resource_packages(&state).await.unwrap();
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].package_version, "1.1.0");
+        assert_eq!(packages[0].metadata.description, "newer package");
     }
 
     #[tokio::test]
@@ -4262,7 +4304,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_resources_from_authorized_summary_rejects_hash_mismatch() {
+    async fn sync_resources_from_authorized_summary_indexes_current_package_for_stale_hash_notice() {
         let dir = tempdir().unwrap();
         let package = sample_resource_package();
         let app = Router::new().route(
@@ -4293,8 +4335,8 @@ mod tests {
                     package_version: package.package_version.clone(),
                     publication_cursor: 9,
                     package_hash: "sha256:bad".to_owned(),
-                    metadata_hash: package.metadata_hash.clone(),
-                    did_document_hash: package.did_document_hash.clone(),
+                    metadata_hash: "sha256:bad".to_owned(),
+                    did_document_hash: "sha256:bad".to_owned(),
                     resource_type: Some("skill".to_owned()),
                     capability_tags: package.metadata.capability_tags.clone(),
                     authorized_domains: package.metadata.authorized_domains.clone(),
@@ -4305,13 +4347,63 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.0["syncMode"], "authorized-summary");
-        assert_eq!(response.0["syncedResourceCount"], 0);
-        assert_eq!(response.0["rejectedCount"], 1);
-        assert_eq!(response.0["rejected"][0]["reason"], "package_hash_mismatch");
-        assert_eq!(
-            read_indexed_resource_packages(&state).await.unwrap().len(),
-            0
+        assert_eq!(response.0["syncedResourceCount"], 1);
+        assert_eq!(response.0["rejectedCount"], 0);
+        let indexed = read_indexed_resource_packages(&state).await.unwrap();
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].resource_did, package.resource_did);
+    }
+
+    #[tokio::test]
+    async fn sync_resources_from_authorized_summary_indexes_current_cdn_package_for_stale_notice() {
+        let dir = tempdir().unwrap();
+        let package = sample_resource_package();
+        let app = Router::new().route(
+            "/cdn/resources/{*did}",
+            get({
+                let package = package.clone();
+                move || {
+                    let package = package.clone();
+                    async move { Json(package) }
+                }
+            }),
         );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut state = app_state_with_sqlite(dir.path()).await;
+        state.config.upstream.cdn_endpoint = Some(format!("http://{addr}"));
+        let response = sync_resources_from_authorized_summary(
+            State(state.clone()),
+            Json(DiscoverySyncRequest {
+                max_publications: Some(10),
+                cursor_hint: Some(9),
+                items: vec![DiscoveryNotificationItem {
+                    resource_did: package.resource_did.clone(),
+                    package_version: "1.0.0".to_owned(),
+                    publication_cursor: 9,
+                    package_hash: "sha256:older".to_owned(),
+                    metadata_hash: "sha256:older".to_owned(),
+                    did_document_hash: "sha256:older".to_owned(),
+                    resource_type: Some("skill".to_owned()),
+                    capability_tags: package.metadata.capability_tags.clone(),
+                    authorized_domains: package.metadata.authorized_domains.clone(),
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0["syncMode"], "authorized-summary");
+        assert_eq!(response.0["syncedResourceCount"], 1);
+        assert_eq!(response.0["rejectedCount"], 0);
+        let indexed = read_indexed_resource_packages(&state).await.unwrap();
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].resource_did, package.resource_did);
+        assert_eq!(indexed[0].package_version, package.package_version);
     }
 
     #[tokio::test]
@@ -4480,20 +4572,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_resources_from_authorized_summary_keeps_cursor_before_unavailable_package() {
+    async fn sync_resources_from_authorized_summary_skips_unavailable_package_without_blocking() {
         let dir = tempdir().unwrap();
         let first =
             sample_resource_package_with_did("did:oan:SKLG:11111111111111111111111111111111");
+        let third =
+            sample_resource_package_with_did("did:oan:SKLG:33333333333333333333333333333333");
         let missing_did = "did:oan:SKLG:22222222222222222222222222222222".to_owned();
         let app = Router::new().route(
             "/cdn/resources/{*did}",
             get({
                 let first = first.clone();
+                let third = third.clone();
                 move |AxumPath(did): AxumPath<String>| {
                     let first = first.clone();
+                    let third = third.clone();
                     async move {
-                        if did.trim_start_matches('/') == first.resource_did {
+                        let did = did.trim_start_matches('/');
+                        if did == first.resource_did {
                             Json(first).into_response()
+                        } else if did == third.resource_did {
+                            Json(third).into_response()
                         } else {
                             (StatusCode::NOT_FOUND, Json(json!({"error": "missing"})))
                                 .into_response()
@@ -4514,7 +4613,7 @@ mod tests {
             State(state.clone()),
             Json(DiscoverySyncRequest {
                 max_publications: Some(10),
-                cursor_hint: Some(2),
+                cursor_hint: Some(3),
                 items: vec![
                     DiscoveryNotificationItem {
                         resource_did: first.resource_did.clone(),
@@ -4538,6 +4637,17 @@ mod tests {
                         capability_tags: vec![],
                         authorized_domains: vec![],
                     },
+                    DiscoveryNotificationItem {
+                        resource_did: third.resource_did.clone(),
+                        package_version: third.package_version.clone(),
+                        publication_cursor: 3,
+                        package_hash: third.package_hash.clone(),
+                        metadata_hash: third.metadata_hash.clone(),
+                        did_document_hash: third.did_document_hash.clone(),
+                        resource_type: Some("skill".to_owned()),
+                        capability_tags: third.metadata.capability_tags.clone(),
+                        authorized_domains: third.metadata.authorized_domains.clone(),
+                    },
                 ],
             }),
         )
@@ -4545,15 +4655,23 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.0["syncMode"], "authorized-summary");
-        assert_eq!(response.0["syncedResourceCount"], 1);
+        assert_eq!(response.0["syncedResourceCount"], 2);
         assert_eq!(response.0["rejectedCount"], 1);
         assert_eq!(
             response.0["rejected"][0]["reason"],
             "resource_package_unavailable"
         );
-        assert_eq!(response.0["toCursor"], 1);
+        assert_eq!(response.0["toCursor"], 3);
         assert_eq!(response.0["blockedCursor"], 2);
-        assert_eq!(read_sync_cursor(&state).await.unwrap(), 1);
+        assert_eq!(read_sync_cursor(&state).await.unwrap(), 3);
+        let indexed = read_indexed_resource_packages(&state).await.unwrap();
+        assert_eq!(indexed.len(), 2);
+        assert!(indexed
+            .iter()
+            .any(|package| package.resource_did == first.resource_did));
+        assert!(indexed
+            .iter()
+            .any(|package| package.resource_did == third.resource_did));
     }
 
     #[tokio::test]
