@@ -418,6 +418,40 @@ enum DiscoverySearchEngine {
     PgVector,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SemanticRebuildStage {
+    Both,
+    Context,
+    Intent,
+}
+
+impl SemanticRebuildStage {
+    fn from_arg(value: &str) -> Result<Self> {
+        match value {
+            "both" => Ok(Self::Both),
+            "context" => Ok(Self::Context),
+            "intent" => Ok(Self::Intent),
+            value => Err(anyhow!("unsupported_semantic_rebuild_stage:{value}")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Context => "context",
+            Self::Intent => "intent",
+        }
+    }
+
+    fn includes_context(self) -> bool {
+        matches!(self, Self::Both | Self::Context)
+    }
+
+    fn includes_intent(self) -> bool {
+        matches!(self, Self::Both | Self::Intent)
+    }
+}
+
 impl DiscoverySearchEngine {
     fn from_config(config: &SemanticSearchConfig) -> Result<Self> {
         match config.engine.as_str() {
@@ -441,9 +475,10 @@ impl DiscoverySearchEngine {
         &self,
         state: &AppState,
         projected: &[DiscoveryProjectedPackage<'_>],
+        stage: SemanticRebuildStage,
     ) -> Result<()> {
         match self {
-            Self::PgVector => upsert_pgvector_semantic_index_batch(state, projected).await,
+            Self::PgVector => upsert_pgvector_semantic_index_batch(state, projected, stage).await,
         }
     }
 
@@ -517,6 +552,7 @@ struct DiscoveryPackageProjection {
     capability_tags: Vec<String>,
     protocols: Vec<String>,
     service_endpoints: Vec<String>,
+    tag_text: String,
     search_text: String,
 }
 
@@ -544,6 +580,7 @@ struct SearchDocument {
     description: String,
     examples: Vec<String>,
     use_cases: Vec<String>,
+    tag_text: String,
     search_text: String,
     semantic_source_hash: String,
 }
@@ -618,12 +655,55 @@ struct DiscoveryQueryMetrics {
 
 #[derive(Debug, Serialize)]
 struct SemanticRebuildReport {
+    stage: String,
+    phase: String,
     backend: String,
     semantic_enabled: bool,
     package_count: usize,
     context_indexed_count: usize,
     intent_indexed_count: usize,
+    skipped_packages: usize,
+    recovered_packages: usize,
+    retries: usize,
+    last_cursor: Option<i64>,
+    safe_to_delete_old_indexes: bool,
     skipped_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct SemanticRebuildProgressRecord {
+    #[serde(default)]
+    stage: String,
+    #[serde(default)]
+    phase: String,
+    #[serde(default)]
+    last_cursor: Option<i64>,
+    #[serde(default)]
+    processed: usize,
+    #[serde(default)]
+    total: usize,
+    #[serde(default)]
+    skipped_packages: usize,
+    #[serde(default)]
+    retries: usize,
+    #[serde(default)]
+    batch_size: usize,
+    #[serde(default)]
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+struct SemanticRebuildSkipRecord {
+    #[serde(default)]
+    stage: String,
+    #[serde(rename = "resourceDid", default)]
+    resource_did: String,
+    #[serde(default)]
+    cursor: i64,
+    #[serde(default)]
+    reason: String,
+    #[serde(rename = "updatedAt", default)]
+    updated_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -749,6 +829,53 @@ impl IntoResponse for ApiError {
 
 type ApiResult<T> = std::result::Result<Json<T>, ApiError>;
 
+fn parse_semantic_cli_args(args: &[String]) -> Result<(String, SemanticRebuildStage, bool)> {
+    let mut config_path = "services/discovery-node/config.example.toml".to_owned();
+    let mut stage = SemanticRebuildStage::Both;
+    let mut reset = false;
+    let mut index = 1usize;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "--reset" => {
+                reset = true;
+                index += 1;
+            }
+            "--stage" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow!("missing_semantic_rebuild_stage"))?;
+                stage = SemanticRebuildStage::from_arg(value)?;
+                index += 2;
+            }
+            value if value.starts_with("--stage=") => {
+                let value = value.split_once('=').map(|(_, rhs)| rhs).unwrap_or("");
+                stage = SemanticRebuildStage::from_arg(value)?;
+                index += 1;
+            }
+            value if value.starts_with("--") => {
+                index += 1;
+            }
+            value => {
+                config_path = value.to_owned();
+                index += 1;
+            }
+        }
+    }
+    Ok((config_path, stage, reset))
+}
+
+fn semantic_rebuild_progress_key(stage: SemanticRebuildStage) -> String {
+    format!("semantic_rebuild_progress:{}", stage.as_str())
+}
+
+fn semantic_rebuild_skip_prefix(stage: Option<SemanticRebuildStage>) -> String {
+    match stage {
+        Some(stage) => format!("semantic_rebuild_skip:{}:", stage.as_str()),
+        None => "semantic_rebuild_skip:".to_owned(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -756,12 +883,19 @@ async fn main() -> Result<()> {
         .first()
         .is_some_and(|value| value == "semantic-rebuild")
     {
-        let config_path = args
-            .get(1)
-            .cloned()
-            .unwrap_or_else(|| "services/discovery-node/config.example.toml".to_owned());
+        let (config_path, stage, reset) = parse_semantic_cli_args(&args)?;
         let state = build_app_state(load_config(config_path)?).await?;
-        let report = rebuild_semantic_indexes(&state).await?;
+        let report = rebuild_semantic_indexes(&state, reset, stage).await?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    if args
+        .first()
+        .is_some_and(|value| value == "semantic-backfill-skipped")
+    {
+        let (config_path, stage, _) = parse_semantic_cli_args(&args)?;
+        let state = build_app_state(load_config(config_path)?).await?;
+        let report = backfill_skipped_semantic_indexes(&state, stage).await?;
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
@@ -795,7 +929,7 @@ async fn main() -> Result<()> {
         let state = build_app_state(load_config(config_path)?).await?;
         let suite_path = PathBuf::from(suite_path);
         let seed_count = seed_semantic_evaluation_packages(&state, &suite_path).await?;
-        let rebuild = rebuild_semantic_indexes(&state).await?;
+        let rebuild = rebuild_semantic_indexes(&state, true, SemanticRebuildStage::Both).await?;
         let evaluation = evaluate_semantic_discovery(&state, &suite_path).await?;
         println!(
             "{}",
@@ -938,17 +1072,38 @@ async fn initialize_discovery_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
         .execute_batch(&format!(
             r#"
             CREATE TABLE IF NOT EXISTS {DISCOVERY_SYNC_STATE_TABLE} (
-                state_key TEXT PRIMARY KEY,
-                state_value TEXT NOT NULL,
+                sync_key TEXT PRIMARY KEY,
+                sync_value TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS {DISCOVERY_PACKAGE_TABLE} (
                 resource_did TEXT PRIMARY KEY,
                 cursor INTEGER NOT NULL,
                 version TEXT NOT NULL,
+                resource_type TEXT NOT NULL DEFAULT '',
+                lifecycle_state TEXT NOT NULL DEFAULT '',
+                capability_tags TEXT NOT NULL DEFAULT '[]',
+                protocols TEXT NOT NULL DEFAULT '[]',
+                service_endpoints TEXT NOT NULL DEFAULT '[]',
+                tag_text TEXT NOT NULL DEFAULT '',
+                search_text TEXT NOT NULL DEFAULT '',
                 package_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            ALTER TABLE {DISCOVERY_PACKAGE_TABLE}
+                ADD COLUMN IF NOT EXISTS resource_type TEXT NOT NULL DEFAULT '';
+            ALTER TABLE {DISCOVERY_PACKAGE_TABLE}
+                ADD COLUMN IF NOT EXISTS lifecycle_state TEXT NOT NULL DEFAULT '';
+            ALTER TABLE {DISCOVERY_PACKAGE_TABLE}
+                ADD COLUMN IF NOT EXISTS capability_tags TEXT NOT NULL DEFAULT '[]';
+            ALTER TABLE {DISCOVERY_PACKAGE_TABLE}
+                ADD COLUMN IF NOT EXISTS protocols TEXT NOT NULL DEFAULT '[]';
+            ALTER TABLE {DISCOVERY_PACKAGE_TABLE}
+                ADD COLUMN IF NOT EXISTS service_endpoints TEXT NOT NULL DEFAULT '[]';
+            ALTER TABLE {DISCOVERY_PACKAGE_TABLE}
+                ADD COLUMN IF NOT EXISTS tag_text TEXT NOT NULL DEFAULT '';
+            ALTER TABLE {DISCOVERY_PACKAGE_TABLE}
+                ADD COLUMN IF NOT EXISTS search_text TEXT NOT NULL DEFAULT '';
             CREATE TABLE IF NOT EXISTS {DISCOVERY_REJECTED_TABLE} (
                 reject_key TEXT PRIMARY KEY,
                 item_json TEXT NOT NULL,
@@ -984,8 +1139,8 @@ async fn initialize_discovery_postgres(postgres: &PostgresJsonStore) -> Result<(
         .execute_batch(&format!(
             r#"
             CREATE TABLE IF NOT EXISTS {DISCOVERY_SYNC_STATE_TABLE} (
-                state_key TEXT PRIMARY KEY,
-                state_value TEXT NOT NULL,
+                sync_key TEXT PRIMARY KEY,
+                sync_value JSONB NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL
             );
             CREATE TABLE IF NOT EXISTS {DISCOVERY_PACKAGE_TABLE} (
@@ -997,6 +1152,7 @@ async fn initialize_discovery_postgres(postgres: &PostgresJsonStore) -> Result<(
                 capability_tags TEXT[] NOT NULL DEFAULT '{{}}',
                 protocols TEXT[] NOT NULL DEFAULT '{{}}',
                 service_endpoints TEXT[] NOT NULL DEFAULT '{{}}',
+                tag_text TEXT NOT NULL DEFAULT '',
                 search_text TEXT NOT NULL DEFAULT '',
                 package_json JSONB NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL
@@ -1011,6 +1167,8 @@ async fn initialize_discovery_postgres(postgres: &PostgresJsonStore) -> Result<(
                 ADD COLUMN IF NOT EXISTS protocols TEXT[] NOT NULL DEFAULT '{{}}';
             ALTER TABLE {DISCOVERY_PACKAGE_TABLE}
                 ADD COLUMN IF NOT EXISTS service_endpoints TEXT[] NOT NULL DEFAULT '{{}}';
+            ALTER TABLE {DISCOVERY_PACKAGE_TABLE}
+                ADD COLUMN IF NOT EXISTS tag_text TEXT NOT NULL DEFAULT '';
             ALTER TABLE {DISCOVERY_PACKAGE_TABLE}
                 ADD COLUMN IF NOT EXISTS search_text TEXT NOT NULL DEFAULT '';
             CREATE TABLE IF NOT EXISTS {DISCOVERY_REJECTED_TABLE} (
@@ -1028,6 +1186,8 @@ async fn initialize_discovery_postgres(postgres: &PostgresJsonStore) -> Result<(
             ON {DISCOVERY_PACKAGE_TABLE} USING GIN(capability_tags);
             CREATE INDEX IF NOT EXISTS idx_discovery_packages_protocols
             ON {DISCOVERY_PACKAGE_TABLE} USING GIN(protocols);
+            CREATE INDEX IF NOT EXISTS idx_discovery_packages_tag_text
+            ON {DISCOVERY_PACKAGE_TABLE} USING GIN(to_tsvector('simple', tag_text));
             CREATE INDEX IF NOT EXISTS idx_discovery_packages_search_text
             ON {DISCOVERY_PACKAGE_TABLE} USING GIN(to_tsvector('simple', search_text));
             CREATE INDEX IF NOT EXISTS idx_discovery_rejected_updated
@@ -1113,6 +1273,7 @@ async fn initialize_semantic_postgres(
                 description TEXT NOT NULL DEFAULT '',
                 examples JSONB NOT NULL DEFAULT '[]'::jsonb,
                 use_cases JSONB NOT NULL DEFAULT '[]'::jsonb,
+                tag_text TEXT NOT NULL DEFAULT '',
                 search_text TEXT NOT NULL DEFAULT '',
                 semantic_source_hash TEXT NOT NULL,
                 embedding VECTOR({dimension}),
@@ -1128,6 +1289,8 @@ async fn initialize_semantic_postgres(
             ON {DISCOVERY_SEMANTIC_INDEX_TABLE} USING GIN(capability_tags);
             CREATE INDEX IF NOT EXISTS idx_discovery_semantic_protocols
             ON {DISCOVERY_SEMANTIC_INDEX_TABLE} USING GIN(protocols);
+            CREATE INDEX IF NOT EXISTS idx_discovery_semantic_tag_text
+            ON {DISCOVERY_SEMANTIC_INDEX_TABLE} USING GIN(to_tsvector('simple', tag_text));
             CREATE INDEX IF NOT EXISTS idx_discovery_semantic_search_text
             ON {DISCOVERY_SEMANTIC_INDEX_TABLE} USING GIN(to_tsvector('simple', search_text));
             CREATE INDEX IF NOT EXISTS idx_discovery_semantic_embedding
@@ -1337,6 +1500,7 @@ fn search_document_from_package(
         description,
         examples,
         use_cases,
+        tag_text: projection.tag_text.clone(),
         search_text: projection.search_text.clone(),
         semantic_source_hash: format!("sha256:{}", sha256_hex(embedding_text.as_bytes())),
     }
@@ -1712,6 +1876,28 @@ fn semantic_query_projection(query: &ResourceDiscoveryQuery) -> SemanticQueryPro
     SemanticQueryProjection { expanded_tokens }
 }
 
+fn semantic_query_tag_tokens(query: &ResourceDiscoveryQuery) -> Vec<String> {
+    let mut tokens = Vec::new();
+    if let Some(resource_type) = &query.resource_type {
+        tokens.extend(semantic_tokens(resource_type.as_str()));
+    }
+    if let Some(protocol) = &query.protocol {
+        tokens.extend(semantic_tokens(protocol));
+    }
+    for tag in &query.capability_tags {
+        tokens.extend(semantic_tokens(tag));
+    }
+    let query_text = query.query.as_deref().unwrap_or_default();
+    if !query_text.trim().is_empty() {
+        tokens.extend(semantic_tokens(query_text));
+    }
+    let mut seen = HashSet::new();
+    tokens
+        .into_iter()
+        .filter(|token| seen.insert(token.clone()))
+        .collect()
+}
+
 fn semantic_tag_text(doc: &SearchDocument) -> String {
     [
         doc.resource_did.as_str(),
@@ -1719,6 +1905,7 @@ fn semantic_tag_text(doc: &SearchDocument) -> String {
         &doc.capability_tags.join(" "),
         &doc.protocols.join(" "),
         &doc.service_endpoints.join(" "),
+        doc.tag_text.as_str(),
     ]
     .join(" ")
 }
@@ -1735,6 +1922,12 @@ fn semantic_context_text(doc: &SearchDocument) -> String {
         doc.search_text.as_str(),
     ]
     .join(" ")
+}
+
+fn semantic_lexical_text(doc: &SearchDocument) -> String {
+    let tag_text = semantic_tag_text(doc);
+    let context_text = semantic_context_text(doc);
+    format!("{tag_text} {tag_text} {context_text}")
 }
 
 fn semantic_intent_texts(doc: &SearchDocument) -> Vec<String> {
@@ -1856,8 +2049,7 @@ fn semantic_resource_scores(
 ) -> SemanticQueryHit {
     let projection = discovery_package_projection(package);
     let doc = search_document_from_package(0, package, &projection);
-    let tag_score =
-        weighted_token_similarity(&query_projection.expanded_tokens, &semantic_tag_text(&doc));
+    let tag_score = weighted_token_similarity(&query_projection.expanded_tokens, &semantic_tag_text(&doc));
     let context_score = weighted_token_similarity(
         &query_projection.expanded_tokens,
         &semantic_context_text(&doc),
@@ -1873,9 +2065,15 @@ fn semantic_resource_scores(
         .map(|(score, intent)| (score, Some(intent)))
         .unwrap_or((0.0, None));
     let structured_score = semantic_structured_score(package, query);
+    let (tag_weight, context_weight, tag_bonus) = if query.resource_type.is_some() {
+        (0.25, 0.25, 0.0)
+    } else {
+        let tag_bonus = if tag_score > 0.0 { 0.04 } else { 0.0 };
+        (0.34, 0.16, tag_bonus)
+    };
     let semantic_score =
-        (0.35 * bm25_score) + (0.20 * tag_score) + (0.25 * context_score) + (0.20 * intent_score);
-    let final_score = (semantic_score + structured_score).clamp(0.0, 1.0);
+        (0.30 * bm25_score) + (tag_weight * tag_score) + (context_weight * context_score) + (0.20 * intent_score);
+    let final_score = (semantic_score + structured_score + tag_bonus).clamp(0.0, 1.0);
     SemanticQueryHit {
         package: package.clone(),
         semantic_score,
@@ -1915,7 +2113,7 @@ fn rank_resource_packages_semantically(
         .map(|package| {
             let projection = discovery_package_projection(package);
             let doc = search_document_from_package(0, package, &projection);
-            semantic_tokens(&semantic_context_text(&doc))
+            semantic_tokens(&semantic_lexical_text(&doc))
         })
         .collect::<Vec<_>>();
     let has_semantic_terms = !query_projection.expanded_tokens.is_empty();
@@ -3223,7 +3421,7 @@ async fn upsert_indexed_resource_packages_batch(
                 r#"
                 INSERT INTO {DISCOVERY_PACKAGE_TABLE}(
                     resource_did, cursor, version, resource_type, lifecycle_state,
-                    capability_tags, protocols, service_endpoints, search_text,
+                    capability_tags, protocols, service_endpoints, tag_text, search_text,
                     package_json, updated_at
                 )
                 "#
@@ -3237,6 +3435,7 @@ async fn upsert_indexed_resource_packages_batch(
                     .push_bind(&item.projection.capability_tags)
                     .push_bind(&item.projection.protocols)
                     .push_bind(&item.projection.service_endpoints)
+                    .push_bind(&item.projection.tag_text)
                     .push_bind(&item.projection.search_text)
                     .push_bind(&item.package_json)
                     .push_bind(updated_at);
@@ -3252,6 +3451,7 @@ async fn upsert_indexed_resource_packages_batch(
                     capability_tags = excluded.capability_tags,
                     protocols = excluded.protocols,
                     service_endpoints = excluded.service_endpoints,
+                    tag_text = excluded.tag_text,
                     search_text = excluded.search_text,
                     package_json = excluded.package_json,
                     updated_at = excluded.updated_at
@@ -3261,7 +3461,9 @@ async fn upsert_indexed_resource_packages_batch(
         }
         tx.commit().await?;
         if semantic_search_available(state) {
-            if let Err(err) = upsert_semantic_index_batch(state, &projected).await {
+            if let Err(err) =
+                upsert_semantic_index_batch(state, &projected, SemanticRebuildStage::Both).await
+            {
                 eprintln!("semantic index upsert failed: {err}");
             }
         }
@@ -3296,14 +3498,16 @@ fn latest_resource_packages_by_did(
 async fn upsert_semantic_index_batch(
     state: &AppState,
     projected: &[DiscoveryProjectedPackage<'_>],
+    stage: SemanticRebuildStage,
 ) -> Result<()> {
     let engine = DiscoverySearchEngine::from_config(&state.config.semantic_search)?;
-    engine.upsert_batch(state, projected).await
+    engine.upsert_batch(state, projected, stage).await
 }
 
 async fn upsert_pgvector_semantic_index_batch(
     state: &AppState,
     projected: &[DiscoveryProjectedPackage<'_>],
+    stage: SemanticRebuildStage,
 ) -> Result<()> {
     let Some(postgres) = &state.postgres else {
         return Ok(());
@@ -3349,6 +3553,7 @@ async fn upsert_pgvector_semantic_index_batch(
                 resource_did, cursor, package_version, did_document_hash, metadata_hash,
                 package_hash, resource_type, lifecycle_state, capability_tags, protocols,
                 service_endpoints, name, description, examples, use_cases, search_text,
+                tag_text,
                 semantic_source_hash, embedding, embedding_model, embedding_version, updated_at
             )
             "#
@@ -3369,6 +3574,7 @@ async fn upsert_pgvector_semantic_index_batch(
                 .push_bind(&doc.description)
                 .push_bind(serde_json::to_value(&doc.examples).unwrap_or_else(|_| json!([])))
                 .push_bind(serde_json::to_value(&doc.use_cases).unwrap_or_else(|_| json!([])))
+                .push_bind(&doc.tag_text)
                 .push_bind(&doc.search_text)
                 .push_bind(&doc.semantic_source_hash)
                 .push(format!("{}::vector", pgvector_literal(&embedding)))
@@ -3394,6 +3600,7 @@ async fn upsert_pgvector_semantic_index_batch(
                 description = excluded.description,
                 examples = excluded.examples,
                 use_cases = excluded.use_cases,
+                tag_text = excluded.tag_text,
                 search_text = excluded.search_text,
                 semantic_source_hash = excluded.semantic_source_hash,
                 embedding = excluded.embedding,
@@ -3404,7 +3611,9 @@ async fn upsert_pgvector_semantic_index_batch(
         );
         builder.build().execute(postgres.pool()).await?;
     }
-    upsert_pgvector_intent_index_batch(state, &docs).await?;
+    if stage.includes_intent() {
+        upsert_pgvector_intent_index_batch(state, &docs).await?;
+    }
     Ok(())
 }
 
@@ -3550,69 +3759,514 @@ async fn count_intent_indexed_rows(state: &AppState) -> Result<Option<i64>> {
     Ok(Some(row.get::<i64, _>(0)))
 }
 
-async fn clear_semantic_indexes_for_current_model(state: &AppState) -> Result<()> {
+async fn clear_semantic_indexes_for_current_model(
+    state: &AppState,
+    stage: SemanticRebuildStage,
+) -> Result<()> {
     let Some(postgres) = &state.postgres else {
         return Ok(());
     };
-    sqlx::query(&format!(
-        "DELETE FROM {DISCOVERY_INTENT_INDEX_TABLE} WHERE embedding_model = $1 AND embedding_version = $2"
-    ))
-    .bind(&state.semantic.embedding_model)
-    .bind(&state.semantic.embedding_version)
-    .execute(postgres.pool())
-    .await?;
-    sqlx::query(&format!(
-        "DELETE FROM {DISCOVERY_SEMANTIC_INDEX_TABLE} WHERE embedding_model = $1 AND embedding_version = $2"
-    ))
-    .bind(&state.semantic.embedding_model)
-    .bind(&state.semantic.embedding_version)
-    .execute(postgres.pool())
-    .await?;
+    if stage.includes_intent() {
+        sqlx::query(&format!(
+            "DELETE FROM {DISCOVERY_INTENT_INDEX_TABLE} WHERE embedding_model = $1 AND embedding_version = $2"
+        ))
+        .bind(&state.semantic.embedding_model)
+        .bind(&state.semantic.embedding_version)
+        .execute(postgres.pool())
+        .await?;
+    }
+    if stage.includes_context() {
+        sqlx::query(&format!(
+            "DELETE FROM {DISCOVERY_SEMANTIC_INDEX_TABLE} WHERE embedding_model = $1 AND embedding_version = $2"
+        ))
+        .bind(&state.semantic.embedding_model)
+        .bind(&state.semantic.embedding_version)
+        .execute(postgres.pool())
+        .await?;
+    }
     Ok(())
 }
 
-async fn rebuild_semantic_indexes(state: &AppState) -> Result<SemanticRebuildReport> {
+async fn rebuild_semantic_indexes(
+    state: &AppState,
+    reset: bool,
+    stage: SemanticRebuildStage,
+) -> Result<SemanticRebuildReport> {
     if !semantic_search_available(state) {
         return Ok(SemanticRebuildReport {
+            stage: stage.as_str().to_owned(),
+            phase: "skipped".to_owned(),
             backend: discovery_backend_name(state),
             semantic_enabled: false,
             package_count: 0,
             context_indexed_count: 0,
             intent_indexed_count: 0,
+            skipped_packages: 0,
+            recovered_packages: 0,
+            retries: 0,
+            last_cursor: None,
+            safe_to_delete_old_indexes: false,
             skipped_reason: state.semantic.fallback_reason.clone(),
         });
     }
     let packages = read_indexed_resource_packages(state).await?;
-    clear_semantic_indexes_for_current_model(state).await?;
     let visible = packages
         .iter()
         .enumerate()
+        .map(|(index, package)| (index as i64 + 1, package))
         .filter(|(_, package)| {
             package.metadata.lifecycle_state == "active"
                 && is_user_consumable_resource_type(&package.resource_type)
         })
-        .map(|(index, package)| (index as i64 + 1, package))
         .collect::<Vec<_>>();
-    let projected = visible
-        .iter()
-        .map(|(cursor, package)| DiscoveryProjectedPackage {
-            cursor: *cursor,
-            package,
-            package_json: serde_json::to_value(package).unwrap_or_else(|_| json!({})),
-            projection: discovery_package_projection(package),
+    let progress = if reset {
+        None
+    } else {
+        load_semantic_rebuild_progress(state, stage).await?
+    };
+    let mut skipped_packages = 0usize;
+    let mut retries = 0usize;
+    let mut last_cursor = None;
+    let mut index = progress
+        .as_ref()
+        .and_then(|record| {
+            visible
+                .iter()
+                .position(|(cursor, _)| Some(*cursor) == record.last_cursor)
+                .map(|pos| pos + 1)
         })
-        .collect::<Vec<_>>();
-    upsert_semantic_index_batch(state, &projected).await?;
+        .unwrap_or(0usize);
+    let mut batch_size = state.config.semantic_search.embedding.batch_size.max(1);
+    if index > 0 {
+        skipped_packages = 0;
+        retries = 0;
+    } else {
+        clear_semantic_indexes_for_current_model(state, stage).await?;
+        clear_semantic_rebuild_progress(state, stage).await?;
+        clear_semantic_rebuild_skip_records(state, Some(stage)).await?;
+    }
+    while index < visible.len() {
+        let end = (index + batch_size).min(visible.len());
+        let projected = visible[index..end]
+            .iter()
+            .map(|(cursor, package)| DiscoveryProjectedPackage {
+                cursor: *cursor,
+                package,
+                package_json: serde_json::to_value(package).unwrap_or_else(|_| json!({})),
+                projection: discovery_package_projection(package),
+            })
+            .collect::<Vec<_>>();
+        match upsert_semantic_index_batch(state, &projected, stage).await {
+            Ok(()) => {
+                last_cursor = projected.last().map(|item| item.cursor);
+                index = end;
+                store_semantic_rebuild_progress(
+                    state,
+                    stage,
+                    "running",
+                    last_cursor,
+                    index,
+                    visible.len(),
+                    skipped_packages,
+                    retries,
+                    batch_size,
+                )
+                .await?;
+            }
+            Err(err) => {
+                if is_embedding_timeout_error(&err) && batch_size > 1 {
+                    retries += 1;
+                    batch_size = (batch_size / 2).max(1);
+                    store_semantic_rebuild_progress(
+                        state,
+                        stage,
+                        "throttled",
+                        last_cursor,
+                        index,
+                        visible.len(),
+                        skipped_packages,
+                        retries,
+                        batch_size,
+                    )
+                    .await?;
+                    continue;
+                }
+                if let Some(failed) = projected.first() {
+                    skipped_packages += 1;
+                    index = end;
+                    last_cursor = Some(failed.cursor);
+                    store_semantic_rebuild_skip(
+                        state,
+                        stage,
+                        failed.cursor,
+                        failed.package.resource_did.clone(),
+                        err.to_string(),
+                    )
+                    .await?;
+                    store_semantic_rebuild_progress(
+                        state,
+                        stage,
+                        "skip",
+                        last_cursor,
+                        index,
+                        visible.len(),
+                        skipped_packages,
+                        retries,
+                        batch_size,
+                    )
+                    .await?;
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
     Ok(SemanticRebuildReport {
+        phase: if skipped_packages == 0 { "completed".to_owned() } else { "completed-with-skips".to_owned() },
+        stage: stage.as_str().to_owned(),
         backend: discovery_backend_name(state),
         semantic_enabled: true,
-        package_count: projected.len(),
+        package_count: visible.len(),
         context_indexed_count: count_semantic_indexed_resources(state)
             .await?
             .unwrap_or_default() as usize,
         intent_indexed_count: count_intent_indexed_rows(state).await?.unwrap_or_default() as usize,
+        skipped_packages,
+        recovered_packages: 0,
+        retries,
+        last_cursor,
+        safe_to_delete_old_indexes: skipped_packages == 0 && matches!(stage, SemanticRebuildStage::Both),
         skipped_reason: None,
     })
+}
+
+async fn backfill_skipped_semantic_indexes(
+    state: &AppState,
+    stage: SemanticRebuildStage,
+) -> Result<SemanticRebuildReport> {
+    if !semantic_search_available(state) {
+        return Ok(SemanticRebuildReport {
+            stage: stage.as_str().to_owned(),
+            phase: "skipped".to_owned(),
+            backend: discovery_backend_name(state),
+            semantic_enabled: false,
+            package_count: 0,
+            context_indexed_count: 0,
+            intent_indexed_count: 0,
+            skipped_packages: 0,
+            recovered_packages: 0,
+            retries: 0,
+            last_cursor: None,
+            safe_to_delete_old_indexes: false,
+            skipped_reason: state.semantic.fallback_reason.clone(),
+        });
+    }
+
+    let skipped = load_semantic_rebuild_skip_records(state, Some(stage)).await?;
+    if skipped.is_empty() {
+        return Ok(SemanticRebuildReport {
+            stage: stage.as_str().to_owned(),
+            phase: "completed".to_owned(),
+            backend: discovery_backend_name(state),
+            semantic_enabled: true,
+            package_count: 0,
+            context_indexed_count: count_semantic_indexed_resources(state)
+                .await?
+                .unwrap_or_default() as usize,
+            intent_indexed_count: count_intent_indexed_rows(state).await?.unwrap_or_default() as usize,
+            skipped_packages: 0,
+            recovered_packages: 0,
+            retries: 0,
+            last_cursor: None,
+        safe_to_delete_old_indexes: matches!(stage, SemanticRebuildStage::Both),
+        skipped_reason: None,
+        });
+    }
+
+    let indexed = read_indexed_resource_packages(state).await?;
+    let by_did = indexed
+        .into_iter()
+        .map(|package| (package.resource_did.clone(), package))
+        .collect::<BTreeMap<_, _>>();
+    let mut recovered = 0usize;
+    let mut skipped_packages = 0usize;
+    let mut retries = 0usize;
+    let mut last_cursor = None;
+
+    for record in skipped {
+        if let Some(package) = by_did.get(&record.resource_did) {
+            let cursor = record.cursor.max(1);
+            let projected = DiscoveryProjectedPackage {
+                cursor,
+                package,
+                package_json: serde_json::to_value(package).unwrap_or_else(|_| json!({})),
+                projection: discovery_package_projection(package),
+            };
+            match upsert_semantic_index_batch(state, &[projected], stage).await {
+                Ok(()) => {
+                    recovered += 1;
+                    last_cursor = Some(cursor);
+                    clear_semantic_rebuild_skip_record(state, stage, &record.resource_did).await?;
+                }
+                Err(err) => {
+                    skipped_packages += 1;
+                    retries += 1;
+                    store_semantic_rebuild_skip(
+                        state,
+                        stage,
+                        cursor,
+                        record.resource_did.clone(),
+                        err.to_string(),
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
+
+    Ok(SemanticRebuildReport {
+        stage: stage.as_str().to_owned(),
+        phase: "backfilled".to_owned(),
+        backend: discovery_backend_name(state),
+        semantic_enabled: true,
+        package_count: recovered,
+        context_indexed_count: count_semantic_indexed_resources(state)
+            .await?
+            .unwrap_or_default() as usize,
+        intent_indexed_count: count_intent_indexed_rows(state).await?.unwrap_or_default() as usize,
+        skipped_packages,
+        recovered_packages: recovered,
+        retries,
+        last_cursor,
+        safe_to_delete_old_indexes: skipped_packages == 0 && matches!(stage, SemanticRebuildStage::Both),
+        skipped_reason: None,
+    })
+}
+
+async fn clear_semantic_rebuild_progress(
+    state: &AppState,
+    stage: SemanticRebuildStage,
+) -> Result<()> {
+    clear_discovery_sync_state_like(state, &format!("semantic_rebuild_progress:{}%", stage.as_str())).await
+}
+
+async fn clear_semantic_rebuild_skip_records(
+    state: &AppState,
+    stage: Option<SemanticRebuildStage>,
+) -> Result<()> {
+    clear_discovery_sync_state_like(state, &format!("{}%", semantic_rebuild_skip_prefix(stage))).await
+}
+
+async fn store_semantic_rebuild_progress(
+    state: &AppState,
+    stage: SemanticRebuildStage,
+    phase: &str,
+    last_cursor: Option<i64>,
+    processed: usize,
+    total: usize,
+    skipped_packages: usize,
+    retries: usize,
+    batch_size: usize,
+) -> Result<()> {
+    let record = SemanticRebuildProgressRecord {
+        stage: stage.as_str().to_owned(),
+        phase: phase.to_owned(),
+        last_cursor,
+        processed,
+        total,
+        skipped_packages,
+        retries,
+        batch_size,
+        updated_at: Utc::now().to_rfc3339(),
+    };
+    upsert_discovery_sync_state(state, &semantic_rebuild_progress_key(stage), &record).await
+}
+
+async fn store_semantic_rebuild_skip(
+    state: &AppState,
+    stage: SemanticRebuildStage,
+    cursor: i64,
+    resource_did: String,
+    reason: String,
+) -> Result<()> {
+    let record = SemanticRebuildSkipRecord {
+        stage: stage.as_str().to_owned(),
+        resource_did,
+        cursor,
+        reason,
+        updated_at: Utc::now().to_rfc3339(),
+    };
+    upsert_discovery_sync_state(
+        state,
+        &format!("semantic_rebuild_skip:{}:{cursor}", stage.as_str()),
+        &record,
+    )
+    .await
+}
+
+async fn clear_semantic_rebuild_skip_record(
+    state: &AppState,
+    stage: SemanticRebuildStage,
+    resource_did: &str,
+) -> Result<()> {
+    if let Some(sqlite) = &state.sqlite {
+        sqlx::query(&format!(
+            "DELETE FROM {DISCOVERY_SYNC_STATE_TABLE} WHERE sync_key LIKE ? AND json_extract(sync_value, '$.resourceDid') = ?"
+        ))
+        .bind(format!("semantic_rebuild_skip:{}:%", stage.as_str()))
+        .bind(resource_did)
+        .execute(sqlite.pool())
+        .await?;
+        return Ok(());
+    }
+    if let Some(postgres) = &state.postgres {
+        sqlx::query(&format!(
+            "DELETE FROM {DISCOVERY_SYNC_STATE_TABLE} WHERE sync_key LIKE $1 AND sync_value->>'resourceDid' = $2"
+        ))
+        .bind(format!("semantic_rebuild_skip:{}:%", stage.as_str()))
+        .bind(resource_did)
+        .execute(postgres.pool())
+        .await?;
+    }
+    Ok(())
+}
+
+async fn load_semantic_rebuild_skip_records(
+    state: &AppState,
+    stage: Option<SemanticRebuildStage>,
+) -> Result<Vec<SemanticRebuildSkipRecord>> {
+    let prefix = semantic_rebuild_skip_prefix(stage);
+    if let Some(sqlite) = &state.sqlite {
+        let rows = sqlx::query(&format!(
+            "SELECT sync_value FROM {DISCOVERY_SYNC_STATE_TABLE} WHERE sync_key LIKE ? ORDER BY sync_key"
+        ))
+        .bind(format!("{prefix}%"))
+        .fetch_all(sqlite.pool())
+        .await?;
+        return Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                serde_json::from_str::<SemanticRebuildSkipRecord>(&row.get::<String, _>(0)).ok()
+            })
+            .collect());
+    }
+    if let Some(postgres) = &state.postgres {
+        let rows = sqlx::query(&format!(
+            "SELECT sync_value::text FROM {DISCOVERY_SYNC_STATE_TABLE} WHERE sync_key LIKE $1 ORDER BY sync_key"
+        ))
+        .bind(format!("{prefix}%"))
+        .fetch_all(postgres.pool())
+        .await?;
+        return Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                serde_json::from_str::<SemanticRebuildSkipRecord>(&row.get::<String, _>(0)).ok()
+            })
+            .collect());
+    }
+    Ok(vec![])
+}
+
+async fn clear_discovery_sync_state_like(state: &AppState, pattern: &str) -> Result<()> {
+    if let Some(sqlite) = &state.sqlite {
+        sqlx::query(&format!(
+            "DELETE FROM {DISCOVERY_SYNC_STATE_TABLE} WHERE sync_key LIKE ?"
+        ))
+        .bind(pattern)
+        .execute(sqlite.pool())
+        .await?;
+        return Ok(());
+    }
+    if let Some(postgres) = &state.postgres {
+        sqlx::query(&format!(
+            "DELETE FROM {DISCOVERY_SYNC_STATE_TABLE} WHERE sync_key LIKE $1"
+        ))
+        .bind(pattern)
+        .execute(postgres.pool())
+        .await?;
+        return Ok(());
+    }
+    Ok(())
+}
+
+async fn load_semantic_rebuild_progress(
+    state: &AppState,
+    stage: SemanticRebuildStage,
+) -> Result<Option<SemanticRebuildProgressRecord>> {
+    if let Some(sqlite) = &state.sqlite {
+        let row = sqlx::query(&format!(
+            "SELECT sync_value FROM {DISCOVERY_SYNC_STATE_TABLE} WHERE sync_key = ?"
+        ))
+        .bind(semantic_rebuild_progress_key(stage))
+        .fetch_optional(sqlite.pool())
+        .await?;
+        if let Some(row) = row {
+            let value = row.get::<String, _>(0);
+            return Ok(serde_json::from_str::<SemanticRebuildProgressRecord>(&value).ok());
+        }
+        return Ok(None);
+    }
+    if let Some(postgres) = &state.postgres {
+        let row = sqlx::query(&format!(
+            "SELECT sync_value::text FROM {DISCOVERY_SYNC_STATE_TABLE} WHERE sync_key = $1"
+        ))
+        .bind(semantic_rebuild_progress_key(stage))
+        .fetch_optional(postgres.pool())
+        .await?;
+        if let Some(row) = row {
+            let value = row.get::<String, _>(0);
+            return Ok(serde_json::from_str::<SemanticRebuildProgressRecord>(&value).ok());
+        }
+        return Ok(None);
+    }
+    Ok(None)
+}
+
+async fn upsert_discovery_sync_state<T: Serialize>(
+    state: &AppState,
+    key: &str,
+    value: &T,
+) -> Result<()> {
+    let payload = serde_json::to_value(value)?;
+    let updated_at = Utc::now();
+    if let Some(sqlite) = &state.sqlite {
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {DISCOVERY_SYNC_STATE_TABLE}(sync_key, sync_value, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(sync_key)
+            DO UPDATE SET sync_value = excluded.sync_value, updated_at = excluded.updated_at
+            "#
+        ))
+        .bind(key)
+        .bind(payload.to_string())
+        .bind(updated_at)
+        .execute(sqlite.pool())
+        .await?;
+        return Ok(());
+    }
+    if let Some(postgres) = &state.postgres {
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {DISCOVERY_SYNC_STATE_TABLE}(sync_key, sync_value, updated_at)
+            VALUES ($1, $2::jsonb, $3)
+            ON CONFLICT(sync_key)
+            DO UPDATE SET sync_value = excluded.sync_value, updated_at = excluded.updated_at
+            "#
+        ))
+        .bind(key)
+        .bind(payload.to_string())
+        .bind(updated_at)
+        .execute(postgres.pool())
+        .await?;
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn is_embedding_timeout_error(err: &anyhow::Error) -> bool {
+    let text = err.to_string().to_ascii_lowercase();
+    text.contains("timed out") || text.contains("timeout")
 }
 
 fn discovery_package_projection(package: &ResourcePackage) -> DiscoveryPackageProjection {
@@ -3652,6 +4306,13 @@ fn discovery_package_projection(package: &ResourcePackage) -> DiscoveryPackagePr
         protocols.join(" "),
         service_endpoints.join(" "),
     ]);
+    let tag_text = semantic_search_text(&[
+        package.resource_did.clone(),
+        package.resource_type.as_str().to_owned(),
+        package.metadata.capability_tags.join(" "),
+        protocols.join(" "),
+        service_endpoints.join(" "),
+    ]);
 
     DiscoveryPackageProjection {
         resource_type: package.resource_type.as_str().to_owned(),
@@ -3659,6 +4320,7 @@ fn discovery_package_projection(package: &ResourcePackage) -> DiscoveryPackagePr
         capability_tags: package.metadata.capability_tags.clone(),
         protocols,
         service_endpoints,
+        tag_text,
         search_text,
     }
 }
@@ -3798,13 +4460,38 @@ async fn query_indexed_resource_packages(
             builder.push(" AND protocols && ");
             builder.push_bind(vec![protocol.to_ascii_lowercase()]);
         }
-        if should_use_sql_text_prefilter(query) {
-            let text = query.query.as_ref().expect("checked query text");
-            builder.push(" AND to_tsvector('simple', search_text) @@ plainto_tsquery('simple', ");
+        let tag_tokens = semantic_query_tag_tokens(query);
+        let query_text = query.query.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty());
+        if query_text.is_some() {
+            let text = query_text.expect("checked query text");
+            builder.push(" AND (");
+            builder.push("to_tsvector('simple', tag_text) @@ plainto_tsquery('simple', ");
             builder.push_bind(text.to_ascii_lowercase());
-            builder.push(")");
+            builder.push(") OR to_tsvector('simple', search_text) @@ plainto_tsquery('simple', ");
+            builder.push_bind(text.to_ascii_lowercase());
+            builder.push("))");
         }
-        if should_use_sql_text_prefilter(query) {
+        if !tag_tokens.is_empty() {
+            builder.push(" ORDER BY ");
+            builder.push(
+                "ts_rank_cd(to_tsvector('simple', tag_text), plainto_tsquery('simple', ",
+            );
+            if let Some(text) = query_text {
+                builder.push_bind(text.to_ascii_lowercase());
+            } else {
+                builder.push_bind(tag_tokens.join(" "));
+            }
+            builder.push(")) DESC, ");
+            builder.push(
+                "ts_rank_cd(to_tsvector('simple', search_text), plainto_tsquery('simple', ",
+            );
+            if let Some(text) = query_text {
+                builder.push_bind(text.to_ascii_lowercase());
+            } else {
+                builder.push_bind(tag_tokens.join(" "));
+            }
+            builder.push(")) DESC, updated_at DESC, resource_did LIMIT ");
+        } else if should_use_sql_text_prefilter(query) {
             let text = query.query.as_ref().expect("checked query text");
             builder.push(
                 " ORDER BY ts_rank_cd(to_tsvector('simple', search_text), plainto_tsquery('simple', ",
@@ -5388,6 +6075,78 @@ mod tests {
         assert!(dids.contains(&lexical_only.resource_did.as_str()));
     }
 
+    #[test]
+    fn discovery_package_projection_separates_tag_text_from_context_text() {
+        let mut package = sample_resource_package();
+        set_package_description(
+            &mut package,
+            "合同审查助手",
+            "审查合同付款、终止、责任和合规风险，并生成风险清单。",
+        );
+        let projection = discovery_package_projection(&package);
+
+        assert!(projection.tag_text.contains("legal.contract.review"));
+        assert!(projection.tag_text.contains("https"));
+        assert!(!projection.tag_text.contains("审查合同付款"));
+        assert!(projection.search_text.contains("审查合同付款"));
+    }
+
+    #[test]
+    fn tag_layer_is_scored_separately_from_context_layer() {
+        let mut package = sample_resource_package();
+        set_package_description(
+            &mut package,
+            "合同审查助手",
+            "审查合同付款、终止、责任和合规风险，并生成风险清单。",
+        );
+        let query = ResourceDiscoveryQuery {
+            query: Some("legal contract review".to_owned()),
+            resource_type: Some(ResourceType::Skill),
+            capability_tags: vec!["legal.contract.review".to_owned()],
+            protocol: Some("https".to_owned()),
+            version: None,
+            version_mode: "latest".to_owned(),
+            limit: 5,
+        };
+        let query_projection = semantic_query_projection(&query);
+        let projection = discovery_package_projection(&package);
+        let doc = search_document_from_package(1, &package, &projection);
+        let hit = semantic_resource_scores(&package, &query, &query_projection, 0.0);
+
+        assert!(hit.tag_score > 0.0);
+        assert!(hit.context_score > 0.0);
+        assert!(hit.semantic_score > 0.0);
+        assert!(hit.final_score > 0.0);
+        assert!(doc.tag_text.contains("legal.contract.review"));
+    }
+
+    #[test]
+    fn no_resource_type_query_prefers_tag_aligned_result() {
+        let contract = sample_resource_package();
+        let mut weather =
+            sample_resource_package_with_did("did:oan:SKLG:77777777777777777777777777777777");
+        set_package_description(
+            &mut weather,
+            "Weather Forecast Skill",
+            "Forecast rainfall and temperature for travel planning.",
+        );
+        set_package_tags(&mut weather, vec!["weather.forecast".to_owned()]);
+
+        let query = ResourceDiscoveryQuery {
+            query: Some("我要审查合同风险并生成风险清单".to_owned()),
+            resource_type: None,
+            capability_tags: vec![],
+            protocol: None,
+            version: None,
+            version_mode: "latest".to_owned(),
+            limit: 5,
+        };
+        let hits = rank_resource_packages_semantically(vec![weather, contract.clone()], &query);
+
+        assert_eq!(hits.first().map(|hit| &hit.package.resource_did), Some(&contract.resource_did));
+        assert!(hits.first().map(|hit| hit.tag_score).unwrap_or(0.0) > 0.0);
+    }
+
     #[tokio::test]
     async fn resource_query_returns_resource_candidates_without_agent_fields() {
         let dir = tempdir().unwrap();
@@ -5454,160 +6213,20 @@ mod tests {
     async fn semantic_evaluation_suite_runs_real_resource_query_path() {
         let dir = tempdir().unwrap();
         let state = app_state(dir.path());
-        let mut contract = sample_resource_package();
-        set_package_description(
-            &mut contract,
-            "Contract Risk Review Skill",
-            "Review commercial contracts, identify risky clauses, and produce a concise risk checklist.",
-        );
-        set_package_capability_details(
-            &mut contract,
-            "Detect payment, termination, liability, compliance, and dispute resolution risks in legal documents.",
-            vec![
-                "审查合同条款并输出风险清单".to_owned(),
-                "Find risky clauses in a vendor agreement".to_owned(),
-            ],
-        );
-
-        let mut file_search =
-            sample_resource_package_with_did("did:oan:MCDM:33333333333333333333333333333333");
-        set_package_type(&mut file_search, ResourceType::McpServer);
-        set_package_description(
-            &mut file_search,
-            "Everything Local File Search MCP Server",
-            "Expose local Windows file search through the MCP protocol and return matching paths from an Everything index.",
-        );
-        set_package_tags(
-            &mut file_search,
-            vec!["file.search".to_owned(), "mcp.server".to_owned()],
-        );
-        set_package_capability_details(
-            &mut file_search,
-            "Search local files by filename keywords and provide MCP tool responses for desktop automation.",
-            vec![
-                "在 Windows 上搜索本地文件".to_owned(),
-                "Use MCP to find local documents by filename".to_owned(),
-            ],
-        );
-
-        let mut weather =
-            sample_resource_package_with_did("did:oan:TLDM:44444444444444444444444444444444");
-        set_package_type(&mut weather, ResourceType::ToolApi);
-        set_package_description(
-            &mut weather,
-            "Open Weather Forecast Tool API",
-            "Provide HTTPS weather forecast data including temperature, rainfall, wind speed, and JSON responses.",
-        );
-        set_package_tags(
-            &mut weather,
-            vec!["weather.forecast".to_owned(), "tool.api".to_owned()],
-        );
-        set_package_capability_details(
-            &mut weather,
-            "Return current and forecast weather information for travel planning and automation workflows.",
-            vec![
-                "查询天气预报和风速".to_owned(),
-                "Get forecast JSON for a city".to_owned(),
-            ],
-        );
-
-        let mut a2a_agent =
-            sample_resource_package_with_did("did:oan:AGDM:55555555555555555555555555555555");
-        set_package_type(&mut a2a_agent, ResourceType::AgentService);
-        set_package_description(
-            &mut a2a_agent,
-            "A2A Connectivity Test Agent Service",
-            "Provide an Agent2Agent service endpoint for connectivity checks and agent card inspection.",
-        );
-        set_package_tags(&mut a2a_agent, vec!["a2a.connectivity".to_owned()]);
-        set_package_capability_details(
-            &mut a2a_agent,
-            "Verify A2A service reachability, inspect agent card metadata, and support simple hello-world calls.",
-            vec![
-                "测试 A2A 智能体服务是否可连通".to_owned(),
-                "Inspect an agent card before integration".to_owned(),
-            ],
-        );
-
-        write_indexed_resource_packages(
-            &state,
-            &[
-                contract.clone(),
-                file_search.clone(),
-                weather.clone(),
-                a2a_agent.clone(),
-            ],
-        )
-        .await
-        .unwrap();
-        let suite_path = dir.path().join("semantic-suite.json");
-        std::fs::write(
-            &suite_path,
-            serde_json::to_vec_pretty(&json!({
-                "suite": "unit-real-multilingual-topk-path",
-                "cases": [
-                    {
-                        "id": "cn-contract",
-                        "language": "zh",
-                        "description": "Chinese task should find the contract review skill without resourceType.",
-                        "query": {
-                            "query": "我需要审查合同风险并生成风险清单",
-                            "capabilityTags": [],
-                            "versionMode": "latest",
-                            "limit": 5
-                        },
-                        "expectedDids": [contract.resource_did]
-                    },
-                    {
-                        "id": "mixed-file-search",
-                        "language": "mixed",
-                        "description": "Mixed Chinese-English task should find the MCP file search server without resourceType.",
-                        "query": {
-                            "query": "需要一个 MCP server 在 Windows 上做 local file search",
-                            "capabilityTags": [],
-                            "versionMode": "latest",
-                            "limit": 5
-                        },
-                        "expectedDids": [file_search.resource_did]
-                    },
-                    {
-                        "id": "en-weather-explicit-type",
-                        "language": "en",
-                        "description": "English task with explicit Tool API filter should find the weather API.",
-                        "query": {
-                            "query": "HTTPS API for weather forecast temperature rainfall wind JSON",
-                            "resourceType": "tool_api",
-                            "capabilityTags": [],
-                            "versionMode": "latest",
-                            "limit": 5
-                        },
-                        "expectedDids": [weather.resource_did]
-                    },
-                    {
-                        "id": "cn-a2a-explicit-type",
-                        "language": "zh",
-                        "description": "Chinese task with explicit Agent Service filter should find the A2A test agent.",
-                        "query": {
-                            "query": "找一个可以做连通性测试并查看 agent card 的 A2A 智能体服务",
-                            "resourceType": "agent_service",
-                            "capabilityTags": [],
-                            "versionMode": "latest",
-                            "limit": 5
-                        },
-                        "expectedDids": [a2a_agent.resource_did]
-                    }
-                ]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
+        let suite_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("evaluation")
+            .join("real-resource-regression.v1.json");
+        let seed_count = seed_semantic_evaluation_packages(&state, &suite_path)
+            .await
+            .unwrap();
         let report = evaluate_semantic_discovery(&state, &suite_path)
             .await
             .unwrap();
-        assert_eq!(report.case_count, 4);
-        assert_eq!(report.recall_at_5, 1.0);
-        assert_eq!(report.mrr_at_10, 1.0);
+        assert!(seed_count >= 10);
+        assert!(report.case_count >= 20);
+        assert!(report.recall_at_5 >= 0.9);
+        assert!(report.recall_at_10 >= 0.95);
+        assert!(report.mrr_at_10 >= 0.9);
         assert!(report.cases.iter().all(|case| case.passed));
     }
 
@@ -5620,12 +6239,145 @@ mod tests {
             .await
             .unwrap();
 
-        let report = rebuild_semantic_indexes(&state).await.unwrap();
+        let report = rebuild_semantic_indexes(&state, true, SemanticRebuildStage::Both)
+            .await
+            .unwrap();
         assert!(!report.semantic_enabled);
         assert_eq!(report.package_count, 0);
         assert_eq!(report.context_indexed_count, 0);
         assert_eq!(report.intent_indexed_count, 0);
         assert!(report.skipped_reason.is_some());
+    }
+
+    #[tokio::test]
+    async fn semantic_rebuild_progress_is_isolated_by_stage() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        store_semantic_rebuild_progress(
+            &state,
+            SemanticRebuildStage::Context,
+            "running",
+            Some(3),
+            10,
+            1,
+            0,
+            4,
+            4,
+        )
+        .await
+        .unwrap();
+        store_semantic_rebuild_progress(
+            &state,
+            SemanticRebuildStage::Intent,
+            "running",
+            Some(8),
+            10,
+            2,
+            1,
+            2,
+            2,
+        )
+        .await
+        .unwrap();
+
+        let context = load_semantic_rebuild_progress(&state, SemanticRebuildStage::Context)
+            .await
+            .unwrap()
+            .unwrap();
+        let intent = load_semantic_rebuild_progress(&state, SemanticRebuildStage::Intent)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(context.stage, "context");
+        assert_eq!(context.last_cursor, Some(3));
+        assert_eq!(intent.stage, "intent");
+        assert_eq!(intent.last_cursor, Some(8));
+    }
+
+    #[tokio::test]
+    async fn semantic_rebuild_skip_records_are_isolated_by_stage() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        store_semantic_rebuild_skip(
+            &state,
+            SemanticRebuildStage::Context,
+            11,
+            "did:oan:SKLG:context".to_owned(),
+            "context failure".to_owned(),
+        )
+        .await
+        .unwrap();
+        store_semantic_rebuild_skip(
+            &state,
+            SemanticRebuildStage::Intent,
+            22,
+            "did:oan:SKLG:intent".to_owned(),
+            "intent failure".to_owned(),
+        )
+        .await
+        .unwrap();
+
+        let context = load_semantic_rebuild_skip_records(
+            &state,
+            Some(SemanticRebuildStage::Context),
+        )
+        .await
+        .unwrap();
+        let intent = load_semantic_rebuild_skip_records(
+            &state,
+            Some(SemanticRebuildStage::Intent),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0].stage, "context");
+        assert_eq!(context[0].resource_did, "did:oan:SKLG:context");
+        assert_eq!(intent.len(), 1);
+        assert_eq!(intent[0].stage, "intent");
+        assert_eq!(intent[0].resource_did, "did:oan:SKLG:intent");
+
+        clear_semantic_rebuild_skip_record(
+            &state,
+            SemanticRebuildStage::Context,
+            "did:oan:SKLG:context",
+        )
+        .await
+        .unwrap();
+
+        let context_after = load_semantic_rebuild_skip_records(
+            &state,
+            Some(SemanticRebuildStage::Context),
+        )
+        .await
+        .unwrap();
+        let intent_after = load_semantic_rebuild_skip_records(
+            &state,
+            Some(SemanticRebuildStage::Intent),
+        )
+        .await
+        .unwrap();
+
+        assert!(context_after.is_empty());
+        assert_eq!(intent_after.len(), 1);
+        assert_eq!(intent_after[0].resource_did, "did:oan:SKLG:intent");
+    }
+
+    #[tokio::test]
+    async fn semantic_rebuild_report_is_not_safe_to_delete_old_indexes_for_stage_runs() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        state.config.semantic_search.enabled = true;
+        write_indexed_resource_packages(&state, &[sample_resource_package()])
+            .await
+            .unwrap();
+
+        let report = rebuild_semantic_indexes(&state, true, SemanticRebuildStage::Context)
+            .await
+            .unwrap();
+        assert_eq!(report.stage, "context");
+        assert!(!report.safe_to_delete_old_indexes);
     }
 
     #[tokio::test]

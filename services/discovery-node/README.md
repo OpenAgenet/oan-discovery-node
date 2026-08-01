@@ -86,6 +86,31 @@ embeddings for the configured model version, and prints a JSON report with the
 indexed resource and intent counts. If semantic search is unavailable, it exits
 successfully with `semantic_enabled: false` and a `skipped_reason`.
 
+Use `--stage context` or `--stage intent` when you need to rebuild only one
+side of the semantic index. The default `--stage both` rebuilds both indexes and
+is the only mode that can report `safe_to_delete_old_indexes: true` when the run
+finishes without unresolved skips.
+
+The rebuild command is intended to support a safe cutover after old semantic
+index data is deleted. Its JSON report includes:
+
+- `phase`: `completed`, `completed-with-skips`, `backfilled`, or `skipped`;
+- `safe_to_delete_old_indexes`: `true` only when the rebuild/backfill run has
+  finished without unresolved skipped items;
+- `skipped_packages`: packages that still need attention;
+- `recovered_packages`: skipped items successfully backfilled in the current
+  run.
+
+If the main rebuild run records skipped items, run:
+
+```powershell
+cargo run -p discovery-node -- semantic-backfill-skipped services/discovery-node/config.example.toml
+```
+
+This command retries the recorded skipped semantic items without touching the
+already rebuilt main index batch. It is meant for final cleanup after the full
+rebuild has completed.
+
 The repository also includes a smoke evaluation suite for real OAN-style
 resource queries:
 
