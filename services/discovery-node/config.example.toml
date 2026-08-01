@@ -41,8 +41,30 @@ modelName = "oan-deterministic-local-v1"
 dimension = 64
 timeoutMs = 2000
 batchSize = 32
+maxInputChars = 6000
+
+# Production semantic discovery can use services/embedding-service as an
+# internal HTTP embedding service. Keep modelVersion stable while an index is
+# active; changing it requires rebuilding the semantic index.
+# provider = "http-embedding"
+# endpoint = "http://127.0.0.1:18080/embed"
+# healthEndpoint = "http://127.0.0.1:18080/health"
+# modelName = "gte-multilingual-base"
+# modelVersion = "gte-multilingual-base-q8-local"
+# strictModelVersion = true
+# dtype = "q8"
+# dimension = 768
+
+# Matching embedding-service environment for the first production profile:
+# OAN_EMBEDDING_PROVIDER=transformers
+# OAN_EMBEDDING_MODEL=gte-multilingual-base
+# OAN_EMBEDDING_MODEL_ID=/opt/oan/models/onnx-community/gte-multilingual-base
+# OAN_EMBEDDING_LOCAL_MODEL_PATH=/opt/oan/models/onnx-community
+# OAN_EMBEDDING_VERSION=gte-multilingual-base-q8-local
+# OAN_EMBEDDING_DIMENSION=768
+# OAN_EMBEDDING_DTYPE=q8
 
 [semanticSearch.filters]
 resourceType = "hard"
-capabilityTags = "soft"
-protocol = "soft"
+capabilityTags = "hard"
+protocol = "hard"

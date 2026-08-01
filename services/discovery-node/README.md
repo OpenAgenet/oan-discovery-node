@@ -41,3 +41,59 @@ cargo run -p discovery-node
 
 The default local API listens on port `8002` when using the sample
 configuration and demo scripts.
+
+## Multilingual Semantic Search
+
+Discovery Node can use a local HTTP embedding service for Chinese and English
+semantic discovery. The reference service is in
+`services/embedding-service` and exposes `GET /health` plus `POST /embed`.
+
+The Discovery Node process does not load embedding model weights directly. In
+production, run the embedding service with `gte-multilingual-base`, configure
+`[semanticSearch.embedding]` with `provider = "http-embedding"`, and keep
+`modelVersion` pinned until the semantic index is rebuilt.
+
+The intended deployment shape is:
+
+- code built in: this repository contains the Discovery integration and the
+  optional HTTP embedding service implementation;
+- model externalized: model weights are loaded from a runtime cache or an
+  operator-managed local model directory, not from Git or a submodule;
+- configuration bound: Discovery pins `modelName`, `modelVersion`, `dimension`,
+  endpoint, health endpoint, timeout, and strict version checking in
+  `config.example.toml` or an environment-specific config;
+- graceful fallback: if semantic search is disabled, PostgreSQL/pgvector is not
+  available, or the embedding service is not healthy, Discovery continues with
+  the local lexical and structured semantic ranking path.
+
+Semantic discovery uses two pgvector-backed indexes:
+
+- `discovery_semantic_index`: one resource-level context embedding per resource.
+- `discovery_intent_index`: one embedding per use case, example, and generated
+  pseudo query. Query-time ranking applies example-level MaxSim over this table
+  for the current candidate set.
+
+When `modelName`, `modelVersion`, or `dimension` changes, rebuild both semantic
+indexes before relying on production semantic ranking:
+
+```powershell
+cargo run -p discovery-node -- semantic-rebuild services/discovery-node/config.example.toml
+```
+
+The command reads the current verified resource package index, projects active
+user-consumable resources, rebuilds the resource-level and intent-level
+embeddings for the configured model version, and prints a JSON report with the
+indexed resource and intent counts. If semantic search is unavailable, it exits
+successfully with `semantic_enabled: false` and a `skipped_reason`.
+
+The repository also includes a smoke evaluation suite for real OAN-style
+resource queries:
+
+```powershell
+cargo run -p discovery-node -- semantic-evaluate services/discovery-node/config.example.toml services/discovery-node/evaluation/real-resource-smoke.v1.json
+```
+
+Each evaluation case uses the same `ResourceDiscoveryQuery` shape as
+`POST /discovery/resources/query`, so the evaluation exercises the production
+query path. The seed suite covers Chinese, English, mixed Chinese-English, and
+exact DID lookup. Larger exported suites can reuse the same JSON schema.

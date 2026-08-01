@@ -13,9 +13,16 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
-use oan_core::{CryptoSuite, DidDocument};
-use oan_crypto::{sha256_hex, signing_key_from_bytes};
-use oan_package::ResourcePackage;
+use jieba_rs::Jieba;
+use oan_core::{
+    CryptoSuite, DidDocument, ImplementationLink, OanMetadata, ProtocolBinding,
+    ResourceDescription, ResourceType, ServiceEndpoint, VerificationMethod,
+};
+use oan_crypto::{hash_json_with_suite, sha256_hex, signing_key_from_bytes};
+use oan_package::{
+    hash_resource_metadata_with_suite, ResourceMetadata, ResourcePackage, ResourcePackageClaims,
+    RootProof,
+};
 use oan_protocol::{
     HealthResponse, ResourceDiscoveryCandidate, ResourceDiscoveryQuery, ResourceDiscoveryResponse,
 };
@@ -27,11 +34,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{Postgres, QueryBuilder, Row, Sqlite};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration as StdDuration, Instant},
 };
 use tokio::sync::Mutex;
@@ -42,9 +49,11 @@ const DISCOVERY_SYNC_STATE_TABLE: &str = "discovery_sync_state";
 const DISCOVERY_PACKAGE_TABLE: &str = "discovery_packages";
 const DISCOVERY_REJECTED_TABLE: &str = "discovery_rejected_packages";
 const DISCOVERY_SEMANTIC_INDEX_TABLE: &str = "discovery_semantic_index";
+const DISCOVERY_INTENT_INDEX_TABLE: &str = "discovery_intent_index";
 const DISCOVERY_INDEX_STATS_CACHE_TTL_MS: u64 = 500;
 const DISCOVERY_CDN_CURSOR_KEY: &str = "cdn_publication_cursor";
 const DEFAULT_SEMANTIC_DIMENSION: usize = 64;
+const SEMANTIC_ALIASES_JSON: &str = include_str!("semantic_aliases.v1.json");
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct DiscoverySyncRequest {
@@ -200,10 +209,20 @@ impl Default for SemanticSearchConfig {
 struct SemanticEmbeddingConfig {
     #[serde(default = "default_semantic_embedding_provider")]
     provider: String,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default, rename = "healthEndpoint")]
+    health_endpoint: Option<String>,
     #[serde(default, rename = "modelPath")]
     model_path: Option<String>,
     #[serde(default = "default_semantic_embedding_model", rename = "modelName")]
     model_name: String,
+    #[serde(default, rename = "modelVersion")]
+    model_version: Option<String>,
+    #[serde(default, rename = "strictModelVersion")]
+    strict_model_version: bool,
+    #[serde(default, rename = "dtype")]
+    dtype: Option<String>,
     #[serde(default = "default_semantic_dimension")]
     dimension: usize,
     #[serde(
@@ -216,17 +235,28 @@ struct SemanticEmbeddingConfig {
         rename = "batchSize"
     )]
     batch_size: usize,
+    #[serde(
+        default = "default_semantic_embedding_max_input_chars",
+        rename = "maxInputChars"
+    )]
+    max_input_chars: usize,
 }
 
 impl Default for SemanticEmbeddingConfig {
     fn default() -> Self {
         Self {
             provider: default_semantic_embedding_provider(),
+            endpoint: None,
+            health_endpoint: None,
             model_path: None,
             model_name: default_semantic_embedding_model(),
+            model_version: None,
+            strict_model_version: false,
+            dtype: None,
             dimension: default_semantic_dimension(),
             timeout_ms: default_semantic_embedding_timeout_ms(),
             batch_size: default_semantic_embedding_batch_size(),
+            max_input_chars: default_semantic_embedding_max_input_chars(),
         }
     }
 }
@@ -301,16 +331,24 @@ fn default_semantic_embedding_batch_size() -> usize {
     32
 }
 
+fn default_semantic_embedding_max_input_chars() -> usize {
+    6_000
+}
+
+fn default_semantic_evaluation_package_version() -> String {
+    "1".to_owned()
+}
+
 fn default_semantic_resource_type_filter() -> String {
     "hard".to_owned()
 }
 
 fn default_semantic_capability_tags_filter() -> String {
-    "soft".to_owned()
+    "hard".to_owned()
 }
 
 fn default_semantic_protocol_filter() -> String {
-    "soft".to_owned()
+    "hard".to_owned()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -348,6 +386,7 @@ struct SemanticRuntimeState {
     fallback_reason: Option<String>,
     embedding_model: String,
     embedding_version: String,
+    embedding_dtype: Option<String>,
     dimension: usize,
 }
 
@@ -360,6 +399,7 @@ impl SemanticRuntimeState {
             fallback_reason: Some(reason.into()),
             embedding_model: config.embedding.model_name.clone(),
             embedding_version: semantic_embedding_version(config),
+            embedding_dtype: config.embedding.dtype.clone(),
             dimension: config.embedding.dimension,
         }
     }
@@ -413,22 +453,47 @@ impl DiscoverySearchEngine {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EmbeddingProviderKind {
     DeterministicLocal,
+    HttpEmbedding,
 }
 
 impl EmbeddingProviderKind {
     fn from_config(config: &SemanticEmbeddingConfig) -> Result<Self> {
         match config.provider.as_str() {
             "deterministic-local" => Ok(Self::DeterministicLocal),
+            "http-embedding" => Ok(Self::HttpEmbedding),
             "local" | "local-model" => Err(anyhow!("local_embedding_provider_not_wired")),
             value => Err(anyhow!("unsupported_embedding_provider:{value}")),
         }
     }
+}
 
-    fn embed(&self, text: &str, dimension: usize) -> Result<Vec<f32>> {
-        match self {
-            Self::DeterministicLocal => Ok(deterministic_embedding(text, dimension)),
-        }
-    }
+#[derive(Debug, Serialize)]
+struct HttpEmbeddingRequest {
+    model: String,
+    input: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HttpEmbeddingResponse {
+    model: String,
+    #[serde(rename = "embeddingVersion", alias = "embedding_version")]
+    embedding_version: String,
+    #[serde(default)]
+    dtype: Option<String>,
+    dimension: usize,
+    vectors: Vec<Vec<f32>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HttpEmbeddingHealthResponse {
+    model: String,
+    #[serde(rename = "embeddingVersion", alias = "embedding_version")]
+    embedding_version: Option<String>,
+    #[serde(default)]
+    dtype: Option<String>,
+    dimension: usize,
+    #[serde(default)]
+    ready: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -476,11 +541,49 @@ struct SearchDocument {
 }
 
 #[derive(Clone, Debug)]
+struct IntentDocument {
+    resource_did: String,
+    intent_id: String,
+    intent_kind: String,
+    intent_text: String,
+    resource_type: String,
+    lifecycle_state: String,
+    semantic_source_hash: String,
+}
+
+#[derive(Clone, Debug)]
 struct SemanticQueryHit {
     package: ResourcePackage,
     semantic_score: f32,
+    bm25_score: f32,
+    tag_score: f32,
+    context_score: f32,
+    intent_score: f32,
     structured_score: f32,
     final_score: f32,
+    matched_intent: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SemanticAliasFile {
+    groups: Vec<SemanticAliasGroup>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SemanticAliasGroup {
+    canonical: String,
+    terms: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct SemanticAliasCatalog {
+    phrase_to_canonical: Vec<(String, String)>,
+    canonical_to_terms: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Clone, Debug)]
+struct SemanticQueryProjection {
+    expanded_tokens: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -490,6 +593,7 @@ struct SemanticSearchDiagnostics {
     backend: String,
     embedding_model: String,
     embedding_version: String,
+    embedding_dtype: Option<String>,
     dimension: usize,
     fallback_used: bool,
     fallback_reason: Option<String>,
@@ -502,6 +606,87 @@ struct DiscoveryQueryMetrics {
     returned_count: usize,
     elapsed_ms: u128,
     used_indexed_prefilter: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SemanticRebuildReport {
+    backend: String,
+    semantic_enabled: bool,
+    package_count: usize,
+    context_indexed_count: usize,
+    intent_indexed_count: usize,
+    skipped_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SemanticEvaluationSuite {
+    suite: String,
+    #[serde(default, rename = "seedPackages")]
+    seed_packages: Vec<ResourcePackage>,
+    #[serde(default, rename = "seedResources")]
+    seed_resources: Vec<SemanticEvaluationSeedResource>,
+    cases: Vec<SemanticEvaluationCase>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SemanticEvaluationSeedResource {
+    #[serde(rename = "resourceDid")]
+    resource_did: String,
+    #[serde(rename = "resourceType")]
+    resource_type: ResourceType,
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(rename = "capabilityDescription", default)]
+    capability_description: String,
+    #[serde(rename = "capabilityTags", default)]
+    capability_tags: Vec<String>,
+    #[serde(rename = "authorizedDomains", default)]
+    authorized_domains: Vec<String>,
+    #[serde(default)]
+    protocols: Vec<String>,
+    #[serde(rename = "serviceEndpoint", default)]
+    service_endpoint: Option<String>,
+    #[serde(rename = "useCaseExamples", default)]
+    use_case_examples: Vec<String>,
+    #[serde(default)]
+    examples: Vec<Value>,
+    #[serde(default = "default_semantic_evaluation_package_version", rename = "packageVersion")]
+    package_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SemanticEvaluationCase {
+    id: String,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    query: ResourceDiscoveryQuery,
+    #[serde(rename = "expectedDids")]
+    expected_dids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SemanticEvaluationReport {
+    suite: String,
+    case_count: usize,
+    seed_package_count: usize,
+    recall_at_5: f32,
+    recall_at_10: f32,
+    mrr_at_10: f32,
+    cases: Vec<SemanticEvaluationCaseReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct SemanticEvaluationCaseReport {
+    id: String,
+    language: Option<String>,
+    description: Option<String>,
+    passed: bool,
+    reciprocal_rank: f32,
+    returned_dids: Vec<String>,
+    expected_dids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -555,10 +740,114 @@ type ApiResult<T> = std::result::Result<Json<T>, ApiError>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config_path = env::args()
-        .nth(1)
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args
+        .first()
+        .is_some_and(|value| value == "semantic-rebuild")
+    {
+        let config_path = args
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| "services/discovery-node/config.example.toml".to_owned());
+        let state = build_app_state(load_config(config_path)?).await?;
+        let report = rebuild_semantic_indexes(&state).await?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    if args
+        .first()
+        .is_some_and(|value| value == "semantic-evaluate")
+    {
+        let config_path = args
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| "services/discovery-node/config.example.toml".to_owned());
+        let suite_path = args.get(2).cloned().unwrap_or_else(|| {
+            "services/discovery-node/evaluation/real-resource-smoke.v1.json".to_owned()
+        });
+        let state = build_app_state(load_config(config_path)?).await?;
+        let report = evaluate_semantic_discovery(&state, &PathBuf::from(suite_path)).await?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    if args
+        .first()
+        .is_some_and(|value| value == "semantic-rebuild-evaluate")
+    {
+        let config_path = args
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| "services/discovery-node/config.example.toml".to_owned());
+        let suite_path = args.get(2).cloned().unwrap_or_else(|| {
+            "services/discovery-node/evaluation/real-resource-smoke.v1.json".to_owned()
+        });
+        let state = build_app_state(load_config(config_path)?).await?;
+        let suite_path = PathBuf::from(suite_path);
+        let seed_count = seed_semantic_evaluation_packages(&state, &suite_path).await?;
+        let rebuild = rebuild_semantic_indexes(&state).await?;
+        let evaluation = evaluate_semantic_discovery(&state, &suite_path).await?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "seedPackageCount": seed_count,
+                "rebuild": rebuild,
+                "evaluation": evaluation
+            }))?
+        );
+        return Ok(());
+    }
+    let config_path = args
+        .first()
+        .cloned()
         .unwrap_or_else(|| "services/discovery-node/config.example.toml".to_owned());
     let config = load_config(config_path)?;
+    let state = build_app_state(config.clone()).await?;
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/discovery/did", get(discovery_did_document))
+        .route("/routes/{did}", get(route_lookup))
+        .route("/discovery/status", get(api_status))
+        .route("/discovery/root-authorization", get(api_root_authorization))
+        .route("/discovery/authorized-domains", get(api_authorized_domains))
+        .route(
+            "/discovery/resources/sync-authorized",
+            post(sync_resources_from_authorized_summary),
+        )
+        .route("/discovery/sync/history", get(api_sync_history))
+        .route("/discovery/index/stats", get(api_index_stats))
+        .route("/discovery/index/resources", get(api_index_resources))
+        .route(
+            "/discovery/index/resources/visibility",
+            post(api_index_resource_visibility),
+        )
+        .route(
+            "/discovery/index/resources/{did}",
+            get(api_index_resource_detail),
+        )
+        .route("/discovery/resources/query", post(resource_query))
+        .route("/discovery/query/suggestions", post(api_query_suggestions))
+        .route("/discovery/query/explain", post(api_query_explain))
+        .route("/discovery/rejected-packages", get(api_rejected_packages))
+        .route("/discovery/capability-tree", get(api_capability_tree))
+        .layer(build_cors_layer(&config.cors)?)
+        .with_state(state.clone());
+
+    if (state.sqlite.is_some() || state.postgres.is_some()) && state.config.debug.export_snapshots {
+        let debug_state = state.clone();
+        tokio::spawn(async move {
+            discovery_debug_export_loop(debug_state).await;
+        });
+    }
+
+    let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
+    println!("discovery-node listening on http://{addr}");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn build_app_state(config: Config) -> Result<AppState> {
     let did_doc: DidDocument = JsonStore::new(&config.paths.data_dir).read("did-document.json")?;
     let key: DevKeyFile = JsonStore::new(".").read(config.paths.keys_dir.join("keypair.json"))?;
     let crypto_suite = crypto_suite_from_algorithm(&key.algorithm)?;
@@ -613,48 +902,7 @@ async fn main() -> Result<()> {
         resource_sync_lock: Arc::new(Mutex::new(())),
         index_stats_cache: Arc::new(Mutex::new(None)),
     };
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/discovery/did", get(discovery_did_document))
-        .route("/routes/{did}", get(route_lookup))
-        .route("/discovery/status", get(api_status))
-        .route("/discovery/root-authorization", get(api_root_authorization))
-        .route("/discovery/authorized-domains", get(api_authorized_domains))
-        .route(
-            "/discovery/resources/sync-authorized",
-            post(sync_resources_from_authorized_summary),
-        )
-        .route("/discovery/sync/history", get(api_sync_history))
-        .route("/discovery/index/stats", get(api_index_stats))
-        .route("/discovery/index/resources", get(api_index_resources))
-        .route(
-            "/discovery/index/resources/visibility",
-            post(api_index_resource_visibility),
-        )
-        .route(
-            "/discovery/index/resources/{did}",
-            get(api_index_resource_detail),
-        )
-        .route("/discovery/resources/query", post(resource_query))
-        .route("/discovery/query/suggestions", post(api_query_suggestions))
-        .route("/discovery/query/explain", post(api_query_explain))
-        .route("/discovery/rejected-packages", get(api_rejected_packages))
-        .route("/discovery/capability-tree", get(api_capability_tree))
-        .layer(build_cors_layer(&config.cors)?)
-        .with_state(state.clone());
-
-    if (state.sqlite.is_some() || state.postgres.is_some()) && state.config.debug.export_snapshots {
-        let debug_state = state.clone();
-        tokio::spawn(async move {
-            discovery_debug_export_loop(debug_state).await;
-        });
-    }
-
-    let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
-    println!("discovery-node listening on http://{addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+    Ok(state)
 }
 
 fn load_config(path: String) -> Result<Config> {
@@ -788,7 +1036,9 @@ async fn initialize_semantic_runtime(
             return SemanticRuntimeState::disabled(err.to_string(), &config.semantic_search);
         }
     };
-    if let Err(err) = EmbeddingProviderKind::from_config(&config.semantic_search.embedding) {
+    if let Err(err) =
+        validate_embedding_provider(&config.semantic_search, &reqwest::Client::new()).await
+    {
         return SemanticRuntimeState::disabled(err.to_string(), &config.semantic_search);
     }
     let Some(postgres) = postgres else {
@@ -805,6 +1055,7 @@ async fn initialize_semantic_runtime(
             fallback_reason: None,
             embedding_model: config.semantic_search.embedding.model_name.clone(),
             embedding_version: semantic_embedding_version(&config.semantic_search),
+            embedding_dtype: config.semantic_search.embedding.dtype.clone(),
             dimension: config.semantic_search.embedding.dimension,
         },
         Err(err) => {
@@ -868,6 +1119,29 @@ async fn initialize_semantic_postgres(
             ON {DISCOVERY_SEMANTIC_INDEX_TABLE}
             USING ivfflat (embedding vector_cosine_ops)
             WITH (lists = 100);
+
+            CREATE TABLE IF NOT EXISTS {DISCOVERY_INTENT_INDEX_TABLE} (
+                resource_did TEXT NOT NULL,
+                intent_id TEXT NOT NULL,
+                intent_kind TEXT NOT NULL,
+                intent_text TEXT NOT NULL,
+                resource_type TEXT NOT NULL,
+                lifecycle_state TEXT NOT NULL,
+                semantic_source_hash TEXT NOT NULL,
+                embedding VECTOR({dimension}),
+                embedding_model TEXT NOT NULL,
+                embedding_version TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(resource_did, intent_id, embedding_model, embedding_version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_discovery_intent_resource
+            ON {DISCOVERY_INTENT_INDEX_TABLE}(resource_did);
+            CREATE INDEX IF NOT EXISTS idx_discovery_intent_type_state
+            ON {DISCOVERY_INTENT_INDEX_TABLE}(resource_type, lifecycle_state);
+            CREATE INDEX IF NOT EXISTS idx_discovery_intent_embedding
+            ON {DISCOVERY_INTENT_INDEX_TABLE}
+            USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = 100);
             "#,
         ))
         .await?;
@@ -875,10 +1149,12 @@ async fn initialize_semantic_postgres(
 }
 
 fn semantic_embedding_version(config: &SemanticSearchConfig) -> String {
-    format!(
-        "1:{}:{}",
-        config.embedding.provider, config.embedding.dimension
-    )
+    config.embedding.model_version.clone().unwrap_or_else(|| {
+        format!(
+            "1:{}:{}",
+            config.embedding.provider, config.embedding.dimension
+        )
+    })
 }
 
 fn semantic_search_available(state: &AppState) -> bool {
@@ -899,6 +1175,7 @@ fn semantic_diagnostics(
         backend: state.semantic.backend.clone(),
         embedding_model: state.semantic.embedding_model.clone(),
         embedding_version: state.semantic.embedding_version.clone(),
+        embedding_dtype: state.semantic.embedding_dtype.clone(),
         dimension: state.semantic.dimension,
         fallback_used,
         fallback_reason: fallback_reason.or_else(|| state.semantic.fallback_reason.clone()),
@@ -921,6 +1198,7 @@ fn semantic_status_json(
         "embeddingProvider": state.config.semantic_search.embedding.provider,
         "embeddingModel": diagnostics.embedding_model,
         "embeddingVersion": diagnostics.embedding_version,
+        "embeddingDtype": diagnostics.embedding_dtype,
         "modelPath": state.config.semantic_search.embedding.model_path,
         "dimension": diagnostics.dimension,
         "timeoutMs": state.config.semantic_search.embedding.timeout_ms,
@@ -1049,6 +1327,17 @@ fn search_document_from_package(
     }
 }
 
+fn semantic_search_text(values: &[String]) -> String {
+    let raw_text = values
+        .iter()
+        .map(|value| normalize_semantic_text(value))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let tokens = semantic_tokens(&raw_text);
+    normalize_semantic_text(&format!("{} {}", raw_text.to_lowercase(), tokens.join(" ")))
+}
+
 struct SemanticEmbeddingTextInput<'a> {
     name: &'a str,
     resource_type: &'a str,
@@ -1078,6 +1367,29 @@ fn semantic_embedding_text(input: &SemanticEmbeddingTextInput<'_>) -> String {
     text.push_str(&input.examples.join("\n"));
     text.push_str("\n\nUse cases:\n");
     text.push_str(&input.use_cases.join("\n"));
+    text.push_str("\n\nTag view:\n");
+    for tag in input.capability_tags {
+        text.push_str("capability ");
+        text.push_str(tag);
+        text.push('\n');
+    }
+    text.push_str("\nContext view:\n");
+    text.push_str(input.name);
+    text.push_str(" provides ");
+    text.push_str(input.resource_type);
+    text.push_str(" capabilities for ");
+    text.push_str(input.description);
+    text.push_str("\n\nIntent view:\n");
+    for use_case in input.use_cases {
+        text.push_str("User wants to ");
+        text.push_str(use_case);
+        text.push('\n');
+    }
+    for example in input.examples {
+        text.push_str("Example request: ");
+        text.push_str(example);
+        text.push('\n');
+    }
     text.chars().take(8_000).collect()
 }
 
@@ -1092,6 +1404,96 @@ fn semantic_document_text(doc: &SearchDocument) -> String {
         examples: &doc.examples,
         use_cases: &doc.use_cases,
     })
+}
+
+fn semantic_alias_catalog() -> &'static SemanticAliasCatalog {
+    static CATALOG: OnceLock<SemanticAliasCatalog> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let alias_file: SemanticAliasFile =
+            serde_json::from_str(SEMANTIC_ALIASES_JSON).expect("semantic_aliases.v1.json is valid");
+        let mut phrase_to_canonical = Vec::new();
+        let mut canonical_to_terms = BTreeMap::new();
+        for group in alias_file.groups {
+            let canonical = normalize_semantic_token(&group.canonical);
+            let mut terms = Vec::new();
+            push_unique_text(&mut terms, &canonical);
+            for term in group.terms {
+                push_unique_text(&mut terms, term);
+            }
+            for term in &terms {
+                phrase_to_canonical.push((term.to_lowercase(), canonical.clone()));
+            }
+            canonical_to_terms.insert(canonical, terms);
+        }
+        phrase_to_canonical.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()));
+        SemanticAliasCatalog {
+            phrase_to_canonical,
+            canonical_to_terms,
+        }
+    })
+}
+
+fn semantic_jieba() -> &'static Jieba {
+    static JIEBA: OnceLock<Jieba> = OnceLock::new();
+    JIEBA.get_or_init(Jieba::new)
+}
+
+fn normalize_semantic_token(token: &str) -> String {
+    token.trim().to_lowercase()
+}
+
+fn technical_semantic_tokens(text: &str) -> Vec<String> {
+    text.split(|ch: char| {
+        !(ch.is_ascii_alphanumeric() || matches!(ch, '.' | ':' | '_' | '-' | '/' | '#'))
+    })
+    .filter_map(|token| {
+        let token = normalize_semantic_token(token)
+            .trim_matches(|ch: char| matches!(ch, '.' | ':' | '_' | '-' | '/' | '#'))
+            .to_owned();
+        (token.len() >= 2).then_some(token)
+    })
+    .collect()
+}
+
+fn expand_semantic_aliases(tokens: &[String], raw_text: &str) -> Vec<String> {
+    let catalog = semantic_alias_catalog();
+    let lower_text = raw_text.to_lowercase();
+    let mut expanded = tokens.to_vec();
+    let mut seen = expanded.iter().cloned().collect::<HashSet<_>>();
+    for (phrase, canonical) in &catalog.phrase_to_canonical {
+        if lower_text.contains(phrase) || tokens.iter().any(|token| token == phrase) {
+            if seen.insert(canonical.clone()) {
+                expanded.push(canonical.clone());
+            }
+            if let Some(terms) = catalog.canonical_to_terms.get(canonical) {
+                for term in terms.iter().take(8) {
+                    for token in semantic_tokens_without_alias_expansion(term) {
+                        if seen.insert(token.clone()) {
+                            expanded.push(token);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    expanded
+}
+
+fn semantic_tokens_without_alias_expansion(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut seen = HashSet::new();
+    for token in technical_semantic_tokens(text) {
+        if seen.insert(token.clone()) {
+            tokens.push(token);
+        }
+    }
+    for token in semantic_jieba().cut(text, false) {
+        let normalized = normalize_semantic_token(token);
+        if normalized.chars().count() >= 2 && seen.insert(normalized.clone()) {
+            tokens.push(normalized);
+        }
+    }
+    tokens
 }
 
 fn deterministic_embedding(text: &str, dimension: usize) -> Vec<f32> {
@@ -1109,18 +1511,445 @@ fn deterministic_embedding(text: &str, dimension: usize) -> Vec<f32> {
     normalize_vector(vector)
 }
 
-fn embed_semantic_text(config: &SemanticSearchConfig, text: &str) -> Result<Vec<f32>> {
-    EmbeddingProviderKind::from_config(&config.embedding)?.embed(text, config.embedding.dimension)
+async fn validate_embedding_provider(
+    config: &SemanticSearchConfig,
+    client: &reqwest::Client,
+) -> Result<()> {
+    match EmbeddingProviderKind::from_config(&config.embedding)? {
+        EmbeddingProviderKind::DeterministicLocal => {
+            let probe = deterministic_embedding("oan semantic probe", config.embedding.dimension);
+            validate_embedding_vector(&probe, config.embedding.dimension)?;
+            Ok(())
+        }
+        EmbeddingProviderKind::HttpEmbedding => {
+            let health_endpoint = config
+                .embedding
+                .health_endpoint
+                .as_deref()
+                .ok_or_else(|| anyhow!("http_embedding_health_endpoint_required"))?;
+            let health = client
+                .get(health_endpoint)
+                .timeout(StdDuration::from_millis(config.embedding.timeout_ms))
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<HttpEmbeddingHealthResponse>()
+                .await?;
+            if !health.ready {
+                return Err(anyhow!("http_embedding_provider_not_ready"));
+            }
+            if health.model != config.embedding.model_name {
+                return Err(anyhow!("http_embedding_model_mismatch:{}", health.model));
+            }
+            if health.dimension != config.embedding.dimension {
+                return Err(anyhow!(
+                    "http_embedding_dimension_mismatch:{}",
+                    health.dimension
+                ));
+            }
+            if config.embedding.strict_model_version {
+                let expected = config
+                    .embedding
+                    .model_version
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("strict_model_version_requires_modelVersion"))?;
+                let actual = health
+                    .embedding_version
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("http_embedding_version_missing"))?;
+                if actual != expected {
+                    return Err(anyhow!("http_embedding_version_mismatch:{actual}"));
+                }
+            }
+            if let Some(expected) = config.embedding.dtype.as_deref() {
+                let actual = health
+                    .dtype
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("http_embedding_dtype_missing"))?;
+                if actual != expected {
+                    return Err(anyhow!("http_embedding_dtype_mismatch:{actual}"));
+                }
+            }
+            let probe = embed_semantic_text(config, client, "oan semantic probe").await?;
+            validate_embedding_vector(&probe, config.embedding.dimension)
+        }
+    }
+}
+
+async fn embed_semantic_text(
+    config: &SemanticSearchConfig,
+    client: &reqwest::Client,
+    text: &str,
+) -> Result<Vec<f32>> {
+    let text = bounded_embedding_text(text, config.embedding.max_input_chars);
+    match EmbeddingProviderKind::from_config(&config.embedding)? {
+        EmbeddingProviderKind::DeterministicLocal => {
+            Ok(deterministic_embedding(&text, config.embedding.dimension))
+        }
+        EmbeddingProviderKind::HttpEmbedding => {
+            let endpoint = config
+                .embedding
+                .endpoint
+                .as_deref()
+                .ok_or_else(|| anyhow!("http_embedding_endpoint_required"))?;
+            let response = client
+                .post(endpoint)
+                .timeout(StdDuration::from_millis(config.embedding.timeout_ms))
+                .json(&HttpEmbeddingRequest {
+                    model: config.embedding.model_name.clone(),
+                    input: vec![text],
+                })
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<HttpEmbeddingResponse>()
+                .await?;
+            if response.model != config.embedding.model_name {
+                return Err(anyhow!("http_embedding_model_mismatch:{}", response.model));
+            }
+            if response.dimension != config.embedding.dimension {
+                return Err(anyhow!(
+                    "http_embedding_dimension_mismatch:{}",
+                    response.dimension
+                ));
+            }
+            if config.embedding.strict_model_version {
+                let expected = config
+                    .embedding
+                    .model_version
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("strict_model_version_requires_modelVersion"))?;
+                if response.embedding_version != expected {
+                    return Err(anyhow!(
+                        "http_embedding_version_mismatch:{}",
+                        response.embedding_version
+                    ));
+                }
+            }
+            if let Some(expected) = config.embedding.dtype.as_deref() {
+                let actual = response
+                    .dtype
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("http_embedding_response_dtype_missing"))?;
+                if actual != expected {
+                    return Err(anyhow!("http_embedding_response_dtype_mismatch:{actual}"));
+                }
+            }
+            let vector = response
+                .vectors
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("http_embedding_vector_missing"))?;
+            validate_embedding_vector(&vector, config.embedding.dimension)?;
+            Ok(normalize_vector(vector))
+        }
+    }
+}
+
+fn bounded_embedding_text(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars.max(1)).collect()
+}
+
+fn validate_embedding_vector(vector: &[f32], dimension: usize) -> Result<()> {
+    if vector.len() != dimension {
+        return Err(anyhow!(
+            "embedding_dimension_mismatch:{}:{}",
+            vector.len(),
+            dimension
+        ));
+    }
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err(anyhow!("embedding_vector_contains_non_finite_value"));
+    }
+    Ok(())
 }
 
 fn semantic_tokens(text: &str) -> Vec<String> {
-    text.to_ascii_lowercase()
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '.')
-        .filter_map(|token| {
-            let trimmed = token.trim();
-            (trimmed.len() >= 2).then(|| trimmed.to_owned())
+    let tokens = semantic_tokens_without_alias_expansion(text);
+    expand_semantic_aliases(&tokens, text)
+}
+
+fn semantic_query_projection(query: &ResourceDiscoveryQuery) -> SemanticQueryProjection {
+    let raw_text = query.query.as_deref().unwrap_or_default().trim().to_owned();
+    let mut explicit_terms = HashSet::new();
+    if let Some(resource_type) = &query.resource_type {
+        explicit_terms.insert(resource_type.as_str().to_owned());
+    }
+    if let Some(protocol) = &query.protocol {
+        explicit_terms.insert(protocol.to_ascii_lowercase());
+    }
+    explicit_terms.extend(
+        query
+            .capability_tags
+            .iter()
+            .map(|tag| tag.to_ascii_lowercase()),
+    );
+
+    let tokens = semantic_tokens_without_alias_expansion(&raw_text);
+    let mut expanded_tokens = expand_semantic_aliases(&tokens, &raw_text);
+    for term in &explicit_terms {
+        for token in semantic_tokens(term) {
+            if !expanded_tokens.iter().any(|existing| existing == &token) {
+                expanded_tokens.push(token);
+            }
+        }
+    }
+    SemanticQueryProjection { expanded_tokens }
+}
+
+fn semantic_tag_text(doc: &SearchDocument) -> String {
+    [
+        doc.resource_did.as_str(),
+        doc.resource_type.as_str(),
+        &doc.capability_tags.join(" "),
+        &doc.protocols.join(" "),
+        &doc.service_endpoints.join(" "),
+    ]
+    .join(" ")
+}
+
+fn semantic_context_text(doc: &SearchDocument) -> String {
+    [
+        doc.name.as_str(),
+        doc.resource_type.as_str(),
+        doc.description.as_str(),
+        &doc.capability_tags.join(" "),
+        &doc.protocols.join(" "),
+        &doc.use_cases.join(" "),
+        &doc.examples.join(" "),
+        doc.search_text.as_str(),
+    ]
+    .join(" ")
+}
+
+fn semantic_intent_texts(doc: &SearchDocument) -> Vec<String> {
+    let mut texts = Vec::new();
+    for value in &doc.use_cases {
+        push_unique_text(&mut texts, value);
+    }
+    for value in &doc.examples {
+        push_unique_text(&mut texts, value);
+    }
+    if !doc.description.is_empty() {
+        push_unique_text(
+            &mut texts,
+            format!("Find a {} for {}", doc.resource_type, doc.description),
+        );
+        push_unique_text(
+            &mut texts,
+            format!("Use {} to {}", doc.name, doc.description),
+        );
+    }
+    for tag in &doc.capability_tags {
+        push_unique_text(&mut texts, format!("Find a resource for capability {tag}"));
+    }
+    texts.into_iter().take(16).collect()
+}
+
+fn semantic_intent_documents(doc: &SearchDocument) -> Vec<IntentDocument> {
+    semantic_intent_texts(doc)
+        .into_iter()
+        .enumerate()
+        .map(|(index, intent_text)| {
+            let intent_kind = if doc.use_cases.iter().any(|value| value == &intent_text) {
+                "use_case"
+            } else if doc.examples.iter().any(|value| value == &intent_text) {
+                "example"
+            } else {
+                "pseudo_query"
+            };
+            let intent_id = format!("intent-{:02}", index + 1);
+            IntentDocument {
+                resource_did: doc.resource_did.clone(),
+                intent_id,
+                intent_kind: intent_kind.to_owned(),
+                semantic_source_hash: format!("sha256:{}", sha256_hex(intent_text.as_bytes())),
+                intent_text,
+                resource_type: doc.resource_type.clone(),
+                lifecycle_state: doc.lifecycle_state.clone(),
+            }
         })
         .collect()
+}
+
+fn token_counts(tokens: &[String]) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for token in tokens {
+        *counts.entry(token.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn weighted_token_similarity(query_tokens: &[String], text: &str) -> f32 {
+    if query_tokens.is_empty() {
+        return 0.0;
+    }
+    let doc_tokens = semantic_tokens(text);
+    if doc_tokens.is_empty() {
+        return 0.0;
+    }
+    let doc_counts = token_counts(&doc_tokens);
+    let matched = query_tokens
+        .iter()
+        .filter(|token| doc_counts.contains_key(*token))
+        .count();
+    (matched as f32 / query_tokens.len() as f32).clamp(0.0, 1.0)
+}
+
+fn bm25_like_score(query_tokens: &[String], documents: &[Vec<String>], index: usize) -> f32 {
+    if query_tokens.is_empty() || documents.is_empty() || index >= documents.len() {
+        return 0.0;
+    }
+    let doc_tokens = &documents[index];
+    if doc_tokens.is_empty() {
+        return 0.0;
+    }
+    let doc_counts = token_counts(doc_tokens);
+    let avg_len = documents
+        .iter()
+        .map(|tokens| tokens.len() as f32)
+        .sum::<f32>()
+        / documents.len() as f32;
+    let doc_len = doc_tokens.len() as f32;
+    let k1 = 1.2_f32;
+    let b = 0.75_f32;
+    let mut score = 0.0;
+    let mut unique_query_terms = HashSet::new();
+    for token in query_tokens {
+        if !unique_query_terms.insert(token) {
+            continue;
+        }
+        let Some(tf) = doc_counts.get(token).copied() else {
+            continue;
+        };
+        let doc_freq = documents
+            .iter()
+            .filter(|tokens| tokens.iter().any(|candidate| *candidate == *token))
+            .count() as f32;
+        let idf = (((documents.len() as f32 - doc_freq + 0.5) / (doc_freq + 0.5)) + 1.0).ln();
+        let tf = tf as f32;
+        score += idf * (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * doc_len / avg_len.max(1.0)));
+    }
+    (score / (score + 3.0)).clamp(0.0, 1.0)
+}
+
+fn semantic_resource_scores(
+    package: &ResourcePackage,
+    query: &ResourceDiscoveryQuery,
+    query_projection: &SemanticQueryProjection,
+    bm25_score: f32,
+) -> SemanticQueryHit {
+    let projection = discovery_package_projection(package);
+    let doc = search_document_from_package(0, package, &projection);
+    let tag_score =
+        weighted_token_similarity(&query_projection.expanded_tokens, &semantic_tag_text(&doc));
+    let context_score = weighted_token_similarity(
+        &query_projection.expanded_tokens,
+        &semantic_context_text(&doc),
+    );
+    let (intent_score, matched_intent) = semantic_intent_texts(&doc)
+        .into_iter()
+        .map(|intent| {
+            let score = weighted_token_similarity(&query_projection.expanded_tokens, &intent);
+            (score, intent)
+        })
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .filter(|(score, _)| *score > 0.0)
+        .map(|(score, intent)| (score, Some(intent)))
+        .unwrap_or((0.0, None));
+    let structured_score = semantic_structured_score(package, query);
+    let semantic_score =
+        (0.35 * bm25_score) + (0.20 * tag_score) + (0.25 * context_score) + (0.20 * intent_score);
+    let final_score = (semantic_score + structured_score).clamp(0.0, 1.0);
+    SemanticQueryHit {
+        package: package.clone(),
+        semantic_score,
+        bm25_score,
+        tag_score,
+        context_score,
+        intent_score,
+        structured_score,
+        final_score,
+        matched_intent,
+    }
+}
+
+fn text_has_cjk(text: &str) -> bool {
+    text.chars()
+        .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch))
+}
+
+fn should_use_sql_text_prefilter(query: &ResourceDiscoveryQuery) -> bool {
+    query
+        .query
+        .as_deref()
+        .map(|text| {
+            let trimmed = text.trim();
+            !trimmed.is_empty() && !text_has_cjk(trimmed)
+        })
+        .unwrap_or(false)
+}
+
+fn rank_resource_packages_semantically(
+    packages: Vec<ResourcePackage>,
+    query: &ResourceDiscoveryQuery,
+) -> Vec<SemanticQueryHit> {
+    let query_projection = semantic_query_projection(query);
+    let doc_tokens = packages
+        .iter()
+        .map(|package| {
+            let projection = discovery_package_projection(package);
+            let doc = search_document_from_package(0, package, &projection);
+            semantic_tokens(&semantic_context_text(&doc))
+        })
+        .collect::<Vec<_>>();
+    let has_semantic_terms = !query_projection.expanded_tokens.is_empty();
+    let mut hits = packages
+        .iter()
+        .enumerate()
+        .filter(|(_, package)| resource_matches_explicit_constraints(package, query))
+        .map(|(index, package)| {
+            let bm25_score = bm25_like_score(&query_projection.expanded_tokens, &doc_tokens, index);
+            semantic_resource_scores(package, query, &query_projection, bm25_score)
+        })
+        .filter(|hit| !has_semantic_terms || hit.final_score > 0.0)
+        .collect::<Vec<_>>();
+    hits.sort_by(|a, b| {
+        b.final_score
+            .total_cmp(&a.final_score)
+            .then_with(|| {
+                b.package
+                    .metadata
+                    .updated_at
+                    .cmp(&a.package.metadata.updated_at)
+            })
+            .then_with(|| a.package.resource_did.cmp(&b.package.resource_did))
+    });
+    hits
+}
+
+fn semantic_match_reason(hit: &SemanticQueryHit) -> String {
+    let mut reasons = Vec::new();
+    if hit.bm25_score > 0.0 {
+        reasons.push("lexical terms");
+    }
+    if hit.tag_score > 0.0 {
+        reasons.push("capability tags or protocols");
+    }
+    if hit.context_score > 0.0 {
+        reasons.push("resource context");
+    }
+    if hit.intent_score > 0.0 {
+        reasons.push("examples or use cases");
+    }
+    if hit.structured_score > 0.0 {
+        reasons.push("explicit filters");
+    }
+    if reasons.is_empty() {
+        "No semantic match above zero; returned only by structured eligibility.".to_owned()
+    } else {
+        format!("Matched by {}.", reasons.join(", "))
+    }
 }
 
 fn normalize_vector(mut vector: Vec<f32>) -> Vec<f32> {
@@ -1178,6 +2007,27 @@ fn semantic_structured_score(package: &ResourcePackage, query: &ResourceDiscover
         score += 0.05;
     }
     score
+}
+
+fn is_user_consumable_resource_type(resource_type: &ResourceType) -> bool {
+    matches!(
+        resource_type,
+        ResourceType::AgentService
+            | ResourceType::Skill
+            | ResourceType::McpServer
+            | ResourceType::ToolApi
+    )
+}
+
+fn should_search_resource_type(package: &ResourcePackage, query: &ResourceDiscoveryQuery) -> bool {
+    query.resource_type.is_some() || is_user_consumable_resource_type(&package.resource_type)
+}
+
+fn default_discoverable_resource_type_names() -> Vec<String> {
+    ["agent_service", "skill", "mcp_server", "tool_api"]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn build_cors_layer(config: &CorsConfig) -> Result<CorsLayer> {
@@ -1494,8 +2344,16 @@ async fn resource_query(
         let package = read_indexed_resource_package(&state, resource_did)
             .await
             .map_err(ApiError::internal)?;
+        let allowed_domains =
+            local_discovery_authorized_domains(&state).map_err(ApiError::internal)?;
         let candidates = package
-            .filter(|package| resource_matches_exact_did_query(package, &query))
+            .filter(|package| {
+                resource_matches_exact_did_query(package, &query)
+                    && authorized_domains_cover(
+                        &allowed_domains,
+                        &package.metadata.authorized_domains,
+                    )
+            })
             .map(|package| discovery_candidate_from_package(package, 1.0))
             .into_iter()
             .collect::<Vec<_>>();
@@ -1588,6 +2446,75 @@ async fn resource_query(
     }))
 }
 
+async fn run_resource_query(
+    state: &AppState,
+    query: &ResourceDiscoveryQuery,
+) -> Result<ResourceDiscoveryResponse> {
+    resource_query(State(state.clone()), Json(query.clone()))
+        .await
+        .map(|response| response.0)
+        .map_err(|err| anyhow!(err.message))
+}
+
+async fn evaluate_semantic_discovery(
+    state: &AppState,
+    suite_path: &Path,
+) -> Result<SemanticEvaluationReport> {
+    let suite: SemanticEvaluationSuite =
+        serde_json::from_str(&read_utf8_text_allowing_bom(suite_path)?)?;
+    if suite.cases.is_empty() {
+        return Err(anyhow!("semantic_evaluation_suite_empty"));
+    }
+    let mut reports = Vec::new();
+    let mut recall5_hits = 0usize;
+    let mut recall10_hits = 0usize;
+    let mut reciprocal_rank_sum = 0.0_f32;
+    for case in &suite.cases {
+        let response = run_resource_query(state, &case.query).await?;
+        let returned_dids = response
+            .candidates
+            .iter()
+            .map(|candidate| candidate.resource_did.clone())
+            .collect::<Vec<_>>();
+        let first_rank = returned_dids
+            .iter()
+            .position(|did| case.expected_dids.iter().any(|expected| expected == did))
+            .map(|index| index + 1);
+        let recall_at_5 = first_rank.is_some_and(|rank| rank <= 5);
+        let recall_at_10 = first_rank.is_some_and(|rank| rank <= 10);
+        if recall_at_5 {
+            recall5_hits += 1;
+        }
+        if recall_at_10 {
+            recall10_hits += 1;
+        }
+        let reciprocal_rank = first_rank
+            .filter(|rank| *rank <= 10)
+            .map(|rank| 1.0 / rank as f32)
+            .unwrap_or(0.0);
+        reciprocal_rank_sum += reciprocal_rank;
+        reports.push(SemanticEvaluationCaseReport {
+            id: case.id.clone(),
+            language: case.language.clone(),
+            description: case.description.clone(),
+            passed: recall_at_10,
+            reciprocal_rank,
+            returned_dids,
+            expected_dids: case.expected_dids.clone(),
+        });
+    }
+    let case_count = reports.len().max(1);
+    Ok(SemanticEvaluationReport {
+        suite: suite.suite,
+        case_count: reports.len(),
+        seed_package_count: suite.seed_packages.len() + suite.seed_resources.len(),
+        recall_at_5: recall5_hits as f32 / case_count as f32,
+        recall_at_10: recall10_hits as f32 / case_count as f32,
+        mrr_at_10: reciprocal_rank_sum / case_count as f32,
+        cases: reports,
+    })
+}
+
 fn query_resource_did(query: &ResourceDiscoveryQuery) -> Option<&str> {
     let value = query.query.as_ref()?.trim();
     if value.starts_with("did:oan:") && !value.chars().any(char::is_whitespace) {
@@ -1610,13 +2537,11 @@ async fn keyword_discovery_candidates(
         })
         .collect::<Vec<_>>();
     let candidate_count = packages.len();
-    let candidates = packages
+    let hits = rank_resource_packages_semantically(packages, query);
+    let candidates = hits
         .into_iter()
-        .filter(|package| prefiltered || resource_matches_query(package, query))
-        .map(|package| {
-            let score = resource_score(&package, query);
-            discovery_candidate_from_package(package, score)
-        })
+        .filter(|hit| prefiltered || hit.final_score > 0.0 || query.query.is_none())
+        .map(|hit| discovery_candidate_from_package(hit.package, hit.final_score))
         .collect::<Vec<_>>();
     Ok((candidates, candidate_count, prefiltered))
 }
@@ -1906,8 +2831,13 @@ async fn api_query_explain(
                             "matched": true,
                             "score": hit.final_score,
                             "semanticScore": hit.semantic_score,
+                            "bm25Score": hit.bm25_score,
+                            "tagScore": hit.tag_score,
+                            "contextScore": hit.context_score,
+                            "intentMaxSimScore": hit.intent_score,
                             "structuredScore": hit.structured_score,
                             "finalScore": hit.final_score,
+                            "matchedIntent": hit.matched_intent,
                             "capabilityTagOverlap": query.capability_tags.iter()
                                 .filter(|tag| hit.package.metadata.capability_tags.iter().any(|candidate| candidate == *tag))
                                 .cloned()
@@ -1929,7 +2859,7 @@ async fn api_query_explain(
                                         .unwrap_or(false)
                                 })
                             }),
-                            "matchReason": "Matched by local semantic vector ranking over verified Discovery packages."
+                            "matchReason": semantic_match_reason(hit)
                         })
                     })
                     .collect::<Vec<_>>();
@@ -1951,15 +2881,17 @@ async fn api_query_explain(
     let (packages, prefiltered) = query_indexed_resource_packages(&state, &query)
         .await
         .map_err(ApiError::internal)?;
-    let explanations = packages
+    let hits = rank_resource_packages_semantically(packages, &query);
+    let explanations = hits
         .iter()
-        .map(|package| {
-            let matched = resource_matches_query(package, &query);
+        .map(|hit| {
+            let package = &hit.package;
+            let matched = hit.final_score > 0.0 || query.query.is_none();
             json!({
                 "resourceDid": package.resource_did,
                 "resourceType": package.resource_type,
                 "matched": matched,
-                "score": if matched { resource_score(package, &query) } else { 0.0 },
+                "score": if matched { hit.final_score } else { 0.0 },
                 "textMatched": query.query.as_ref().map(|text| {
                     let needle = text.to_ascii_lowercase();
                     package.resource_did.to_ascii_lowercase().contains(&needle)
@@ -1983,15 +2915,22 @@ async fn api_query_explain(
                             .unwrap_or(false)
                     })
                 }),
-                "semanticScore": None::<f32>,
-                "structuredScore": Some(resource_score(package, &query)),
+                "semanticScore": hit.semantic_score,
+                "bm25Score": hit.bm25_score,
+                "tagScore": hit.tag_score,
+                "contextScore": hit.context_score,
+                "intentMaxSimScore": hit.intent_score,
+                "structuredScore": hit.structured_score,
+                "finalScore": hit.final_score,
+                "matchedIntent": hit.matched_intent,
+                "matchReason": semantic_match_reason(hit),
             })
         })
         .collect::<Vec<_>>();
     Ok(Json(json!({
         "query": query,
         "items": explanations,
-        "candidateCount": packages.len(),
+        "candidateCount": explanations.len(),
         "usedIndexedPrefilter": prefiltered,
         "semanticSearch": semantic_status_json(&state, true, Some("keyword_explain_fallback".to_owned()))
     })))
@@ -2254,13 +3193,16 @@ async fn upsert_pgvector_semantic_index_batch(
         if changed.is_empty() {
             continue;
         }
-        let embedded = changed
-            .into_iter()
-            .map(|doc| {
-                embed_semantic_text(&state.config.semantic_search, &semantic_document_text(doc))
-                    .map(|embedding| (doc, embedding))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut embedded = Vec::new();
+        for doc in changed {
+            let embedding = embed_semantic_text(
+                &state.config.semantic_search,
+                &state.client,
+                &semantic_document_text(doc),
+            )
+            .await?;
+            embedded.push((doc, embedding));
+        }
 
         let mut builder = QueryBuilder::<Postgres>::new(format!(
             r#"
@@ -2323,6 +3265,87 @@ async fn upsert_pgvector_semantic_index_batch(
         );
         builder.build().execute(postgres.pool()).await?;
     }
+    upsert_pgvector_intent_index_batch(state, &docs).await?;
+    Ok(())
+}
+
+async fn upsert_pgvector_intent_index_batch(
+    state: &AppState,
+    docs: &[SearchDocument],
+) -> Result<()> {
+    let Some(postgres) = &state.postgres else {
+        return Ok(());
+    };
+    if docs.is_empty() {
+        return Ok(());
+    }
+    let updated_at = Utc::now();
+    for chunk in docs.chunks(50) {
+        let resource_dids = chunk
+            .iter()
+            .map(|doc| doc.resource_did.clone())
+            .collect::<Vec<_>>();
+        sqlx::query(&format!(
+            "DELETE FROM {DISCOVERY_INTENT_INDEX_TABLE} WHERE resource_did = ANY($1) AND embedding_model = $2 AND embedding_version = $3"
+        ))
+        .bind(&resource_dids)
+        .bind(&state.semantic.embedding_model)
+        .bind(&state.semantic.embedding_version)
+        .execute(postgres.pool())
+        .await?;
+
+        let mut embedded = Vec::new();
+        for doc in chunk {
+            for intent in semantic_intent_documents(doc) {
+                let embedding = embed_semantic_text(
+                    &state.config.semantic_search,
+                    &state.client,
+                    &intent.intent_text,
+                )
+                .await?;
+                embedded.push((intent, embedding));
+            }
+        }
+        if embedded.is_empty() {
+            continue;
+        }
+        let mut builder = QueryBuilder::<Postgres>::new(format!(
+            r#"
+            INSERT INTO {DISCOVERY_INTENT_INDEX_TABLE}(
+                resource_did, intent_id, intent_kind, intent_text, resource_type,
+                lifecycle_state, semantic_source_hash, embedding, embedding_model,
+                embedding_version, updated_at
+            )
+            "#
+        ));
+        builder.push_values(embedded, |mut row, (intent, embedding)| {
+            row.push_bind(intent.resource_did)
+                .push_bind(intent.intent_id)
+                .push_bind(intent.intent_kind)
+                .push_bind(intent.intent_text)
+                .push_bind(intent.resource_type)
+                .push_bind(intent.lifecycle_state)
+                .push_bind(intent.semantic_source_hash)
+                .push(format!("{}::vector", pgvector_literal(&embedding)))
+                .push_bind(&state.semantic.embedding_model)
+                .push_bind(&state.semantic.embedding_version)
+                .push_bind(updated_at);
+        });
+        builder.push(
+            r#"
+            ON CONFLICT(resource_did, intent_id, embedding_model, embedding_version)
+            DO UPDATE SET
+                intent_kind = excluded.intent_kind,
+                intent_text = excluded.intent_text,
+                resource_type = excluded.resource_type,
+                lifecycle_state = excluded.lifecycle_state,
+                semantic_source_hash = excluded.semantic_source_hash,
+                embedding = excluded.embedding,
+                updated_at = excluded.updated_at
+            "#,
+        );
+        builder.build().execute(postgres.pool()).await?;
+    }
     Ok(())
 }
 
@@ -2371,6 +3394,88 @@ async fn count_semantic_indexed_resources(state: &AppState) -> Result<Option<i64
     Ok(Some(row.get::<i64, _>(0)))
 }
 
+async fn count_intent_indexed_rows(state: &AppState) -> Result<Option<i64>> {
+    let Some(postgres) = &state.postgres else {
+        return Ok(None);
+    };
+    if !state.semantic.enabled {
+        return Ok(None);
+    }
+    let row = sqlx::query(&format!(
+        "SELECT COUNT(*) FROM {DISCOVERY_INTENT_INDEX_TABLE} WHERE embedding_model = $1 AND embedding_version = $2"
+    ))
+    .bind(&state.semantic.embedding_model)
+    .bind(&state.semantic.embedding_version)
+    .fetch_one(postgres.pool())
+    .await?;
+    Ok(Some(row.get::<i64, _>(0)))
+}
+
+async fn clear_semantic_indexes_for_current_model(state: &AppState) -> Result<()> {
+    let Some(postgres) = &state.postgres else {
+        return Ok(());
+    };
+    sqlx::query(&format!(
+        "DELETE FROM {DISCOVERY_INTENT_INDEX_TABLE} WHERE embedding_model = $1 AND embedding_version = $2"
+    ))
+    .bind(&state.semantic.embedding_model)
+    .bind(&state.semantic.embedding_version)
+    .execute(postgres.pool())
+    .await?;
+    sqlx::query(&format!(
+        "DELETE FROM {DISCOVERY_SEMANTIC_INDEX_TABLE} WHERE embedding_model = $1 AND embedding_version = $2"
+    ))
+    .bind(&state.semantic.embedding_model)
+    .bind(&state.semantic.embedding_version)
+    .execute(postgres.pool())
+    .await?;
+    Ok(())
+}
+
+async fn rebuild_semantic_indexes(state: &AppState) -> Result<SemanticRebuildReport> {
+    if !semantic_search_available(state) {
+        return Ok(SemanticRebuildReport {
+            backend: discovery_backend_name(state),
+            semantic_enabled: false,
+            package_count: 0,
+            context_indexed_count: 0,
+            intent_indexed_count: 0,
+            skipped_reason: state.semantic.fallback_reason.clone(),
+        });
+    }
+    let packages = read_indexed_resource_packages(state).await?;
+    clear_semantic_indexes_for_current_model(state).await?;
+    let visible = packages
+        .iter()
+        .enumerate()
+        .filter(|(_, package)| {
+            package.metadata.lifecycle_state == "active"
+                && is_user_consumable_resource_type(&package.resource_type)
+        })
+        .map(|(index, package)| (index as i64 + 1, package))
+        .collect::<Vec<_>>();
+    let projected = visible
+        .iter()
+        .map(|(cursor, package)| DiscoveryProjectedPackage {
+            cursor: *cursor,
+            package,
+            package_json: serde_json::to_value(package).unwrap_or_else(|_| json!({})),
+            projection: discovery_package_projection(package),
+        })
+        .collect::<Vec<_>>();
+    upsert_semantic_index_batch(state, &projected).await?;
+    Ok(SemanticRebuildReport {
+        backend: discovery_backend_name(state),
+        semantic_enabled: true,
+        package_count: projected.len(),
+        context_indexed_count: count_semantic_indexed_resources(state)
+            .await?
+            .unwrap_or_default() as usize,
+        intent_indexed_count: count_intent_indexed_rows(state).await?.unwrap_or_default() as usize,
+        skipped_reason: None,
+    })
+}
+
 fn discovery_package_projection(package: &ResourcePackage) -> DiscoveryPackageProjection {
     let mut protocols = package
         .metadata
@@ -2399,16 +3504,15 @@ fn discovery_package_projection(package: &ResourcePackage) -> DiscoveryPackagePr
     service_endpoints.sort();
     service_endpoints.dedup();
 
-    let search_text = format!(
-        "{} {} {} {} {} {}",
-        package.resource_did,
-        package.resource_type.as_str(),
-        package.metadata.name,
-        package.metadata.description,
+    let search_text = semantic_search_text(&[
+        package.resource_did.clone(),
+        package.resource_type.as_str().to_owned(),
+        package.metadata.name.clone(),
+        package.metadata.description.clone(),
         package.metadata.capability_tags.join(" "),
-        service_endpoints.join(" ")
-    )
-    .to_ascii_lowercase();
+        protocols.join(" "),
+        service_endpoints.join(" "),
+    ]);
 
     DiscoveryPackageProjection {
         resource_type: package.resource_type.as_str().to_owned(),
@@ -2538,6 +3642,10 @@ async fn query_indexed_resource_packages(
         if let Some(resource_type) = &query.resource_type {
             builder.push(" AND resource_type = ");
             builder.push_bind(resource_type.as_str());
+        } else {
+            builder.push(" AND resource_type = ANY(");
+            builder.push_bind(default_discoverable_resource_type_names());
+            builder.push(")");
         }
         if let Some(version) = &query.version {
             builder.push(" AND version = ");
@@ -2551,12 +3659,14 @@ async fn query_indexed_resource_packages(
             builder.push(" AND protocols && ");
             builder.push_bind(vec![protocol.to_ascii_lowercase()]);
         }
-        if let Some(text) = &query.query {
+        if should_use_sql_text_prefilter(query) {
+            let text = query.query.as_ref().expect("checked query text");
             builder.push(" AND to_tsvector('simple', search_text) @@ plainto_tsquery('simple', ");
             builder.push_bind(text.to_ascii_lowercase());
             builder.push(")");
         }
-        if let Some(text) = &query.query {
+        if should_use_sql_text_prefilter(query) {
+            let text = query.query.as_ref().expect("checked query text");
             builder.push(
                 " ORDER BY ts_rank_cd(to_tsvector('simple', search_text), plainto_tsquery('simple', ",
             );
@@ -2565,7 +3675,7 @@ async fn query_indexed_resource_packages(
         } else {
             builder.push(" ORDER BY updated_at DESC, resource_did LIMIT ");
         }
-        builder.push_bind(discovery_sql_candidate_limit(query.limit));
+        builder.push_bind(discovery_sql_candidate_limit_for_query(query));
         let rows = builder.build().fetch_all(postgres.pool()).await?;
         let packages = rows
             .into_iter()
@@ -2575,7 +3685,13 @@ async fn query_indexed_resource_packages(
     }
     read_indexed_resource_packages(state)
         .await
-        .and_then(|packages| Ok((filter_packages_for_local_discovery(state, packages)?, false)))
+        .and_then(|packages| {
+            let packages = packages
+                .into_iter()
+                .filter(|package| should_search_resource_type(package, query))
+                .collect::<Vec<_>>();
+            Ok((filter_packages_for_local_discovery(state, packages)?, false))
+        })
 }
 
 async fn query_semantic_index(
@@ -2608,7 +3724,8 @@ async fn query_pgvector_semantic_index(
         return Ok(None);
     };
 
-    let query_embedding = embed_semantic_text(&state.config.semantic_search, text)?;
+    let query_embedding =
+        embed_semantic_text(&state.config.semantic_search, &state.client, text).await?;
     let candidate_limit = semantic_candidate_limit(query.limit, &state.config.semantic_search);
     let mut builder = QueryBuilder::<Postgres>::new(format!(
         r#"
@@ -2632,6 +3749,10 @@ async fn query_pgvector_semantic_index(
     if let Some(resource_type) = &query.resource_type {
         builder.push(" AND p.resource_type = ");
         builder.push_bind(resource_type.as_str());
+    } else {
+        builder.push(" AND p.resource_type = ANY(");
+        builder.push_bind(default_discoverable_resource_type_names());
+        builder.push(")");
     }
     if let Some(version) = &query.version {
         builder.push(" AND p.version = ");
@@ -2645,7 +3766,7 @@ async fn query_pgvector_semantic_index(
             .capability_tags
             .eq_ignore_ascii_case("hard")
     {
-        builder.push(" AND p.capability_tags && ");
+        builder.push(" AND p.capability_tags @> ");
         builder.push_bind(query.capability_tags.clone());
     }
     if let Some(protocol) = &query.protocol {
@@ -2667,21 +3788,19 @@ async fn query_pgvector_semantic_index(
     builder.push_bind(candidate_limit);
 
     let rows = builder.build().fetch_all(postgres.pool()).await?;
-    let mut hits = rows
+    let vector_hits = rows
         .into_iter()
         .map(|row| {
             let package = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(0))?;
-            let semantic_score = row.get::<f32, _>(1).clamp(0.0, 1.0);
-            let structured_score = semantic_structured_score(&package, query);
-            let final_score = (0.65 * semantic_score) + structured_score + 0.05;
-            Ok::<_, anyhow::Error>(SemanticQueryHit {
-                package,
-                semantic_score,
-                structured_score,
-                final_score,
-            })
+            let vector_score = row.get::<f32, _>(1).clamp(0.0, 1.0);
+            Ok::<_, anyhow::Error>((package, vector_score))
         })
         .collect::<Result<Vec<_>>>()?;
+    let (lexical_packages, _) = query_indexed_resource_packages(state, query).await?;
+    let mut hits = hybrid_semantic_hits(vector_hits, lexical_packages, query);
+    if let Err(err) = apply_pgvector_intent_maxsim(state, &query_embedding, &mut hits).await {
+        eprintln!("intent maxsim rerank skipped: {err}");
+    }
     let allowed_domains = local_discovery_authorized_domains(state)?;
     hits.retain(|hit| {
         authorized_domains_cover(&allowed_domains, &hit.package.metadata.authorized_domains)
@@ -2689,6 +3808,127 @@ async fn query_pgvector_semantic_index(
     hits.sort_by(|a, b| b.final_score.total_cmp(&a.final_score));
     hits.truncate(query.limit as usize);
     Ok(Some(hits))
+}
+
+async fn apply_pgvector_intent_maxsim(
+    state: &AppState,
+    query_embedding: &[f32],
+    hits: &mut [SemanticQueryHit],
+) -> Result<()> {
+    let Some(postgres) = &state.postgres else {
+        return Ok(());
+    };
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let dids = hits
+        .iter()
+        .map(|hit| hit.package.resource_did.clone())
+        .collect::<Vec<_>>();
+    let rows = sqlx::query(&format!(
+        r#"
+        SELECT resource_did, intent_text, intent_score
+        FROM (
+            SELECT
+                resource_did,
+                intent_text,
+                (1 - (embedding <=> {}::vector))::float4 AS intent_score,
+                ROW_NUMBER() OVER (
+                    PARTITION BY resource_did
+                    ORDER BY embedding <=> {}::vector
+                ) AS rank
+            FROM {DISCOVERY_INTENT_INDEX_TABLE}
+            WHERE resource_did = ANY($1)
+              AND lifecycle_state = 'active'
+              AND embedding_model = $2
+              AND embedding_version = $3
+        ) ranked
+        WHERE rank = 1
+        "#,
+        pgvector_literal(query_embedding),
+        pgvector_literal(query_embedding),
+    ))
+    .bind(&dids)
+    .bind(&state.semantic.embedding_model)
+    .bind(&state.semantic.embedding_version)
+    .fetch_all(postgres.pool())
+    .await?;
+
+    let maxsim_by_did = rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("resource_did"),
+                (
+                    row.get::<f32, _>("intent_score").clamp(0.0, 1.0),
+                    row.get::<String, _>("intent_text"),
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    for hit in hits {
+        if let Some((intent_score, intent_text)) = maxsim_by_did.get(&hit.package.resource_did) {
+            if *intent_score > hit.intent_score {
+                hit.intent_score = *intent_score;
+                hit.matched_intent = Some(intent_text.clone());
+                hit.semantic_score =
+                    (0.80 * hit.semantic_score + 0.20 * intent_score).clamp(0.0, 1.0);
+                hit.final_score =
+                    (hit.semantic_score + hit.structured_score + 0.03).clamp(0.0, 1.0);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn hybrid_semantic_hits(
+    vector_hits: Vec<(ResourcePackage, f32)>,
+    lexical_packages: Vec<ResourcePackage>,
+    query: &ResourceDiscoveryQuery,
+) -> Vec<SemanticQueryHit> {
+    let query_projection = semantic_query_projection(query);
+    let mut vector_scores = HashMap::new();
+    let mut packages = Vec::new();
+    let mut seen = HashSet::new();
+    for (package, vector_score) in vector_hits {
+        vector_scores.insert(package.resource_did.clone(), vector_score.clamp(0.0, 1.0));
+        if seen.insert(package.resource_did.clone()) {
+            packages.push(package);
+        }
+    }
+    for package in lexical_packages {
+        if seen.insert(package.resource_did.clone()) {
+            packages.push(package);
+        }
+    }
+    let doc_tokens = packages
+        .iter()
+        .map(|package| {
+            let projection = discovery_package_projection(package);
+            let doc = search_document_from_package(0, package, &projection);
+            semantic_tokens(&semantic_context_text(&doc))
+        })
+        .collect::<Vec<_>>();
+    let mut hits = packages
+        .into_iter()
+        .enumerate()
+        .map(|(index, package)| {
+            let vector_score = vector_scores
+                .get(&package.resource_did)
+                .copied()
+                .unwrap_or(0.0);
+            let bm25_score = bm25_like_score(&query_projection.expanded_tokens, &doc_tokens, index);
+            let mut hit = semantic_resource_scores(&package, query, &query_projection, bm25_score);
+            hit.semantic_score = (0.45 * vector_score) + (0.55 * hit.semantic_score);
+            hit.final_score = (hit.semantic_score + hit.structured_score + 0.03).clamp(0.0, 1.0);
+            hit
+        })
+        .filter(|hit| resource_matches_explicit_constraints(&hit.package, query))
+        .collect::<Vec<_>>();
+    hits.sort_by(|a, b| b.final_score.total_cmp(&a.final_score));
+    hits.truncate(query.limit as usize);
+    hits
 }
 
 fn filter_packages_for_local_discovery(
@@ -2777,6 +4017,14 @@ fn discovery_sql_candidate_limit(query_limit: u32) -> i64 {
     (requested * 3).clamp(25, 5_000).max(requested)
 }
 
+fn discovery_sql_candidate_limit_for_query(query: &ResourceDiscoveryQuery) -> i64 {
+    if should_use_sql_text_prefilter(query) {
+        return discovery_sql_candidate_limit(query.limit);
+    }
+    let requested = query.limit.max(1) as i64;
+    (requested * 50).clamp(200, 5_000).max(requested)
+}
+
 async fn read_indexed_resource_packages(state: &AppState) -> Result<Vec<ResourcePackage>> {
     if let Some(sqlite) = &state.sqlite {
         let rows = sqlx::query(&format!(
@@ -2812,7 +4060,6 @@ async fn read_indexed_resource_packages(state: &AppState) -> Result<Vec<Resource
         .unwrap_or_default())
 }
 
-#[cfg(test)]
 async fn write_indexed_resource_packages(
     state: &AppState,
     packages: &[ResourcePackage],
@@ -2845,6 +4092,207 @@ async fn write_indexed_resource_packages(
         .index
         .write("resource-capabilities.json", &packages.to_vec())?;
     Ok(())
+}
+
+async fn seed_semantic_evaluation_packages(state: &AppState, suite_path: &Path) -> Result<usize> {
+    let suite: SemanticEvaluationSuite =
+        serde_json::from_str(&read_utf8_text_allowing_bom(suite_path)?)?;
+    let mut packages = suite.seed_packages;
+    packages.extend(
+        suite
+            .seed_resources
+            .iter()
+            .map(seed_resource_package)
+            .collect::<Result<Vec<_>>>()?,
+    );
+    if packages.is_empty() {
+        return Ok(0);
+    }
+    for package in &packages {
+        validate_resource_package_for_index(package)
+            .map_err(|reason| anyhow!("invalid_seed_package:{}:{reason}", package.resource_did))?;
+    }
+    let count = packages.len();
+    write_indexed_resource_packages(state, &packages).await?;
+    Ok(count)
+}
+
+fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<ResourcePackage> {
+    let did = seed.resource_did.clone();
+    let service_endpoint = seed
+        .service_endpoint
+        .clone()
+        .unwrap_or_else(|| format!("https://example.org/oan/resources/{}", did.replace(':', "/")));
+    let protocol = seed
+        .protocols
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "https".to_owned());
+    let service = ServiceEndpoint {
+        id: format!("{did}#service-1"),
+        service_type: format!("{}Service", seed.resource_type.as_str()),
+        service_endpoint: service_endpoint.clone(),
+        version: Some(seed.package_version.clone()),
+        protocol: Some(protocol.clone()),
+        server_type: None,
+        port: None,
+    };
+    let binding = ProtocolBinding {
+        id: format!("{did}#binding-{protocol}"),
+        protocol: protocol.clone(),
+        version: None,
+        transport: Some(if protocol.eq_ignore_ascii_case("https") {
+            "http".to_owned()
+        } else {
+            protocol.clone()
+        }),
+        service_ref: Some(service.id.clone()),
+        schema_ref: None,
+        extra: Default::default(),
+    };
+    let authorized_domains = if seed.authorized_domains.is_empty() {
+        vec!["examples".to_owned()]
+    } else {
+        seed.authorized_domains.clone()
+    };
+    let description = ResourceDescription {
+        name: Some(seed.name.clone()),
+        description: Some(seed.description.clone()),
+        capability_description: Some(seed.capability_description.clone()),
+        capability_tags: seed.capability_tags.clone(),
+        use_case_examples: seed.use_case_examples.clone(),
+        examples: seed.examples.clone(),
+        version: Some(seed.package_version.clone()),
+        ..Default::default()
+    };
+    let did_document = DidDocument {
+        context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+        id: did.clone(),
+        verification_method: vec![VerificationMethod {
+            id: format!("{did}#key-1"),
+            method_type: "Ed25519VerificationKey2020".to_owned(),
+            controller: did.clone(),
+            crypto_suite: Some(CryptoSuite::Ed25519Sha256),
+            public_key_format: None,
+            public_key_multibase: Some("zExample".to_owned()),
+            public_key_jwk: None,
+        }],
+        authentication: vec![format!("{did}#key-1")],
+        assertion_method: vec![format!("{did}#key-1")],
+        service: vec![service.clone()],
+        oan_metadata: Some(OanMetadata {
+            subject_type: seed.resource_type.clone(),
+            resource_type: seed.resource_type.clone(),
+            node_role: None,
+            identity_type: None,
+            controller_did: None,
+            publisher_did: Some("did:oan:AGUS:semantic-evaluation-publisher".to_owned()),
+            issuer_did: None,
+            ttl: None,
+            resource_description: Some(description),
+            agent_description: None,
+            capability_tags: seed.capability_tags.clone(),
+            authorized_domains: authorized_domains.clone(),
+            protocol_bindings: vec![binding],
+            implementation_links: vec![ImplementationLink {
+                relation: "service".to_owned(),
+                target_did: did.clone(),
+                target_type: Some(seed.resource_type.clone()),
+                target_service: Some(service.id.clone()),
+                version_constraint: Some(seed.package_version.clone()),
+            }],
+            credential_requirements: vec![],
+            package_info: None,
+            service_policy: None,
+            network_scope: Some("oan-evaluation".to_owned()),
+            lifecycle_state: Some("active".to_owned()),
+            extra: Default::default(),
+        }),
+    };
+    let mut package = ResourcePackage {
+        package_version: seed.package_version.clone(),
+        resource_did: did.clone(),
+        resource_type: seed.resource_type.clone(),
+        did_document,
+        did_document_hash: String::new(),
+        metadata_hash: String::new(),
+        package_hash: String::new(),
+        hash_algorithm: "sha256".to_owned(),
+        metadata: ResourceMetadata {
+            resource_did: did.clone(),
+            resource_type: seed.resource_type.clone(),
+            subject_type: seed.resource_type.clone(),
+            publisher_did: Some("did:oan:AGUS:semantic-evaluation-publisher".to_owned()),
+            subject_did: Some(did.clone()),
+            name: seed.name.clone(),
+            description: seed.description.clone(),
+            capability_tags: seed.capability_tags.clone(),
+            authorized_domains,
+            protocol_bindings: vec![json!({"protocol": protocol, "role": "service"})],
+            services: vec![service],
+            lifecycle_state: "active".to_owned(),
+            package_version: seed.package_version.clone(),
+            package_hash: String::new(),
+            metadata_hash: String::new(),
+            hash_algorithm: "sha256".to_owned(),
+            updated_at: Utc::now(),
+        },
+        root_proof: RootProof {
+            root_did: "did:oan:AGRT:semantic-evaluation-root".to_owned(),
+            bulletin_event_hash: None,
+            signature: None,
+            package_claims: None,
+            proof: None,
+            crypto_suite: Some(CryptoSuite::Ed25519Sha256),
+            hash_algorithm: Some("sha256".to_owned()),
+        },
+        created_at: Utc::now(),
+    };
+    refresh_resource_package_hashes(&mut package)?;
+    Ok(package)
+}
+
+fn refresh_resource_package_hashes(package: &mut ResourcePackage) -> Result<()> {
+    package.did_document_hash =
+        hash_json_with_suite(CryptoSuite::Ed25519Sha256, &package.did_document)
+            .map(|hash| format!("sha256:{hash}"))?;
+    package.metadata.metadata_hash.clear();
+    package.metadata.package_hash.clear();
+    package.metadata_hash =
+        hash_resource_metadata_with_suite(CryptoSuite::Ed25519Sha256, &package.metadata)
+            .map(|hash| format!("sha256:{hash}"))?;
+    package.metadata.metadata_hash = package.metadata_hash.clone();
+    package.package_hash = hash_json_with_suite(
+        CryptoSuite::Ed25519Sha256,
+        &json!({
+            "packageVersion": package.package_version,
+            "resourceDid": package.resource_did,
+            "resourceType": package.resource_type,
+            "didDocumentHash": package.did_document_hash,
+            "metadataHash": package.metadata_hash,
+            "hashAlgorithm": package.hash_algorithm,
+        }),
+    )
+    .map(|hash| format!("sha256:{hash}"))?;
+    package.metadata.package_hash = package.package_hash.clone();
+    package.root_proof.package_claims = Some(serde_json::to_value(ResourcePackageClaims {
+        resource_did: package.resource_did.clone(),
+        resource_type: package.resource_type.clone(),
+        version: package.package_version.clone(),
+        did_document_hash: package.did_document_hash.clone(),
+        metadata_hash: package.metadata_hash.clone(),
+        package_hash: package.package_hash.clone(),
+        hash_algorithm: package.hash_algorithm.clone(),
+        lifecycle_state: package.metadata.lifecycle_state.clone(),
+        authorized_domains: package.metadata.authorized_domains.clone(),
+        bulletin_ref: None,
+    })?);
+    Ok(())
+}
+
+fn read_utf8_text_allowing_bom(path: &Path) -> Result<String> {
+    let text = std::fs::read_to_string(path)?;
+    Ok(text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned())
 }
 
 async fn write_sync_history_store(state: &AppState, item: Value) -> Result<()> {
@@ -3093,7 +4541,10 @@ fn validate_resource_package_for_index(
     Ok(())
 }
 
-fn resource_matches_query(package: &ResourcePackage, query: &ResourceDiscoveryQuery) -> bool {
+fn resource_matches_explicit_constraints(
+    package: &ResourcePackage,
+    query: &ResourceDiscoveryQuery,
+) -> bool {
     if query
         .resource_type
         .as_ref()
@@ -3112,7 +4563,7 @@ fn resource_matches_query(package: &ResourcePackage, query: &ResourceDiscoveryQu
         && !query
             .capability_tags
             .iter()
-            .any(|tag| package.metadata.capability_tags.contains(tag))
+            .all(|tag| package.metadata.capability_tags.contains(tag))
     {
         return false;
     }
@@ -3133,19 +4584,6 @@ fn resource_matches_query(package: &ResourcePackage, query: &ResourceDiscoveryQu
     }) {
         return false;
     }
-    if let Some(text) = &query.query {
-        let needle = text.to_ascii_lowercase();
-        let haystack = format!(
-            "{} {} {} {} {:?}",
-            package.resource_did,
-            package.resource_type.as_str(),
-            package.metadata.name,
-            package.metadata.description,
-            package.metadata.capability_tags
-        )
-        .to_ascii_lowercase();
-        return haystack.contains(&needle);
-    }
     true
 }
 
@@ -3153,37 +4591,9 @@ fn resource_matches_exact_did_query(
     package: &ResourcePackage,
     query: &ResourceDiscoveryQuery,
 ) -> bool {
-    query
-        .version
-        .as_ref()
-        .map_or(true, |version| version == &package.package_version)
-}
-
-fn resource_score(package: &ResourcePackage, query: &ResourceDiscoveryQuery) -> f32 {
-    let mut score = 0.5;
-    if query
-        .resource_type
-        .as_ref()
-        .is_some_and(|resource_type| resource_type == &package.resource_type)
-    {
-        score += 0.2;
-    }
-    score += query
-        .capability_tags
-        .iter()
-        .filter(|tag| package.metadata.capability_tags.contains(tag))
-        .count() as f32
-        * 0.1;
-    if query.query.as_ref().is_some_and(|text| {
-        package
-            .metadata
-            .description
-            .to_ascii_lowercase()
-            .contains(&text.to_ascii_lowercase())
-    }) {
-        score += 0.2;
-    }
-    score
+    let mut constraint_query = query.clone();
+    constraint_query.query = None;
+    resource_matches_explicit_constraints(package, &constraint_query)
 }
 
 fn discovery_authorized_domains(bulletin: &Value, discovery_did: &str) -> Vec<String> {
@@ -3215,13 +4625,11 @@ mod tests {
     use axum::{routing::get, Router};
     use chrono::Utc;
     use oan_core::{
-        CryptoSuite, ImplementationLink, OanMetadata, ProtocolBinding, ResourceDescription,
-        ResourceType, ServiceEndpoint, VerificationMethod,
+        CryptoSuite, OanMetadata, ProtocolBinding, ResourceDescription, ServiceEndpoint,
+        VerificationMethod,
     };
-    use oan_crypto::{hash_json_with_suite, public_key_jwk, public_key_multibase, VerifyingKey};
-    use oan_package::{
-        hash_resource_metadata_with_suite, ResourceMetadata, ResourcePackageClaims, RootProof,
-    };
+    use oan_crypto::{public_key_jwk, public_key_multibase, VerifyingKey};
+    use oan_package::RootProof;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -3360,46 +4768,7 @@ mod tests {
     }
 
     fn refresh_hashes(package: &mut ResourcePackage) {
-        package.did_document_hash =
-            hash_json_with_suite(CryptoSuite::Ed25519Sha256, &package.did_document)
-                .map(|hash| format!("sha256:{hash}"))
-                .unwrap();
-        package.metadata.metadata_hash.clear();
-        package.metadata.package_hash.clear();
-        package.metadata_hash =
-            hash_resource_metadata_with_suite(CryptoSuite::Ed25519Sha256, &package.metadata)
-                .map(|hash| format!("sha256:{hash}"))
-                .unwrap();
-        package.metadata.metadata_hash = package.metadata_hash.clone();
-        package.package_hash = hash_json_with_suite(
-            CryptoSuite::Ed25519Sha256,
-            &json!({
-                "packageVersion": package.package_version,
-                "resourceDid": package.resource_did,
-                "resourceType": package.resource_type,
-                "didDocumentHash": package.did_document_hash,
-                "metadataHash": package.metadata_hash,
-                "hashAlgorithm": package.hash_algorithm,
-            }),
-        )
-        .map(|hash| format!("sha256:{hash}"))
-        .unwrap();
-        package.metadata.package_hash = package.package_hash.clone();
-        package.root_proof.package_claims = Some(
-            serde_json::to_value(ResourcePackageClaims {
-                resource_did: package.resource_did.clone(),
-                resource_type: package.resource_type.clone(),
-                version: package.package_version.clone(),
-                did_document_hash: package.did_document_hash.clone(),
-                metadata_hash: package.metadata_hash.clone(),
-                package_hash: package.package_hash.clone(),
-                hash_algorithm: package.hash_algorithm.clone(),
-                lifecycle_state: package.metadata.lifecycle_state.clone(),
-                authorized_domains: package.metadata.authorized_domains.clone(),
-                bulletin_ref: None,
-            })
-            .unwrap(),
-        );
+        refresh_resource_package_hashes(package).unwrap();
     }
 
     fn sample_resource_package_with_did(resource_did: &str) -> ResourcePackage {
@@ -3501,6 +4870,54 @@ mod tests {
         refresh_hashes(package);
     }
 
+    fn set_package_type(package: &mut ResourcePackage, resource_type: ResourceType) {
+        package.resource_type = resource_type.clone();
+        package.metadata.resource_type = resource_type.clone();
+        package.metadata.subject_type = resource_type.clone();
+        let metadata = package.did_document.oan_metadata.as_mut().unwrap();
+        metadata.resource_type = resource_type.clone();
+        metadata.subject_type = resource_type;
+        refresh_hashes(package);
+    }
+
+    fn set_package_tags(package: &mut ResourcePackage, tags: Vec<String>) {
+        package.metadata.capability_tags = tags.clone();
+        package
+            .did_document
+            .oan_metadata
+            .as_mut()
+            .unwrap()
+            .capability_tags = tags;
+        refresh_hashes(package);
+    }
+
+    fn set_package_description(package: &mut ResourcePackage, name: &str, description: &str) {
+        package.metadata.name = name.to_owned();
+        package.metadata.description = description.to_owned();
+        if let Some(metadata) = package.did_document.oan_metadata.as_mut() {
+            if let Some(resource_description) = metadata.resource_description.as_mut() {
+                resource_description.name = Some(name.to_owned());
+                resource_description.description = Some(description.to_owned());
+            }
+        }
+        refresh_hashes(package);
+    }
+
+    fn set_package_capability_details(
+        package: &mut ResourcePackage,
+        capability_description: &str,
+        use_cases: Vec<String>,
+    ) {
+        if let Some(metadata) = package.did_document.oan_metadata.as_mut() {
+            if let Some(resource_description) = metadata.resource_description.as_mut() {
+                resource_description.capability_description =
+                    Some(capability_description.to_owned());
+                resource_description.use_case_examples = use_cases;
+            }
+        }
+        refresh_hashes(package);
+    }
+
     async fn app_state_with_sqlite(dir: &std::path::Path) -> AppState {
         let sqlite =
             SqliteJsonStore::connect(&format!("sqlite:{}", dir.join("discovery.db").display()))
@@ -3531,6 +4948,10 @@ mod tests {
             .execute(postgres.pool())
             .await
             .ok()?;
+        sqlx::query(&format!("DELETE FROM {DISCOVERY_INTENT_INDEX_TABLE}"))
+            .execute(postgres.pool())
+            .await
+            .ok()?;
         sqlx::query(&format!("DELETE FROM {DISCOVERY_PACKAGE_TABLE}"))
             .execute(postgres.pool())
             .await
@@ -3542,6 +4963,7 @@ mod tests {
             fallback_reason: None,
             embedding_model: state.config.semantic_search.embedding.model_name.clone(),
             embedding_version: semantic_embedding_version(&state.config.semantic_search),
+            embedding_dtype: state.config.semantic_search.embedding.dtype.clone(),
             dimension: state.config.semantic_search.embedding.dimension,
         };
         state.postgres = Some(postgres);
@@ -3633,20 +5055,159 @@ mod tests {
             version_mode: "exact".to_owned(),
             limit: 10,
         };
-        assert!(resource_matches_query(&package, &query));
-        assert!(resource_score(&package, &query) > 0.9);
+        let hits = rank_resource_packages_semantically(vec![package.clone()], &query);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].final_score > 0.0);
 
         let wrong_type = ResourceDiscoveryQuery {
             resource_type: Some(ResourceType::McpServer),
             ..query.clone()
         };
-        assert!(!resource_matches_query(&package, &wrong_type));
+        assert!(rank_resource_packages_semantically(vec![package.clone()], &wrong_type).is_empty());
 
         let wrong_protocol = ResourceDiscoveryQuery {
             protocol: Some("a2a".to_owned()),
             ..query
         };
-        assert!(!resource_matches_query(&package, &wrong_protocol));
+        assert!(rank_resource_packages_semantically(vec![package], &wrong_protocol).is_empty());
+    }
+
+    #[test]
+    fn resource_query_requires_all_explicit_capability_tags() {
+        let package = sample_resource_package();
+        let query = ResourceDiscoveryQuery {
+            query: None,
+            resource_type: Some(ResourceType::Skill),
+            capability_tags: vec![
+                "legal.contract.review".to_owned(),
+                "missing.required.tag".to_owned(),
+            ],
+            protocol: None,
+            version: None,
+            version_mode: "latest".to_owned(),
+            limit: 10,
+        };
+
+        assert!(rank_resource_packages_semantically(vec![package], &query).is_empty());
+    }
+
+    #[test]
+    fn semantic_alias_catalog_supports_chinese_and_english_query_terms() {
+        let tokens = semantic_tokens("我想审查合同风险并输出风险清单");
+        assert!(tokens.iter().any(|token| token == "document.analysis"));
+        assert!(tokens.iter().any(|token| token == "security.risk"));
+
+        let english_tokens = semantic_tokens("find a model context protocol server");
+        assert!(english_tokens.iter().any(|token| token == "mcp.protocol"));
+    }
+
+    #[test]
+    fn local_semantic_ranking_matches_chinese_query_to_english_metadata() {
+        let contract = sample_resource_package();
+        let mut weather =
+            sample_resource_package_with_did("did:oan:SKLG:44444444444444444444444444444444");
+        set_package_description(
+            &mut weather,
+            "Weather Forecast Skill",
+            "Forecast rainfall and temperature for travel planning.",
+        );
+        set_package_tags(&mut weather, vec!["weather.forecast".to_owned()]);
+
+        let query = ResourceDiscoveryQuery {
+            query: Some("我想审查合同里的付款和终止风险".to_owned()),
+            resource_type: None,
+            capability_tags: vec![],
+            protocol: None,
+            version: None,
+            version_mode: "latest".to_owned(),
+            limit: 5,
+        };
+        let hits = rank_resource_packages_semantically(vec![weather, contract.clone()], &query);
+        assert_eq!(hits[0].package.resource_did, contract.resource_did);
+        assert!(hits[0].intent_score > 0.0 || hits[0].context_score > 0.0);
+    }
+
+    #[test]
+    fn semantic_intent_documents_split_use_cases_examples_and_pseudo_queries() {
+        let package = sample_resource_package();
+        let projection = discovery_package_projection(&package);
+        let document = search_document_from_package(1, &package, &projection);
+        let intents = semantic_intent_documents(&document);
+
+        assert!(intents.iter().any(|intent| intent.intent_kind == "use_case"
+            && intent.intent_text.contains("payment and termination risks")));
+        assert!(intents.iter().any(|intent| intent.intent_kind == "example"
+            && intent.intent_text.contains("Review a commercial contract")));
+        assert!(intents
+            .iter()
+            .any(|intent| intent.intent_kind == "pseudo_query"));
+        assert!(intents
+            .windows(2)
+            .all(|window| window[0].intent_id < window[1].intent_id));
+    }
+
+    #[test]
+    fn local_semantic_ranking_keeps_explicit_type_and_protocol_hard() {
+        let mut mcp =
+            sample_resource_package_with_did("did:oan:MCDM:55555555555555555555555555555555");
+        set_package_type(&mut mcp, ResourceType::McpServer);
+        set_package_description(
+            &mut mcp,
+            "Repository MCP Server",
+            "Search GitHub issues, pull requests, and source repositories through MCP.",
+        );
+        set_package_tags(&mut mcp, vec!["github.repository".to_owned()]);
+
+        let skill = sample_resource_package();
+        let query = ResourceDiscoveryQuery {
+            query: Some("search github pull requests".to_owned()),
+            resource_type: Some(ResourceType::McpServer),
+            capability_tags: vec!["github.repository".to_owned()],
+            protocol: Some("https".to_owned()),
+            version: None,
+            version_mode: "latest".to_owned(),
+            limit: 5,
+        };
+        let hits = rank_resource_packages_semantically(vec![skill, mcp.clone()], &query);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].package.resource_did, mcp.resource_did);
+    }
+
+    #[test]
+    fn hybrid_semantic_hits_merges_vector_and_lexical_candidates() {
+        let vector_only = sample_resource_package();
+        let mut lexical_only =
+            sample_resource_package_with_did("did:oan:MCDM:88888888888888888888888888888888");
+        set_package_type(&mut lexical_only, ResourceType::McpServer);
+        set_package_description(
+            &mut lexical_only,
+            "Repository MCP Server",
+            "Search GitHub issues and pull requests through Model Context Protocol.",
+        );
+        set_package_tags(&mut lexical_only, vec!["github.repository".to_owned()]);
+
+        let query = ResourceDiscoveryQuery {
+            query: Some("github pull request mcp".to_owned()),
+            resource_type: None,
+            capability_tags: vec![],
+            protocol: None,
+            version: None,
+            version_mode: "latest".to_owned(),
+            limit: 10,
+        };
+
+        let hits = hybrid_semantic_hits(
+            vec![(vector_only.clone(), 0.92)],
+            vec![lexical_only.clone()],
+            &query,
+        );
+        let dids = hits
+            .iter()
+            .map(|hit| hit.package.resource_did.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(dids.contains(&vector_only.resource_did.as_str()));
+        assert!(dids.contains(&lexical_only.resource_did.as_str()));
     }
 
     #[tokio::test]
@@ -3677,11 +5238,225 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resource_query_supports_chinese_natural_language_without_type() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let contract = sample_resource_package();
+        let mut weather =
+            sample_resource_package_with_did("did:oan:SKLG:66666666666666666666666666666666");
+        set_package_description(
+            &mut weather,
+            "Weather Forecast Skill",
+            "Forecast rainfall and temperature for travel planning.",
+        );
+        set_package_tags(&mut weather, vec!["weather.forecast".to_owned()]);
+        write_indexed_resource_packages(&state, &[weather, contract.clone()])
+            .await
+            .unwrap();
+
+        let response = resource_query(
+            State(state),
+            Json(ResourceDiscoveryQuery {
+                query: Some("我需要审查合同风险并生成风险清单".to_owned()),
+                resource_type: None,
+                capability_tags: vec![],
+                protocol: None,
+                version: None,
+                version_mode: "latest".to_owned(),
+                limit: 5,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!response.0.candidates.is_empty());
+        assert_eq!(response.0.candidates[0].resource_did, contract.resource_did);
+    }
+
+    #[tokio::test]
+    async fn semantic_evaluation_suite_runs_real_resource_query_path() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let mut contract = sample_resource_package();
+        set_package_description(
+            &mut contract,
+            "Contract Risk Review Skill",
+            "Review commercial contracts, identify risky clauses, and produce a concise risk checklist.",
+        );
+        set_package_capability_details(
+            &mut contract,
+            "Detect payment, termination, liability, compliance, and dispute resolution risks in legal documents.",
+            vec![
+                "审查合同条款并输出风险清单".to_owned(),
+                "Find risky clauses in a vendor agreement".to_owned(),
+            ],
+        );
+
+        let mut file_search =
+            sample_resource_package_with_did("did:oan:MCDM:33333333333333333333333333333333");
+        set_package_type(&mut file_search, ResourceType::McpServer);
+        set_package_description(
+            &mut file_search,
+            "Everything Local File Search MCP Server",
+            "Expose local Windows file search through the MCP protocol and return matching paths from an Everything index.",
+        );
+        set_package_tags(
+            &mut file_search,
+            vec!["file.search".to_owned(), "mcp.server".to_owned()],
+        );
+        set_package_capability_details(
+            &mut file_search,
+            "Search local files by filename keywords and provide MCP tool responses for desktop automation.",
+            vec![
+                "在 Windows 上搜索本地文件".to_owned(),
+                "Use MCP to find local documents by filename".to_owned(),
+            ],
+        );
+
+        let mut weather =
+            sample_resource_package_with_did("did:oan:TLDM:44444444444444444444444444444444");
+        set_package_type(&mut weather, ResourceType::ToolApi);
+        set_package_description(
+            &mut weather,
+            "Open Weather Forecast Tool API",
+            "Provide HTTPS weather forecast data including temperature, rainfall, wind speed, and JSON responses.",
+        );
+        set_package_tags(
+            &mut weather,
+            vec!["weather.forecast".to_owned(), "tool.api".to_owned()],
+        );
+        set_package_capability_details(
+            &mut weather,
+            "Return current and forecast weather information for travel planning and automation workflows.",
+            vec![
+                "查询天气预报和风速".to_owned(),
+                "Get forecast JSON for a city".to_owned(),
+            ],
+        );
+
+        let mut a2a_agent =
+            sample_resource_package_with_did("did:oan:AGDM:55555555555555555555555555555555");
+        set_package_type(&mut a2a_agent, ResourceType::AgentService);
+        set_package_description(
+            &mut a2a_agent,
+            "A2A Connectivity Test Agent Service",
+            "Provide an Agent2Agent service endpoint for connectivity checks and agent card inspection.",
+        );
+        set_package_tags(&mut a2a_agent, vec!["a2a.connectivity".to_owned()]);
+        set_package_capability_details(
+            &mut a2a_agent,
+            "Verify A2A service reachability, inspect agent card metadata, and support simple hello-world calls.",
+            vec![
+                "测试 A2A 智能体服务是否可连通".to_owned(),
+                "Inspect an agent card before integration".to_owned(),
+            ],
+        );
+
+        write_indexed_resource_packages(
+            &state,
+            &[
+                contract.clone(),
+                file_search.clone(),
+                weather.clone(),
+                a2a_agent.clone(),
+            ],
+        )
+        .await
+        .unwrap();
+        let suite_path = dir.path().join("semantic-suite.json");
+        std::fs::write(
+            &suite_path,
+            serde_json::to_vec_pretty(&json!({
+                "suite": "unit-real-multilingual-topk-path",
+                "cases": [
+                    {
+                        "id": "cn-contract",
+                        "language": "zh",
+                        "description": "Chinese task should find the contract review skill without resourceType.",
+                        "query": {
+                            "query": "我需要审查合同风险并生成风险清单",
+                            "capabilityTags": [],
+                            "versionMode": "latest",
+                            "limit": 5
+                        },
+                        "expectedDids": [contract.resource_did]
+                    },
+                    {
+                        "id": "mixed-file-search",
+                        "language": "mixed",
+                        "description": "Mixed Chinese-English task should find the MCP file search server without resourceType.",
+                        "query": {
+                            "query": "需要一个 MCP server 在 Windows 上做 local file search",
+                            "capabilityTags": [],
+                            "versionMode": "latest",
+                            "limit": 5
+                        },
+                        "expectedDids": [file_search.resource_did]
+                    },
+                    {
+                        "id": "en-weather-explicit-type",
+                        "language": "en",
+                        "description": "English task with explicit Tool API filter should find the weather API.",
+                        "query": {
+                            "query": "HTTPS API for weather forecast temperature rainfall wind JSON",
+                            "resourceType": "tool_api",
+                            "capabilityTags": [],
+                            "versionMode": "latest",
+                            "limit": 5
+                        },
+                        "expectedDids": [weather.resource_did]
+                    },
+                    {
+                        "id": "cn-a2a-explicit-type",
+                        "language": "zh",
+                        "description": "Chinese task with explicit Agent Service filter should find the A2A test agent.",
+                        "query": {
+                            "query": "找一个可以做连通性测试并查看 agent card 的 A2A 智能体服务",
+                            "resourceType": "agent_service",
+                            "capabilityTags": [],
+                            "versionMode": "latest",
+                            "limit": 5
+                        },
+                        "expectedDids": [a2a_agent.resource_did]
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report = evaluate_semantic_discovery(&state, &suite_path)
+            .await
+            .unwrap();
+        assert_eq!(report.case_count, 4);
+        assert_eq!(report.recall_at_5, 1.0);
+        assert_eq!(report.mrr_at_10, 1.0);
+        assert!(report.cases.iter().all(|case| case.passed));
+    }
+
+    #[tokio::test]
+    async fn semantic_rebuild_reports_disabled_when_pgvector_is_unavailable() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        state.config.semantic_search.enabled = true;
+        write_indexed_resource_packages(&state, &[sample_resource_package()])
+            .await
+            .unwrap();
+
+        let report = rebuild_semantic_indexes(&state).await.unwrap();
+        assert!(!report.semantic_enabled);
+        assert_eq!(report.package_count, 0);
+        assert_eq!(report.context_indexed_count, 0);
+        assert_eq!(report.intent_indexed_count, 0);
+        assert!(report.skipped_reason.is_some());
+    }
+
+    #[tokio::test]
     async fn resource_query_treats_complete_did_as_exact_lookup() {
         let dir = tempdir().unwrap();
         let state = app_state(dir.path());
         let target = sample_resource_package();
-        let mut other = sample_resource_package_with_did("did:oan:MCDM:33333333333333333333333333333333");
+        let mut other =
+            sample_resource_package_with_did("did:oan:MCDM:33333333333333333333333333333333");
         other.resource_type = ResourceType::McpServer;
         write_indexed_resource_packages(&state, &[target.clone(), other])
             .await
@@ -3706,8 +5481,9 @@ mod tests {
         assert_eq!(candidates[0].resource_did, target.resource_did);
         assert_eq!(candidates[0].score, 1.0);
 
+        write_discovery_document(&state, vec!["legal".to_owned()]);
         let response = resource_query(
-            State(state),
+            State(state.clone()),
             Json(ResourceDiscoveryQuery {
                 query: Some("did:oan:MCDM:33333333333333333333333333333333".to_owned()),
                 resource_type: Some(ResourceType::Skill),
@@ -3721,12 +5497,61 @@ mod tests {
         .await
         .unwrap();
         let candidates = response.0.candidates;
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(
-            candidates[0].resource_did,
-            "did:oan:MCDM:33333333333333333333333333333333"
-        );
-        assert_eq!(candidates[0].resource_type, ResourceType::McpServer);
+        assert!(candidates.is_empty());
+
+        let mut out_of_scope =
+            sample_resource_package_with_did("did:oan:SKLG:77777777777777777777777777777777");
+        set_package_authorized_domains(&mut out_of_scope, vec!["finance".to_owned()]);
+        write_indexed_resource_packages(&state, &[out_of_scope.clone()])
+            .await
+            .unwrap();
+
+        let response = resource_query(
+            State(state),
+            Json(ResourceDiscoveryQuery {
+                query: Some(out_of_scope.resource_did.clone()),
+                resource_type: None,
+                capability_tags: vec![],
+                protocol: None,
+                version: None,
+                version_mode: "latest".to_owned(),
+                limit: 5,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(response.0.candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resource_query_without_type_searches_only_user_consumable_resources_by_default() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let skill = sample_resource_package();
+        let mut node =
+            sample_resource_package_with_did("did:oan:AGDS:33333333333333333333333333333333");
+        set_package_type(&mut node, ResourceType::InfrastructureNode);
+        write_indexed_resource_packages(&state, &[skill.clone(), node])
+            .await
+            .unwrap();
+
+        let response = resource_query(
+            State(state),
+            Json(ResourceDiscoveryQuery {
+                query: None,
+                resource_type: None,
+                capability_tags: vec![],
+                protocol: None,
+                version: None,
+                version_mode: "latest".to_owned(),
+                limit: 10,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0.candidates.len(), 1);
+        assert_eq!(response.0.candidates[0].resource_did, skill.resource_did);
     }
 
     #[tokio::test]
@@ -3926,6 +5751,14 @@ mod tests {
             count_semantic_indexed_resources(&state).await.unwrap(),
             Some(2)
         );
+        assert!(
+            count_intent_indexed_rows(&state)
+                .await
+                .unwrap()
+                .unwrap_or_default()
+                >= 2,
+            "expected per-intent embeddings to be indexed"
+        );
 
         let hits = query_semantic_index(
             &state,
@@ -3987,7 +5820,10 @@ mod tests {
             .unwrap();
         assert!(!prefiltered);
         assert_eq!(packages.len(), 1);
-        assert!(resource_matches_query(&packages[0], &query));
+        assert_eq!(
+            rank_resource_packages_semantically(packages, &query).len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -4027,6 +5863,50 @@ mod tests {
             response.0.candidates[0].authorized_domains,
             vec!["legal".to_owned()]
         );
+    }
+
+    #[tokio::test]
+    async fn resource_query_accepts_empty_query_with_structured_filters() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        let mut legal = sample_resource_package();
+        set_package_tags(
+            &mut legal,
+            vec![
+                "legal.contract.review".to_owned(),
+                "risk.analysis".to_owned(),
+            ],
+        );
+        let mut finance =
+            sample_resource_package_with_did("did:oan:SKLG:44444444444444444444444444444444");
+        set_package_tags(&mut finance, vec!["finance.invoice.audit".to_owned()]);
+        upsert_indexed_resource_package(&state, 1, &legal)
+            .await
+            .unwrap();
+        upsert_indexed_resource_package(&state, 2, &finance)
+            .await
+            .unwrap();
+
+        let response = resource_query(
+            State(state),
+            Json(ResourceDiscoveryQuery {
+                query: None,
+                resource_type: Some(ResourceType::Skill),
+                capability_tags: vec![
+                    "legal.contract.review".to_owned(),
+                    "risk.analysis".to_owned(),
+                ],
+                protocol: Some("https".to_owned()),
+                version: None,
+                version_mode: "latest".to_owned(),
+                limit: 10,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0.candidates.len(), 1);
+        assert_eq!(response.0.candidates[0].resource_did, legal.resource_did);
     }
 
     #[tokio::test]
@@ -4120,6 +6000,22 @@ mod tests {
     }
 
     #[test]
+    fn discovery_package_projection_adds_chinese_tokens_and_aliases_to_search_text() {
+        let mut package = sample_resource_package();
+        set_package_description(
+            &mut package,
+            "合同审查助手",
+            "审查合同付款、终止、责任和合规风险，并生成风险清单。",
+        );
+        let projection = discovery_package_projection(&package);
+
+        assert!(projection.search_text.contains("合同"));
+        assert!(projection.search_text.contains("风险"));
+        assert!(projection.search_text.contains("document.analysis"));
+        assert!(projection.search_text.contains("security.risk"));
+    }
+
+    #[test]
     fn semantic_search_document_extracts_did_metadata_without_package_examples() {
         let package = sample_resource_package();
         let projection = discovery_package_projection(&package);
@@ -4142,7 +6038,21 @@ mod tests {
             .examples
             .iter()
             .any(|example| example.contains("commercial contract")));
+        let semantic_text = semantic_document_text(&doc);
+        assert!(semantic_text.contains("Tag view:"));
+        assert!(semantic_text.contains("Context view:"));
+        assert!(semantic_text.contains("Intent view:"));
+        assert!(semantic_text.contains("User wants to Find payment and termination risks"));
         assert!(doc.semantic_source_hash.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn semantic_filter_defaults_keep_explicit_metadata_as_hard_constraints() {
+        let config = SemanticSearchConfig::default();
+
+        assert_eq!(config.filters.resource_type, "hard");
+        assert_eq!(config.filters.capability_tags, "hard");
+        assert_eq!(config.filters.protocol, "hard");
     }
 
     #[test]
@@ -4160,8 +6070,8 @@ mod tests {
         assert!(pgvector_literal(&first).ends_with("]'"));
     }
 
-    #[test]
-    fn semantic_engine_and_embedding_provider_have_explicit_extension_points() {
+    #[tokio::test]
+    async fn semantic_engine_and_embedding_provider_have_explicit_extension_points() {
         let mut config = SemanticSearchConfig {
             enabled: true,
             ..SemanticSearchConfig::default()
@@ -4174,16 +6084,152 @@ mod tests {
             EmbeddingProviderKind::from_config(&config.embedding).unwrap(),
             EmbeddingProviderKind::DeterministicLocal
         );
-        assert!(embed_semantic_text(&config, "contract risk")
-            .unwrap()
-            .iter()
-            .any(|value| *value > 0.0));
+        assert!(
+            embed_semantic_text(&config, &reqwest::Client::new(), "contract risk")
+                .await
+                .unwrap()
+                .iter()
+                .any(|value| *value > 0.0)
+        );
 
         config.engine = "grail".to_owned();
         assert!(DiscoverySearchEngine::from_config(&config)
             .unwrap_err()
             .to_string()
             .contains("grail_engine_not_implemented"));
+    }
+
+    #[tokio::test]
+    async fn http_embedding_provider_validates_health_and_embeds_query_text() {
+        let app = Router::new()
+            .route(
+                "/health",
+                get(|| async {
+                    Json(json!({
+                        "model": "gte-multilingual-base",
+                        "embeddingVersion": "test-revision",
+                        "dtype": "q8",
+                        "dimension": 4,
+                        "ready": true
+                    }))
+                }),
+            )
+            .route(
+                "/embed",
+                post(|Json(body): Json<Value>| async move {
+                    assert_eq!(body["model"], "gte-multilingual-base");
+                    assert_eq!(body["input"].as_array().unwrap().len(), 1);
+                    Json(json!({
+                        "model": "gte-multilingual-base",
+                        "embeddingVersion": "test-revision",
+                        "dtype": "q8",
+                        "dimension": 4,
+                        "vectors": [[1.0, 0.0, 0.0, 0.0]]
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = SemanticSearchConfig {
+            embedding: SemanticEmbeddingConfig {
+                provider: "http-embedding".to_owned(),
+                endpoint: Some(format!("http://{addr}/embed")),
+                health_endpoint: Some(format!("http://{addr}/health")),
+                model_name: "gte-multilingual-base".to_owned(),
+                model_version: Some("test-revision".to_owned()),
+                strict_model_version: true,
+                dtype: Some("q8".to_owned()),
+                dimension: 4,
+                ..SemanticEmbeddingConfig::default()
+            },
+            ..SemanticSearchConfig::default()
+        };
+        let client = reqwest::Client::new();
+
+        validate_embedding_provider(&config, &client).await.unwrap();
+        let vector = embed_semantic_text(&config, &client, "我需要搜索代码仓库")
+            .await
+            .unwrap();
+        assert_eq!(vector.len(), 4);
+        assert!((vector[0] - 1.0).abs() < 0.0001);
+    }
+
+    #[tokio::test]
+    async fn http_embedding_provider_rejects_dtype_mismatch() {
+        let app = Router::new().route(
+            "/health",
+            get(|| async {
+                Json(json!({
+                    "model": "gte-multilingual-base",
+                    "embeddingVersion": "test-revision",
+                    "dtype": "fp32",
+                    "dimension": 4,
+                    "ready": true
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = SemanticSearchConfig {
+            embedding: SemanticEmbeddingConfig {
+                provider: "http-embedding".to_owned(),
+                endpoint: Some(format!("http://{addr}/embed")),
+                health_endpoint: Some(format!("http://{addr}/health")),
+                model_name: "gte-multilingual-base".to_owned(),
+                model_version: Some("test-revision".to_owned()),
+                strict_model_version: true,
+                dtype: Some("q8".to_owned()),
+                dimension: 4,
+                ..SemanticEmbeddingConfig::default()
+            },
+            ..SemanticSearchConfig::default()
+        };
+
+        let error = validate_embedding_provider(&config, &reqwest::Client::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("http_embedding_dtype_mismatch:fp32"));
+    }
+
+    #[tokio::test]
+    async fn unavailable_http_embedding_provider_disables_semantic_runtime() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        state.config.semantic_search = SemanticSearchConfig {
+            enabled: true,
+            embedding: SemanticEmbeddingConfig {
+                provider: "http-embedding".to_owned(),
+                endpoint: Some("http://127.0.0.1:9/embed".to_owned()),
+                health_endpoint: Some("http://127.0.0.1:9/health".to_owned()),
+                model_name: "gte-multilingual-base".to_owned(),
+                model_version: Some("gte-multilingual-base".to_owned()),
+                strict_model_version: true,
+                dimension: 768,
+                timeout_ms: 50,
+                ..SemanticEmbeddingConfig::default()
+            },
+            ..SemanticSearchConfig::default()
+        };
+
+        state.semantic = initialize_semantic_runtime(&state.config, state.postgres.as_ref()).await;
+        assert!(!semantic_search_available(&state));
+
+        let status = semantic_status_json(&state, true, Some("keyword_fallback".to_owned()));
+        assert_eq!(status["enabled"], false);
+        assert_eq!(status["healthy"], false);
+        assert_eq!(status["embeddingProvider"], "http-embedding");
+        assert_eq!(status["embeddingModel"], "gte-multilingual-base");
+        assert_eq!(status["fallbackUsed"], true);
+        assert!(status["fallbackReason"].as_str().unwrap().len() > 0);
     }
 
     #[test]
@@ -4219,6 +6265,26 @@ mod tests {
         assert_eq!(discovery_sql_candidate_limit(100), 300);
         assert_eq!(discovery_sql_candidate_limit(1_000), 3_000);
         assert_eq!(discovery_sql_candidate_limit(10_000), 10_000);
+    }
+
+    #[test]
+    fn discovery_sql_candidate_limit_expands_when_text_prefilter_is_unavailable() {
+        let mut query = ResourceDiscoveryQuery {
+            query: Some("合同风险审查".to_owned()),
+            resource_type: None,
+            capability_tags: Vec::new(),
+            protocol: None,
+            version: None,
+            version_mode: "latest".to_owned(),
+            limit: 10,
+        };
+
+        assert!(!should_use_sql_text_prefilter(&query));
+        assert_eq!(discovery_sql_candidate_limit_for_query(&query), 500);
+
+        query.query = Some("contract risk review".to_owned());
+        assert!(should_use_sql_text_prefilter(&query));
+        assert_eq!(discovery_sql_candidate_limit_for_query(&query), 30);
     }
 
     #[tokio::test]
@@ -4304,7 +6370,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_resources_from_authorized_summary_indexes_current_package_for_stale_hash_notice() {
+    async fn sync_resources_from_authorized_summary_indexes_current_package_for_stale_hash_notice()
+    {
         let dir = tempdir().unwrap();
         let package = sample_resource_package();
         let app = Router::new().route(

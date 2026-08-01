@@ -1,5 +1,9 @@
 /target/
 /target-*/
+node_modules/
+services/embedding-service/dist/
+services/embedding-service/.env
+services/embedding-service/.cache/
 /.oan-runtime/
 /.oan-demo-*/
 /.oan-example-*/

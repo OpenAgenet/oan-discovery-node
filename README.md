@@ -5,6 +5,8 @@ Discovery service workspace for OpenAgenet.
 This repository owns:
 
 - `discovery-node`
+- `embedding-service`, an optional HTTP embedding service for multilingual
+  semantic discovery
 
 Shared protocol, bulletin, package, storage, and crypto crates live in the
 sibling `oan-protocol-common` repository.
@@ -15,6 +17,15 @@ sibling `oan-protocol-common` repository.
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace -j 1
+```
+
+Embedding service checks:
+
+```powershell
+cd services/embedding-service
+npm install
+npm test
+npm run build
 ```
 
 Official integration tests and benchmarks are run through

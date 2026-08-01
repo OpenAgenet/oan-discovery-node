@@ -9,6 +9,7 @@ repository.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 chrono.workspace = true
+jieba-rs.workspace = true
 oan-bulletin.workspace = true
 oan-core.workspace = true
 oan-crypto.workspace = true

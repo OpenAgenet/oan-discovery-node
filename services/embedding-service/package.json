@@ -1,0 +1,22 @@
+{
+  "name": "@openagenet/oan-discovery-embedding-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "HTTP embedding service for OAN Discovery Node semantic search.",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/server.ts",
+    "start": "node dist/src/server.js",
+    "test": "npm run build && node --test dist/tests/*.test.js",
+    "smoke:real": "npm run build && node --test dist/tests/realModel.smoke.test.js"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0"
+  }
+}

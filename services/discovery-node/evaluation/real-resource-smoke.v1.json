@@ -1,0 +1,224 @@
+﻿{
+  "suite": "real-oan-resource-smoke.v1",
+  "seedResources": [
+    {
+      "resourceDid": "did:oan:SKDM:2ftSobUkN63sLPjXPuc4rNAB8zBJF6qR",
+      "resourceType": "skill",
+      "name": "PDF Document Analysis Skill",
+      "description": "A reusable OAN Skill for PDF document parsing, text extraction, metadata inspection, and source-oriented document analysis. It is intended for agents that need to read PDF files, extract structured content, and prepare downstream summaries or evidence snippets.",
+      "capabilityDescription": "Parse PDF documents, extract text and metadata, identify pages and sections, and provide document-analysis outputs that can be consumed by an agent workflow.",
+      "capabilityTags": ["pdf.analysis", "document.parsing", "text.extraction", "skill"],
+      "authorizedDomains": ["documents"],
+      "protocols": ["https"],
+      "serviceEndpoint": "https://github.com/OpenAgenet/oan-resource-examples/tree/main/pdf-document-analysis-skill",
+      "useCaseExamples": [
+        "我需要一个可以帮助智能体处理 PDF 文档、提取内容并做文档分析的技能",
+        "Extract text and metadata from a PDF file before summarization",
+        "Analyze a report PDF and return page-level evidence snippets"
+      ],
+      "examples": [
+        {"task": "解析 PDF 文档并提取正文", "output": "Document text, metadata, page references"},
+        {"task": "Analyze an uploaded PDF contract", "output": "Structured text and extracted sections"}
+      ]
+    },
+    {
+      "resourceDid": "did:oan:MCDM:uj16KsUwTMX7GmBSN6EA7Qi3XMN4P1Pj",
+      "resourceType": "mcp_server",
+      "name": "Everything Local File Search MCP Server",
+      "description": "An MCP Server that exposes local file search capabilities through the Model Context Protocol. It is suitable for desktop agents that need to query a Windows Everything index, locate files by keyword, and return paths or file metadata through MCP tools.",
+      "capabilityDescription": "Provide MCP tool calls for local file discovery, filename keyword search, path lookup, and desktop automation workflows that need reliable file retrieval.",
+      "capabilityTags": ["mcp.server", "file.search", "desktop.automation", "everything"],
+      "authorizedDomains": ["mcp"],
+      "protocols": ["mcp", "stdio"],
+      "serviceEndpoint": "https://github.com/OpenAgenet/oan-resource-examples/tree/main/everything-file-search-mcp",
+      "useCaseExamples": [
+        "需要一个 MCP server，在 Windows 上通过 Everything 做 local file search",
+        "Find local documents by filename from an agent workflow",
+        "Use MCP to search a developer workstation for project files"
+      ],
+      "examples": [
+        {"task": "搜索本地文件名中包含 report 的文档", "output": "Matching local file paths"},
+        {"task": "MCP local file search for README files", "output": "Candidate paths and metadata"}
+      ]
+    },
+    {
+      "resourceDid": "did:oan:TLDM:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP",
+      "resourceType": "tool_api",
+      "name": "Open-Meteo Forecast Tool API",
+      "description": "A Tool/API resource for public weather forecast queries. It provides HTTPS access to current and forecast weather data such as temperature, rainfall, wind speed, and structured JSON responses for agent applications.",
+      "capabilityDescription": "Call a public weather forecast API, retrieve current conditions and future forecasts, and use JSON outputs in travel planning, alerting, or automation tasks.",
+      "capabilityTags": ["tool.api", "weather.forecast", "public.api", "json"],
+      "authorizedDomains": ["tools"],
+      "protocols": ["https"],
+      "serviceEndpoint": "https://open-meteo.com/",
+      "useCaseExamples": [
+        "查询某个城市未来几天的天气预报和风速",
+        "public HTTPS API for weather forecast current temperature wind speed JSON",
+        "Get rainfall forecast for travel planning"
+      ],
+      "examples": [
+        {"task": "查询北京明天是否下雨", "output": "Forecast JSON with rainfall probability"},
+        {"task": "Get current temperature and wind speed", "output": "Weather JSON response"}
+      ]
+    },
+    {
+      "resourceDid": "did:oan:AGDM:PAmHQoT9Dup4q4GZfgAAv9YaHHgsZgm2",
+      "resourceType": "agent_service",
+      "name": "A2A Hello World Agent Service",
+      "description": "A minimal Agent Service used to verify Agent2Agent connectivity, agent card inspection, and simple request-response integration. It is useful as a reference resource for checking whether an agent platform can discover and call an A2A endpoint.",
+      "capabilityDescription": "Expose an A2A-compatible endpoint, publish agent card information, and support simple connectivity or hello-world tests before deeper integration.",
+      "capabilityTags": ["agent.service", "a2a", "connectivity.test", "agent.card"],
+      "authorizedDomains": ["agents"],
+      "protocols": ["a2a", "https"],
+      "serviceEndpoint": "https://github.com/OpenAgenet/oan-resource-examples/tree/main/a2a-hello-world-agent",
+      "useCaseExamples": [
+        "找一个可以用于连通性测试的 A2A 智能体服务，最好有 agent card",
+        "Inspect an A2A agent card before integration",
+        "Run a hello-world request against an agent service endpoint"
+      ],
+      "examples": [
+        {"task": "测试 A2A 智能体服务是否可连通", "output": "Connectivity status and agent card metadata"},
+        {"task": "Call hello world agent", "output": "Simple response from A2A service"}
+      ]
+    },
+    {
+      "resourceDid": "did:oan:MCDM:ZSZQ6eLz2huG1JcnJVKeTXyK26x4EbKH",
+      "resourceType": "mcp_server",
+      "name": "Inference MCP Server",
+      "description": "An MCP Server resource that exposes inference-oriented tool access for agent workflows. It represents a network service that can be discovered by capability and protocol metadata rather than by a fixed vendor-specific integration.",
+      "capabilityDescription": "Provide MCP-based inference calls and structured tool responses for agents that need to delegate model inference or related computation through an interoperable service interface.",
+      "capabilityTags": ["mcp.server", "inference", "model.tool", "agent.workflow"],
+      "authorizedDomains": ["mcp"],
+      "protocols": ["mcp", "https"],
+      "serviceEndpoint": "https://ac.inference.sh/mcp",
+      "useCaseExamples": [
+        "Find an MCP server for inference tasks",
+        "需要一个能够提供模型推理能力的 MCP 服务",
+        "Route an agent workflow to an inference tool endpoint"
+      ],
+      "examples": [
+        {"task": "调用推理 MCP 服务完成模型计算", "output": "Structured MCP tool result"}
+      ]
+    },
+    {
+      "resourceDid": "did:oan:SKDM:F5xLwQj7N9pR2sT6uV8yZ3aBcDeFgHkM",
+      "resourceType": "skill",
+      "name": "中文合同风险审查技能",
+      "description": "面向中文合同文本的智能体技能资源，可用于识别付款条款、违约责任、终止条件、保密义务和合规风险。该资源适合需要对中文合同进行初步审查、风险摘要和证据定位的智能体工作流。",
+      "capabilityDescription": "对中文合同内容进行条款级风险识别，输出风险清单、风险原因和相关段落位置，辅助后续人工审核或智能体自动化处理。",
+      "capabilityTags": ["legal.contract.review", "risk.analysis", "chinese.document", "skill"],
+      "authorizedDomains": ["legal"],
+      "protocols": ["https"],
+      "serviceEndpoint": "https://example.org/oan/examples/chinese-contract-risk-skill",
+      "useCaseExamples": [
+        "帮我审查一份中文合同里的付款风险和违约责任",
+        "识别合同里的终止条款风险并生成风险清单",
+        "Find risky clauses in a Chinese commercial contract"
+      ],
+      "examples": [
+        {"task": "审查采购合同风险", "output": "风险条款、风险等级、证据段落"}
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "id": "cn-pdf-skill-without-type",
+      "language": "zh",
+      "description": "Chinese natural-language task without resourceType should find the published PDF skill example.",
+      "query": {
+        "query": "我需要一个可以帮助智能体处理 PDF 文档、提取内容并做文档分析的技能",
+        "capabilityTags": [],
+        "versionMode": "latest",
+        "limit": 10
+      },
+      "expectedDids": ["did:oan:SKDM:2ftSobUkN63sLPjXPuc4rNAB8zBJF6qR"]
+    },
+    {
+      "id": "en-pdf-skill-explicit-type",
+      "language": "en",
+      "description": "English task with explicit Skill filter should find the published PDF skill example.",
+      "query": {
+        "query": "skill for PDF document analysis extraction and source inspection",
+        "resourceType": "skill",
+        "capabilityTags": [],
+        "versionMode": "latest",
+        "limit": 10
+      },
+      "expectedDids": ["did:oan:SKDM:2ftSobUkN63sLPjXPuc4rNAB8zBJF6qR"]
+    },
+    {
+      "id": "mixed-local-file-mcp",
+      "language": "mixed",
+      "description": "Mixed Chinese-English query should find the Everything File Search MCP Server.",
+      "query": {
+        "query": "需要一个 MCP server，在 Windows 上通过 Everything 做 local file search",
+        "capabilityTags": [],
+        "versionMode": "latest",
+        "limit": 10
+      },
+      "expectedDids": ["did:oan:MCDM:uj16KsUwTMX7GmBSN6EA7Qi3XMN4P1Pj"]
+    },
+    {
+      "id": "en-weather-tool-api",
+      "language": "en",
+      "description": "English task with Tool/API filter should find the Open-Meteo Forecast API.",
+      "query": {
+        "query": "public HTTPS API for weather forecast current temperature wind speed JSON",
+        "resourceType": "tool_api",
+        "capabilityTags": [],
+        "versionMode": "latest",
+        "limit": 10
+      },
+      "expectedDids": ["did:oan:TLDM:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP"]
+    },
+    {
+      "id": "cn-agent-service-a2a",
+      "language": "zh",
+      "description": "Chinese task should find the published A2A Hello World agent service example.",
+      "query": {
+        "query": "找一个可以用于连通性测试的 A2A 智能体服务，最好有 agent card",
+        "resourceType": "agent_service",
+        "capabilityTags": [],
+        "versionMode": "latest",
+        "limit": 10
+      },
+      "expectedDids": ["did:oan:AGDM:PAmHQoT9Dup4q4GZfgAAv9YaHHgsZgm2"]
+    },
+    {
+      "id": "cn-contract-without-type-cross-type-ranking",
+      "language": "zh",
+      "description": "Chinese contract-risk query without resourceType should rank the contract Skill ahead of unrelated MCP, Tool API, and Agent Service resources.",
+      "query": {
+        "query": "帮我审查一份中文合同里的付款风险、违约责任和终止条款",
+        "capabilityTags": [],
+        "versionMode": "latest",
+        "limit": 10
+      },
+      "expectedDids": ["did:oan:SKDM:F5xLwQj7N9pR2sT6uV8yZ3aBcDeFgHkM"]
+    },
+    {
+      "id": "mixed-inference-mcp-without-type",
+      "language": "mixed",
+      "description": "Mixed inference query without resourceType should find the inference MCP server.",
+      "query": {
+        "query": "找一个 MCP 服务给 agent workflow 调用模型 inference tool",
+        "capabilityTags": [],
+        "versionMode": "latest",
+        "limit": 10
+      },
+      "expectedDids": ["did:oan:MCDM:ZSZQ6eLz2huG1JcnJVKeTXyK26x4EbKH"]
+    },
+    {
+      "id": "did-exact-weather-tool-api",
+      "language": "identifier",
+      "description": "Exact DID lookup should return the target Tool/API through the same query entrypoint.",
+      "query": {
+        "query": "did:oan:TLDM:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP",
+        "capabilityTags": [],
+        "versionMode": "latest",
+        "limit": 10
+      },
+      "expectedDids": ["did:oan:TLDM:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP"]
+    }
+  ]
+}

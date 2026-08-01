@@ -1,0 +1,64 @@
+{
+  "groups": [
+    {
+      "canonical": "web.search",
+      "terms": ["web search", "internet search", "search engine", "webpage search", "网页搜索", "联网搜索", "互联网搜索", "搜索网页", "检索网页", "查资料", "资料检索"]
+    },
+    {
+      "canonical": "github.repository",
+      "terms": ["github", "git repository", "source code", "pull request", "issue", "代码仓库", "开源仓库", "源码", "拉取请求", "问题单"]
+    },
+    {
+      "canonical": "browser.automation",
+      "terms": ["browser automation", "web automation", "playwright", "selenium", "网页自动化", "浏览器自动化", "页面操作", "自动浏览"]
+    },
+    {
+      "canonical": "file.system",
+      "terms": ["filesystem", "file system", "local files", "documents", "文件系统", "本地文件", "文件管理", "读写文件", "文档处理"]
+    },
+    {
+      "canonical": "database.query",
+      "terms": ["database", "sql", "postgresql", "sqlite", "mysql", "数据库", "数据查询", "SQL查询", "查库", "结构化数据"]
+    },
+    {
+      "canonical": "knowledge.retrieval",
+      "terms": ["knowledge retrieval", "rag", "vector search", "semantic search", "知识检索", "语义检索", "向量检索", "知识库", "问答检索"]
+    },
+    {
+      "canonical": "document.analysis",
+      "terms": ["document analysis", "contract review", "pdf", "markdown", "text extraction", "文档分析", "合同审查", "审查合同", "合同审核", "审核合同", "PDF解析", "文本抽取", "转Markdown", "网页转Markdown"]
+    },
+    {
+      "canonical": "data.analysis",
+      "terms": ["data analysis", "spreadsheet", "csv", "excel", "chart", "数据分析", "表格处理", "电子表格", "CSV", "Excel", "图表"]
+    },
+    {
+      "canonical": "image.media",
+      "terms": ["image", "video", "audio", "multimodal", "图片", "图像", "视频", "音频", "多模态", "媒体处理"]
+    },
+    {
+      "canonical": "calendar.email",
+      "terms": ["calendar", "email", "mail", "schedule", "gmail", "outlook", "日历", "邮件", "邮箱", "日程", "会议安排"]
+    },
+    {
+      "canonical": "map.location",
+      "terms": ["map", "location", "geo", "navigation", "地图", "位置", "地理", "导航", "路线"]
+    },
+    {
+      "canonical": "finance.payment",
+      "terms": ["finance", "payment", "invoice", "accounting", "stock", "金融", "支付", "发票", "财务", "股票", "记账"]
+    },
+    {
+      "canonical": "security.risk",
+      "terms": ["security", "risk", "compliance", "vulnerability", "audit", "安全", "风险", "合规", "漏洞", "审计", "风控"]
+    },
+    {
+      "canonical": "mcp.protocol",
+      "terms": ["mcp", "model context protocol", "claude desktop", "MCP协议", "模型上下文协议", "Claude Desktop"]
+    },
+    {
+      "canonical": "api.integration",
+      "terms": ["api", "rest", "graphql", "webhook", "integration", "接口", "API", "集成", "Webhook", "服务入口"]
+    }
+  ]
+}
