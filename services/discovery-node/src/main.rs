@@ -1072,7 +1072,9 @@ async fn initialize_discovery_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
         .execute_batch(&format!(
             r#"
             CREATE TABLE IF NOT EXISTS {DISCOVERY_SYNC_STATE_TABLE} (
-                sync_key TEXT PRIMARY KEY,
+                state_key TEXT PRIMARY KEY,
+                state_value TEXT NOT NULL,
+                sync_key TEXT UNIQUE,
                 sync_value TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -1112,6 +1114,25 @@ async fn initialize_discovery_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
             "#
         ))
         .await?;
+    sqlite
+        .execute_batch(&format!(
+            r#"
+            ALTER TABLE {DISCOVERY_SYNC_STATE_TABLE} ADD COLUMN IF NOT EXISTS state_key TEXT;
+            ALTER TABLE {DISCOVERY_SYNC_STATE_TABLE} ADD COLUMN IF NOT EXISTS state_value TEXT;
+            ALTER TABLE {DISCOVERY_SYNC_STATE_TABLE} ADD COLUMN IF NOT EXISTS sync_key TEXT;
+            ALTER TABLE {DISCOVERY_SYNC_STATE_TABLE} ADD COLUMN IF NOT EXISTS sync_value TEXT;
+            UPDATE {DISCOVERY_SYNC_STATE_TABLE}
+            SET state_key = COALESCE(state_key, sync_key),
+                state_value = COALESCE(state_value, sync_value),
+                sync_key = COALESCE(sync_key, state_key),
+                sync_value = COALESCE(sync_value, state_value)
+            WHERE state_key IS NULL
+               OR state_value IS NULL
+               OR sync_key IS NULL
+               OR sync_value IS NULL;
+            "#
+        ))
+        .await?;
     Ok(())
 }
 
@@ -1139,7 +1160,9 @@ async fn initialize_discovery_postgres(postgres: &PostgresJsonStore) -> Result<(
         .execute_batch(&format!(
             r#"
             CREATE TABLE IF NOT EXISTS {DISCOVERY_SYNC_STATE_TABLE} (
-                sync_key TEXT PRIMARY KEY,
+                state_key TEXT PRIMARY KEY,
+                state_value JSONB NOT NULL,
+                sync_key TEXT UNIQUE,
                 sync_value JSONB NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL
             );
@@ -1192,6 +1215,25 @@ async fn initialize_discovery_postgres(postgres: &PostgresJsonStore) -> Result<(
             ON {DISCOVERY_PACKAGE_TABLE} USING GIN(to_tsvector('simple', search_text));
             CREATE INDEX IF NOT EXISTS idx_discovery_rejected_updated
             ON {DISCOVERY_REJECTED_TABLE}(updated_at, reject_key);
+            "#
+        ))
+        .await?;
+    postgres
+        .execute_batch(&format!(
+            r#"
+            ALTER TABLE {DISCOVERY_SYNC_STATE_TABLE} ADD COLUMN IF NOT EXISTS state_key TEXT;
+            ALTER TABLE {DISCOVERY_SYNC_STATE_TABLE} ADD COLUMN IF NOT EXISTS state_value JSONB;
+            ALTER TABLE {DISCOVERY_SYNC_STATE_TABLE} ADD COLUMN IF NOT EXISTS sync_key TEXT;
+            ALTER TABLE {DISCOVERY_SYNC_STATE_TABLE} ADD COLUMN IF NOT EXISTS sync_value JSONB;
+            UPDATE {DISCOVERY_SYNC_STATE_TABLE}
+            SET state_key = COALESCE(state_key, sync_key),
+                state_value = COALESCE(state_value, sync_value),
+                sync_key = COALESCE(sync_key, state_key),
+                sync_value = COALESCE(sync_value, state_value)
+            WHERE state_key IS NULL
+               OR state_value IS NULL
+               OR sync_key IS NULL
+               OR sync_value IS NULL;
             "#
         ))
         .await?;
@@ -4232,10 +4274,14 @@ async fn upsert_discovery_sync_state<T: Serialize>(
     if let Some(sqlite) = &state.sqlite {
         sqlx::query(&format!(
             r#"
-            INSERT INTO {DISCOVERY_SYNC_STATE_TABLE}(sync_key, sync_value, updated_at)
-            VALUES (?1, ?2, ?3)
-            ON CONFLICT(sync_key)
-            DO UPDATE SET sync_value = excluded.sync_value, updated_at = excluded.updated_at
+            INSERT INTO {DISCOVERY_SYNC_STATE_TABLE}(state_key, state_value, sync_key, sync_value, updated_at)
+            VALUES (?1, ?2, ?1, ?2, ?3)
+            ON CONFLICT(state_key)
+            DO UPDATE SET
+                state_value = excluded.state_value,
+                sync_key = excluded.sync_key,
+                sync_value = excluded.sync_value,
+                updated_at = excluded.updated_at
             "#
         ))
         .bind(key)
@@ -4248,10 +4294,14 @@ async fn upsert_discovery_sync_state<T: Serialize>(
     if let Some(postgres) = &state.postgres {
         sqlx::query(&format!(
             r#"
-            INSERT INTO {DISCOVERY_SYNC_STATE_TABLE}(sync_key, sync_value, updated_at)
-            VALUES ($1, $2::jsonb, $3)
-            ON CONFLICT(sync_key)
-            DO UPDATE SET sync_value = excluded.sync_value, updated_at = excluded.updated_at
+            INSERT INTO {DISCOVERY_SYNC_STATE_TABLE}(state_key, state_value, sync_key, sync_value, updated_at)
+            VALUES ($1, $2::jsonb, $1, $2::jsonb, $3)
+            ON CONFLICT(state_key)
+            DO UPDATE SET
+                state_value = excluded.state_value,
+                sync_key = excluded.sync_key,
+                sync_value = excluded.sync_value,
+                updated_at = excluded.updated_at
             "#
         ))
         .bind(key)
@@ -5149,8 +5199,9 @@ async fn write_sync_history_store(state: &AppState, item: Value) -> Result<()> {
 async fn read_sync_cursor(state: &AppState) -> Result<i64> {
     if let Some(sqlite) = &state.sqlite {
         let row = sqlx::query(&format!(
-            "SELECT state_value FROM {DISCOVERY_SYNC_STATE_TABLE} WHERE state_key = ?"
+            "SELECT COALESCE(state_value, sync_value) FROM {DISCOVERY_SYNC_STATE_TABLE} WHERE state_key = ? OR sync_key = ?"
         ))
+        .bind(DISCOVERY_CDN_CURSOR_KEY)
         .bind(DISCOVERY_CDN_CURSOR_KEY)
         .fetch_optional(sqlite.pool())
         .await?;
@@ -5160,7 +5211,7 @@ async fn read_sync_cursor(state: &AppState) -> Result<i64> {
     }
     if let Some(postgres) = &state.postgres {
         let row = sqlx::query(&format!(
-            "SELECT state_value FROM {DISCOVERY_SYNC_STATE_TABLE} WHERE state_key = $1"
+            "SELECT COALESCE(state_value, sync_value::text) FROM {DISCOVERY_SYNC_STATE_TABLE} WHERE state_key = $1 OR sync_key = $1"
         ))
         .bind(DISCOVERY_CDN_CURSOR_KEY)
         .fetch_optional(postgres.pool())
@@ -5183,12 +5234,18 @@ async fn write_sync_cursor(state: &AppState, cursor: i64) -> Result<()> {
     if let Some(sqlite) = &state.sqlite {
         sqlx::query(&format!(
             r#"
-            INSERT INTO {DISCOVERY_SYNC_STATE_TABLE}(state_key, state_value, updated_at)
-            VALUES (?, ?, ?)
+            INSERT INTO {DISCOVERY_SYNC_STATE_TABLE}(state_key, state_value, sync_key, sync_value, updated_at)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(state_key)
-            DO UPDATE SET state_value = excluded.state_value, updated_at = excluded.updated_at
+            DO UPDATE SET
+                state_value = excluded.state_value,
+                sync_key = excluded.sync_key,
+                sync_value = excluded.sync_value,
+                updated_at = excluded.updated_at
             "#
         ))
+        .bind(DISCOVERY_CDN_CURSOR_KEY)
+        .bind(cursor.to_string())
         .bind(DISCOVERY_CDN_CURSOR_KEY)
         .bind(cursor.to_string())
         .bind(&updated_at_text)
@@ -5199,10 +5256,14 @@ async fn write_sync_cursor(state: &AppState, cursor: i64) -> Result<()> {
     if let Some(postgres) = &state.postgres {
         sqlx::query(&format!(
             r#"
-            INSERT INTO {DISCOVERY_SYNC_STATE_TABLE}(state_key, state_value, updated_at)
-            VALUES ($1, $2, $3::timestamptz)
+            INSERT INTO {DISCOVERY_SYNC_STATE_TABLE}(state_key, state_value, sync_key, sync_value, updated_at)
+            VALUES ($1, $2, $1, $2::jsonb, $3::timestamptz)
             ON CONFLICT(state_key)
-            DO UPDATE SET state_value = excluded.state_value, updated_at = excluded.updated_at
+            DO UPDATE SET
+                state_value = excluded.state_value,
+                sync_key = excluded.sync_key,
+                sync_value = excluded.sync_value,
+                updated_at = excluded.updated_at
             "#
         ))
         .bind(DISCOVERY_CDN_CURSOR_KEY)
