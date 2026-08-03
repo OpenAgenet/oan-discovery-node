@@ -102,6 +102,26 @@ struct RejectedPackageBackfillRequest {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct ResolvedRejectedPackageCleanupRequest {
+    #[serde(rename = "dryRun", default = "default_true")]
+    dry_run: bool,
+    #[serde(rename = "maxItems", default)]
+    max_items: Option<usize>,
+    #[serde(rename = "resourceDids", default)]
+    resource_dids: Vec<String>,
+}
+
+impl Default for ResolvedRejectedPackageCleanupRequest {
+    fn default() -> Self {
+        Self {
+            dry_run: true,
+            max_items: None,
+            resource_dids: vec![],
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct IndexedResourceVisibilityRequest {
     #[serde(rename = "resourceDids")]
     resource_dids: Vec<String>,
@@ -167,6 +187,10 @@ struct PathConfig {
 
 fn default_debug_export_interval_ms() -> u64 {
     2_000
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -978,6 +1002,10 @@ async fn main() -> Result<()> {
             "/discovery/rejected-packages/backfill",
             post(api_backfill_rejected_packages),
         )
+        .route(
+            "/discovery/rejected-packages/resolved/audit",
+            post(api_audit_resolved_rejected_packages),
+        )
         .route("/discovery/capability-tree", get(api_capability_tree))
         .layer(build_cors_layer(&config.cors)?)
         .with_state(state.clone());
@@ -1092,20 +1120,6 @@ async fn initialize_discovery_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
                 package_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
-            ALTER TABLE {DISCOVERY_PACKAGE_TABLE}
-                ADD COLUMN IF NOT EXISTS resource_type TEXT NOT NULL DEFAULT '';
-            ALTER TABLE {DISCOVERY_PACKAGE_TABLE}
-                ADD COLUMN IF NOT EXISTS lifecycle_state TEXT NOT NULL DEFAULT '';
-            ALTER TABLE {DISCOVERY_PACKAGE_TABLE}
-                ADD COLUMN IF NOT EXISTS capability_tags TEXT NOT NULL DEFAULT '[]';
-            ALTER TABLE {DISCOVERY_PACKAGE_TABLE}
-                ADD COLUMN IF NOT EXISTS protocols TEXT NOT NULL DEFAULT '[]';
-            ALTER TABLE {DISCOVERY_PACKAGE_TABLE}
-                ADD COLUMN IF NOT EXISTS service_endpoints TEXT NOT NULL DEFAULT '[]';
-            ALTER TABLE {DISCOVERY_PACKAGE_TABLE}
-                ADD COLUMN IF NOT EXISTS tag_text TEXT NOT NULL DEFAULT '';
-            ALTER TABLE {DISCOVERY_PACKAGE_TABLE}
-                ADD COLUMN IF NOT EXISTS search_text TEXT NOT NULL DEFAULT '';
             CREATE TABLE IF NOT EXISTS {DISCOVERY_REJECTED_TABLE} (
                 reject_key TEXT PRIMARY KEY,
                 item_json TEXT NOT NULL,
@@ -1114,13 +1128,86 @@ async fn initialize_discovery_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
             "#
         ))
         .await?;
+    sqlite_add_column_if_missing(
+        sqlite,
+        DISCOVERY_PACKAGE_TABLE,
+        "resource_type",
+        "resource_type TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+    sqlite_add_column_if_missing(
+        sqlite,
+        DISCOVERY_PACKAGE_TABLE,
+        "lifecycle_state",
+        "lifecycle_state TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+    sqlite_add_column_if_missing(
+        sqlite,
+        DISCOVERY_PACKAGE_TABLE,
+        "capability_tags",
+        "capability_tags TEXT NOT NULL DEFAULT '[]'",
+    )
+    .await?;
+    sqlite_add_column_if_missing(
+        sqlite,
+        DISCOVERY_PACKAGE_TABLE,
+        "protocols",
+        "protocols TEXT NOT NULL DEFAULT '[]'",
+    )
+    .await?;
+    sqlite_add_column_if_missing(
+        sqlite,
+        DISCOVERY_PACKAGE_TABLE,
+        "service_endpoints",
+        "service_endpoints TEXT NOT NULL DEFAULT '[]'",
+    )
+    .await?;
+    sqlite_add_column_if_missing(
+        sqlite,
+        DISCOVERY_PACKAGE_TABLE,
+        "tag_text",
+        "tag_text TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+    sqlite_add_column_if_missing(
+        sqlite,
+        DISCOVERY_PACKAGE_TABLE,
+        "search_text",
+        "search_text TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+    sqlite_add_column_if_missing(
+        sqlite,
+        DISCOVERY_SYNC_STATE_TABLE,
+        "state_key",
+        "state_key TEXT",
+    )
+    .await?;
+    sqlite_add_column_if_missing(
+        sqlite,
+        DISCOVERY_SYNC_STATE_TABLE,
+        "state_value",
+        "state_value TEXT",
+    )
+    .await?;
+    sqlite_add_column_if_missing(
+        sqlite,
+        DISCOVERY_SYNC_STATE_TABLE,
+        "sync_key",
+        "sync_key TEXT",
+    )
+    .await?;
+    sqlite_add_column_if_missing(
+        sqlite,
+        DISCOVERY_SYNC_STATE_TABLE,
+        "sync_value",
+        "sync_value TEXT",
+    )
+    .await?;
     sqlite
         .execute_batch(&format!(
             r#"
-            ALTER TABLE {DISCOVERY_SYNC_STATE_TABLE} ADD COLUMN IF NOT EXISTS state_key TEXT;
-            ALTER TABLE {DISCOVERY_SYNC_STATE_TABLE} ADD COLUMN IF NOT EXISTS state_value TEXT;
-            ALTER TABLE {DISCOVERY_SYNC_STATE_TABLE} ADD COLUMN IF NOT EXISTS sync_key TEXT;
-            ALTER TABLE {DISCOVERY_SYNC_STATE_TABLE} ADD COLUMN IF NOT EXISTS sync_value TEXT;
             UPDATE {DISCOVERY_SYNC_STATE_TABLE}
             SET state_key = COALESCE(state_key, sync_key),
                 state_value = COALESCE(state_value, sync_value),
@@ -1133,6 +1220,27 @@ async fn initialize_discovery_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
             "#
         ))
         .await?;
+    Ok(())
+}
+
+async fn sqlite_add_column_if_missing(
+    sqlite: &SqliteJsonStore,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let escaped_table = table.replace('\'', "''");
+    let rows = sqlx::query(&format!("PRAGMA table_info('{escaped_table}')"))
+        .fetch_all(sqlite.pool())
+        .await?;
+    let exists = rows
+        .iter()
+        .any(|row| row.get::<String, _>("name") == column);
+    if !exists {
+        sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {definition}"))
+            .execute(sqlite.pool())
+            .await?;
+    }
     Ok(())
 }
 
@@ -2447,6 +2555,16 @@ async fn sync_resources_from_cdn_items(
         accepted.push((item.publication_cursor, package));
     }
 
+    let accepted_dids = accepted
+        .iter()
+        .map(|(_, package)| package.resource_did.as_str())
+        .collect::<HashSet<_>>();
+    rejected.retain(|item| !accepted_dids.contains(rejected_package_resource_did(item)));
+    blocked_cursor = rejected
+        .iter()
+        .filter_map(|item| item.get("cursor").and_then(Value::as_i64))
+        .min();
+
     let synced = accepted.len();
     upsert_indexed_resource_packages_batch(&state, &accepted)
         .await
@@ -3217,6 +3335,16 @@ async fn api_backfill_rejected_packages(
         .map_err(ApiError::internal)
 }
 
+async fn api_audit_resolved_rejected_packages(
+    State(state): State<AppState>,
+    Json(request): Json<ResolvedRejectedPackageCleanupRequest>,
+) -> ApiResult<Value> {
+    audit_resolved_rejected_packages(&state, request)
+        .await
+        .map(Json)
+        .map_err(ApiError::internal)
+}
+
 async fn backfill_rejected_resource_packages(
     state: &AppState,
     cdn_base: &str,
@@ -3322,6 +3450,80 @@ async fn backfill_rejected_resource_packages(
     }))
 }
 
+async fn audit_resolved_rejected_packages(
+    state: &AppState,
+    request: ResolvedRejectedPackageCleanupRequest,
+) -> Result<Value> {
+    let max_items = request.max_items.unwrap_or(1_000).max(1);
+    let requested_dids = request.resource_dids.into_iter().collect::<BTreeSet<_>>();
+    let discovery_domains = local_discovery_authorized_domains(state)?;
+    let visible_dids = read_indexed_resource_packages(state)
+        .await?
+        .into_iter()
+        .filter(|package| {
+            package.metadata.lifecycle_state == "active"
+                && is_user_consumable_resource_type(&package.resource_type)
+                && authorized_domains_cover(&discovery_domains, &package.metadata.authorized_domains)
+        })
+        .map(|package| package.resource_did)
+        .collect::<HashSet<_>>();
+    let rejected = read_rejected_packages(state).await?;
+    let mut resolved = Vec::new();
+    let mut reject_keys = Vec::new();
+
+    for item in rejected.iter() {
+        if resolved.len() >= max_items {
+            break;
+        }
+        let reason = item
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !is_resolvable_historical_reject_reason(reason) {
+            continue;
+        }
+        let resource_did = rejected_package_resource_did(item);
+        if resource_did.is_empty()
+            || !visible_dids.contains(resource_did)
+            || (!requested_dids.is_empty() && !requested_dids.contains(resource_did))
+        {
+            continue;
+        }
+        resolved.push(json!({
+            "resourceDid": resource_did,
+            "cursor": item.get("cursor").cloned().unwrap_or(Value::Null),
+            "reason": reason,
+            "rejectKey": rejected_package_key(item)
+        }));
+        reject_keys.push(rejected_package_key(item));
+    }
+
+    if !request.dry_run {
+        delete_rejected_packages(state, &reject_keys).await?;
+    }
+
+    Ok(json!({
+        "status": if request.dry_run { "audited" } else { "cleaned" },
+        "dryRun": request.dry_run,
+        "resolvedRejectedCount": resolved.len(),
+        "deletedCount": if request.dry_run { 0 } else { reject_keys.len() },
+        "reasons": resolvable_historical_reject_reasons(),
+        "items": resolved
+    }))
+}
+
+fn resolvable_historical_reject_reasons() -> &'static [&'static str] {
+    &[
+        "package_version_mismatch",
+        "capability_tags_mismatch",
+        "package_hash_mismatch",
+    ]
+}
+
+fn is_resolvable_historical_reject_reason(reason: &str) -> bool {
+    resolvable_historical_reject_reasons().contains(&reason)
+}
+
 async fn api_capability_tree(State(state): State<AppState>) -> ApiResult<Value> {
     let response = state
         .client
@@ -3401,6 +3603,10 @@ async fn upsert_indexed_resource_packages_batch(
         return Ok(());
     }
     let packages = latest_resource_packages_by_did(packages);
+    let accepted_dids = packages
+        .iter()
+        .map(|(_, package)| package.resource_did.clone())
+        .collect::<Vec<_>>();
     let updated_at = Utc::now();
     let updated_at_text = updated_at.to_rfc3339();
     if let Some(sqlite) = &state.sqlite {
@@ -3443,6 +3649,7 @@ async fn upsert_indexed_resource_packages_batch(
             builder.build().execute(&mut *tx).await?;
         }
         tx.commit().await?;
+        delete_rejected_packages_by_did(state, &accepted_dids).await?;
         return Ok(());
     }
     if let Some(postgres) = &state.postgres {
@@ -3502,6 +3709,7 @@ async fn upsert_indexed_resource_packages_batch(
             builder.build().execute(&mut *tx).await?;
         }
         tx.commit().await?;
+        delete_rejected_packages_by_did(state, &accepted_dids).await?;
         if semantic_search_available(state) {
             if let Err(err) =
                 upsert_semantic_index_batch(state, &projected, SemanticRebuildStage::Both).await
@@ -3517,6 +3725,7 @@ async fn upsert_indexed_resource_packages_batch(
         indexed.push(package.clone());
     }
     state.index.write("resource-capabilities.json", &indexed)?;
+    delete_rejected_packages_by_did(state, &accepted_dids).await?;
     Ok(())
 }
 
@@ -3963,8 +4172,25 @@ async fn rebuild_semantic_indexes(
             }
         }
     }
+    let final_phase = if skipped_packages == 0 {
+        "completed"
+    } else {
+        "completed-with-skips"
+    };
+    store_semantic_rebuild_progress(
+        state,
+        stage,
+        final_phase,
+        last_cursor,
+        index,
+        visible.len(),
+        skipped_packages,
+        retries,
+        batch_size,
+    )
+    .await?;
     Ok(SemanticRebuildReport {
-        phase: if skipped_packages == 0 { "completed".to_owned() } else { "completed-with-skips".to_owned() },
+        phase: final_phase.to_owned(),
         stage: stage.as_str().to_owned(),
         backend: discovery_backend_name(state),
         semantic_enabled: true,
@@ -5332,12 +5558,60 @@ async fn write_rejected_packages(state: &AppState, rejected: &[Value]) -> Result
 fn rejected_package_key(item: &Value) -> String {
     format!(
         "{}:{}",
-        item["resourceDid"]
-            .as_str()
-            .or_else(|| item["did"].as_str())
-            .unwrap_or("unknown"),
+        rejected_package_resource_did(item),
         item["cursor"].as_i64().unwrap_or_default()
     )
+}
+
+fn rejected_package_resource_did(item: &Value) -> &str {
+    item["resourceDid"]
+        .as_str()
+        .or_else(|| item["did"].as_str())
+        .unwrap_or("unknown")
+}
+
+async fn delete_rejected_packages_by_did(state: &AppState, resource_dids: &[String]) -> Result<()> {
+    if resource_dids.is_empty() {
+        return Ok(());
+    }
+    if let Some(sqlite) = &state.sqlite {
+        let mut tx = sqlite.pool().begin().await?;
+        for resource_did in resource_dids {
+            sqlx::query(&format!(
+                "DELETE FROM {DISCOVERY_REJECTED_TABLE} WHERE json_extract(item_json, '$.resourceDid') = ? OR json_extract(item_json, '$.did') = ?"
+            ))
+            .bind(resource_did)
+            .bind(resource_did)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        return Ok(());
+    }
+    if let Some(postgres) = &state.postgres {
+        let mut tx = postgres.pool().begin().await?;
+        for resource_did in resource_dids {
+            sqlx::query(&format!(
+                "DELETE FROM {DISCOVERY_REJECTED_TABLE} WHERE item_json->>'resourceDid' = $1 OR item_json->>'did' = $1"
+            ))
+            .bind(resource_did)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        return Ok(());
+    }
+    let dids = resource_dids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let rejected = read_rejected_packages(state)
+        .await?
+        .into_iter()
+        .filter(|item| !dids.contains(rejected_package_resource_did(item)))
+        .collect::<Vec<_>>();
+    state.index.write("rejected-packages.json", &rejected)?;
+    Ok(())
 }
 
 async fn delete_rejected_packages(state: &AppState, reject_keys: &[String]) -> Result<()> {
@@ -6204,7 +6478,10 @@ mod tests {
         };
         let hits = rank_resource_packages_semantically(vec![weather, contract.clone()], &query);
 
-        assert_eq!(hits.first().map(|hit| &hit.package.resource_did), Some(&contract.resource_did));
+        assert_eq!(
+            hits.first().map(|hit| &hit.package.resource_did),
+            Some(&contract.resource_did)
+        );
         assert!(hits.first().map(|hit| hit.tag_score).unwrap_or(0.0) > 0.0);
     }
 
@@ -6379,18 +6656,13 @@ mod tests {
         .await
         .unwrap();
 
-        let context = load_semantic_rebuild_skip_records(
-            &state,
-            Some(SemanticRebuildStage::Context),
-        )
-        .await
-        .unwrap();
-        let intent = load_semantic_rebuild_skip_records(
-            &state,
-            Some(SemanticRebuildStage::Intent),
-        )
-        .await
-        .unwrap();
+        let context =
+            load_semantic_rebuild_skip_records(&state, Some(SemanticRebuildStage::Context))
+                .await
+                .unwrap();
+        let intent = load_semantic_rebuild_skip_records(&state, Some(SemanticRebuildStage::Intent))
+            .await
+            .unwrap();
 
         assert_eq!(context.len(), 1);
         assert_eq!(context[0].stage, "context");
@@ -6407,18 +6679,14 @@ mod tests {
         .await
         .unwrap();
 
-        let context_after = load_semantic_rebuild_skip_records(
-            &state,
-            Some(SemanticRebuildStage::Context),
-        )
-        .await
-        .unwrap();
-        let intent_after = load_semantic_rebuild_skip_records(
-            &state,
-            Some(SemanticRebuildStage::Intent),
-        )
-        .await
-        .unwrap();
+        let context_after =
+            load_semantic_rebuild_skip_records(&state, Some(SemanticRebuildStage::Context))
+                .await
+                .unwrap();
+        let intent_after =
+            load_semantic_rebuild_skip_records(&state, Some(SemanticRebuildStage::Intent))
+                .await
+                .unwrap();
 
         assert!(context_after.is_empty());
         assert_eq!(intent_after.len(), 1);
@@ -6703,6 +6971,151 @@ mod tests {
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].package_version, "1.1.0");
         assert_eq!(packages[0].metadata.description, "newer package");
+    }
+
+    #[tokio::test]
+    async fn accepted_package_upsert_clears_old_rejections_for_same_did() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let package = sample_resource_package();
+        write_rejected_packages(
+            &state,
+            &[
+                json!({
+                    "resourceDid": package.resource_did,
+                    "cursor": 7,
+                    "reason": "package_version_mismatch"
+                }),
+                json!({
+                    "resourceDid": "did:oan:SKLG:other",
+                    "cursor": 8,
+                    "reason": "package_hash_mismatch"
+                }),
+            ],
+        )
+        .await
+        .unwrap();
+
+        upsert_indexed_resource_package(&state, 9, &package)
+            .await
+            .unwrap();
+
+        let rejected = read_rejected_packages(&state).await.unwrap();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0]["resourceDid"], "did:oan:SKLG:other");
+    }
+
+    #[tokio::test]
+    async fn resolved_historical_rejection_audit_is_dry_run_by_default() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let package = sample_resource_package();
+        upsert_indexed_resource_package(&state, 9, &package)
+            .await
+            .unwrap();
+        write_rejected_packages(
+            &state,
+            &[json!({
+                "resourceDid": package.resource_did,
+                "cursor": 7,
+                "reason": "package_hash_mismatch"
+            })],
+        )
+        .await
+        .unwrap();
+
+        let report = audit_resolved_rejected_packages(
+            &state,
+            ResolvedRejectedPackageCleanupRequest::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report["status"], "audited");
+        assert_eq!(report["resolvedRejectedCount"], 1);
+        assert_eq!(report["deletedCount"], 0);
+        assert_eq!(read_rejected_packages(&state).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolved_historical_rejection_cleanup_deletes_only_visible_mismatches() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let package = sample_resource_package();
+        upsert_indexed_resource_package(&state, 9, &package)
+            .await
+            .unwrap();
+        write_rejected_packages(
+            &state,
+            &[
+                json!({
+                    "resourceDid": package.resource_did,
+                    "cursor": 7,
+                    "reason": "capability_tags_mismatch"
+                }),
+                json!({
+                    "resourceDid": package.resource_did,
+                    "cursor": 8,
+                    "reason": "unauthorized_domains"
+                }),
+                json!({
+                    "resourceDid": "did:oan:SKLG:not-visible",
+                    "cursor": 9,
+                    "reason": "package_version_mismatch"
+                }),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let report = audit_resolved_rejected_packages(
+            &state,
+            ResolvedRejectedPackageCleanupRequest {
+                dry_run: false,
+                max_items: None,
+                resource_dids: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report["status"], "cleaned");
+        assert_eq!(report["deletedCount"], 1);
+        let rejected = read_rejected_packages(&state).await.unwrap();
+        assert_eq!(rejected.len(), 2);
+        assert!(rejected
+            .iter()
+            .any(|item| item["reason"] == "unauthorized_domains"));
+        assert!(rejected
+            .iter()
+            .any(|item| item["resourceDid"] == "did:oan:SKLG:not-visible"));
+    }
+
+    #[tokio::test]
+    async fn postgres_semantic_rebuild_persists_completed_phase_when_available() {
+        let dir = tempdir().unwrap();
+        let Some(state) = app_state_with_semantic_postgres(dir.path()).await else {
+            eprintln!(
+                "skipping pgvector semantic rebuild progress test; set OAN_DISCOVERY_SEMANTIC_TEST_DATABASE_URL"
+            );
+            return;
+        };
+        upsert_indexed_resource_package(&state, 1, &sample_resource_package())
+            .await
+            .unwrap();
+
+        let report = rebuild_semantic_indexes(&state, true, SemanticRebuildStage::Both)
+            .await
+            .unwrap();
+        let progress = load_semantic_rebuild_progress(&state, SemanticRebuildStage::Both)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(report.phase, "completed");
+        assert_eq!(progress.phase, "completed");
+        assert_eq!(progress.processed, report.package_count);
+        assert_eq!(progress.total, report.package_count);
     }
 
     #[tokio::test]
@@ -7462,6 +7875,70 @@ mod tests {
         assert_eq!(indexed.len(), 1);
         assert_eq!(indexed[0].resource_did, package.resource_did);
         assert_eq!(indexed[0].package_version, package.package_version);
+    }
+
+    #[tokio::test]
+    async fn sync_resources_from_authorized_summary_drops_same_batch_rejection_for_accepted_did() {
+        let dir = tempdir().unwrap();
+        let package = sample_resource_package();
+        let app = Router::new().route(
+            "/cdn/resources/{*did}",
+            get({
+                let package = package.clone();
+                move || {
+                    let package = package.clone();
+                    async move { Json(package) }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut state = app_state_with_sqlite(dir.path()).await;
+        state.config.upstream.cdn_endpoint = Some(format!("http://{addr}"));
+        let response = sync_resources_from_authorized_summary(
+            State(state.clone()),
+            Json(DiscoverySyncRequest {
+                max_publications: Some(10),
+                cursor_hint: Some(9),
+                items: vec![
+                    DiscoveryNotificationItem {
+                        resource_did: package.resource_did.clone(),
+                        package_version: package.package_version.clone(),
+                        publication_cursor: 8,
+                        package_hash: package.package_hash.clone(),
+                        metadata_hash: package.metadata_hash.clone(),
+                        did_document_hash: package.did_document_hash.clone(),
+                        resource_type: Some("skill".to_owned()),
+                        capability_tags: vec!["stale-tag".to_owned()],
+                        authorized_domains: package.metadata.authorized_domains.clone(),
+                    },
+                    DiscoveryNotificationItem {
+                        resource_did: package.resource_did.clone(),
+                        package_version: package.package_version.clone(),
+                        publication_cursor: 9,
+                        package_hash: package.package_hash.clone(),
+                        metadata_hash: package.metadata_hash.clone(),
+                        did_document_hash: package.did_document_hash.clone(),
+                        resource_type: Some("skill".to_owned()),
+                        capability_tags: package.metadata.capability_tags.clone(),
+                        authorized_domains: package.metadata.authorized_domains.clone(),
+                    },
+                ],
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0["syncedResourceCount"], 1);
+        assert_eq!(response.0["rejectedCount"], 0);
+        assert!(read_rejected_packages(&state).await.unwrap().is_empty());
+        let indexed = read_indexed_resource_packages(&state).await.unwrap();
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].resource_did, package.resource_did);
     }
 
     #[tokio::test]
