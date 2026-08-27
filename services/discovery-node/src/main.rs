@@ -12,7 +12,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use jieba_rs::Jieba;
 use oan_core::{
     CryptoSuite, DidDocument, ImplementationLink, OanMetadata, ProtocolBinding,
@@ -36,6 +36,7 @@ use sqlx::{Postgres, QueryBuilder, Row, Sqlite};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env,
+    fs,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
@@ -52,6 +53,7 @@ const DISCOVERY_SEMANTIC_INDEX_TABLE: &str = "discovery_semantic_index";
 const DISCOVERY_INTENT_INDEX_TABLE: &str = "discovery_intent_index";
 const DISCOVERY_INDEX_STATS_CACHE_TTL_MS: u64 = 500;
 const DISCOVERY_CDN_CURSOR_KEY: &str = "cdn_publication_cursor";
+const DISCOVERY_QUERY_STATS_TABLE: &str = "discovery_query_stats";
 const DEFAULT_SEMANTIC_DIMENSION: usize = 64;
 const SEMANTIC_ALIASES_JSON: &str = include_str!("semantic_aliases.v1.json");
 
@@ -985,6 +987,7 @@ async fn main() -> Result<()> {
         )
         .route("/discovery/sync/history", get(api_sync_history))
         .route("/discovery/index/stats", get(api_index_stats))
+        .route("/discovery/query/stats", get(api_query_stats))
         .route("/discovery/index/resources", get(api_index_resources))
         .route(
             "/discovery/index/resources/visibility",
@@ -1123,6 +1126,11 @@ async fn initialize_discovery_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
             CREATE TABLE IF NOT EXISTS {DISCOVERY_REJECTED_TABLE} (
                 reject_key TEXT PRIMARY KEY,
                 item_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS {DISCOVERY_QUERY_STATS_TABLE} (
+                stat_date TEXT PRIMARY KEY,
+                query_count INTEGER NOT NULL,
                 updated_at TEXT NOT NULL
             );
             "#
@@ -1305,6 +1313,11 @@ async fn initialize_discovery_postgres(postgres: &PostgresJsonStore) -> Result<(
             CREATE TABLE IF NOT EXISTS {DISCOVERY_REJECTED_TABLE} (
                 reject_key TEXT PRIMARY KEY,
                 item_json JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS {DISCOVERY_QUERY_STATS_TABLE} (
+                stat_date TEXT PRIMARY KEY,
+                query_count BIGINT NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_discovery_packages_cursor
@@ -2713,6 +2726,9 @@ async fn resource_query(
     Json(query): Json<ResourceDiscoveryQuery>,
 ) -> ApiResult<ResourceDiscoveryResponse> {
     let started = Instant::now();
+    record_discovery_query_stat(&state)
+        .await
+        .map_err(ApiError::internal)?;
     if let Some(resource_did) = query_resource_did(&query) {
         let package = read_indexed_resource_package(&state, resource_did)
             .await
@@ -2817,6 +2833,38 @@ async fn resource_query(
         created_at: Utc::now(),
         proof: None,
     }))
+}
+
+async fn api_query_stats(State(state): State<AppState>) -> ApiResult<Value> {
+    let today = Utc::now().date_naive();
+    let week_start = today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64);
+    let month_start = today.with_day(1).unwrap_or(today);
+    let records = read_discovery_query_stats(&state)
+        .await
+        .map_err(ApiError::internal)?;
+    let mut today_count = 0i64;
+    let mut week_count = 0i64;
+    let mut month_count = 0i64;
+    for record in records {
+        let Ok(stat_date) = chrono::NaiveDate::parse_from_str(&record.stat_date, "%Y-%m-%d") else {
+            continue;
+        };
+        if stat_date == today {
+            today_count += record.query_count;
+        }
+        if stat_date >= week_start {
+            week_count += record.query_count;
+        }
+        if stat_date >= month_start {
+            month_count += record.query_count;
+        }
+    }
+    Ok(Json(json!({
+        "discoveryDid": state.did,
+        "todayQueryCount": today_count,
+        "weekQueryCount": week_count,
+        "monthQueryCount": month_count
+    })))
 }
 
 async fn run_resource_query(
@@ -5422,6 +5470,117 @@ async fn write_sync_history_store(state: &AppState, item: Value) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DiscoveryQueryStatRecord {
+    #[serde(rename = "statDate")]
+    stat_date: String,
+    #[serde(rename = "queryCount")]
+    query_count: i64,
+    #[serde(rename = "updatedAt")]
+    updated_at: String,
+}
+
+async fn record_discovery_query_stat(state: &AppState) -> Result<()> {
+    let today = Utc::now().date_naive().to_string();
+    let updated_at = Utc::now();
+    if let Some(sqlite) = &state.sqlite {
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {DISCOVERY_QUERY_STATS_TABLE}(stat_date, query_count, updated_at)
+            VALUES (?1, 1, ?2)
+            ON CONFLICT(stat_date)
+            DO UPDATE SET query_count = query_count + 1, updated_at = excluded.updated_at
+            "#
+        ))
+        .bind(&today)
+        .bind(updated_at.to_rfc3339())
+        .execute(sqlite.pool())
+        .await?;
+        return Ok(());
+    }
+    if let Some(postgres) = &state.postgres {
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {DISCOVERY_QUERY_STATS_TABLE}(stat_date, query_count, updated_at)
+            VALUES ($1, 1, $2)
+            ON CONFLICT(stat_date)
+            DO UPDATE SET query_count = {DISCOVERY_QUERY_STATS_TABLE}.query_count + 1, updated_at = excluded.updated_at
+            "#
+        ))
+        .bind(&today)
+        .bind(updated_at)
+        .execute(postgres.pool())
+        .await?;
+        return Ok(());
+    }
+    let path = Path::new("query-stats").join(format!("{today}.json"));
+    let mut record = state.data.read::<DiscoveryQueryStatRecord>(&path).unwrap_or(DiscoveryQueryStatRecord {
+        stat_date: today.clone(),
+        query_count: 0,
+        updated_at: String::new(),
+    });
+    record.query_count += 1;
+    record.updated_at = updated_at.to_rfc3339();
+    state.data.write(path, &record)?;
+    Ok(())
+}
+
+async fn read_discovery_query_stats(state: &AppState) -> Result<Vec<DiscoveryQueryStatRecord>> {
+    if let Some(sqlite) = &state.sqlite {
+        let rows = sqlx::query_as::<_, (String, i64, String)>(
+            &format!(
+                "SELECT stat_date, query_count, updated_at::text FROM {DISCOVERY_QUERY_STATS_TABLE}"
+            ),
+        )
+        .fetch_all(sqlite.pool())
+        .await?;
+        return Ok(rows
+            .into_iter()
+            .map(|(stat_date, query_count, updated_at)| DiscoveryQueryStatRecord {
+                stat_date,
+                query_count,
+                updated_at,
+            })
+            .collect());
+    }
+    if let Some(postgres) = &state.postgres {
+        let rows = sqlx::query_as::<_, (String, i64, String)>(
+            &format!(
+                "SELECT stat_date, query_count, updated_at::text FROM {DISCOVERY_QUERY_STATS_TABLE}"
+            ),
+        )
+        .fetch_all(postgres.pool())
+        .await?;
+        return Ok(rows
+            .into_iter()
+            .map(|(stat_date, query_count, updated_at)| DiscoveryQueryStatRecord {
+                stat_date,
+                query_count,
+                updated_at,
+            })
+            .collect());
+    }
+    let mut records = Vec::new();
+    let dir = state.data.root().join("query-stats");
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(records),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(state.data.root()) else {
+            continue;
+        };
+        if let Ok(record) = state.data.read(relative) {
+            records.push(record);
+        }
+    }
+    Ok(records)
+}
+
 async fn read_sync_cursor(state: &AppState) -> Result<i64> {
     if let Some(sqlite) = &state.sqlite {
         let row = sqlx::query(&format!(
@@ -5437,7 +5596,7 @@ async fn read_sync_cursor(state: &AppState) -> Result<i64> {
     }
     if let Some(postgres) = &state.postgres {
         let row = sqlx::query(&format!(
-            "SELECT COALESCE(state_value, sync_value::text) FROM {DISCOVERY_SYNC_STATE_TABLE} WHERE state_key = $1 OR sync_key = $1"
+            "SELECT COALESCE(state_value::text, sync_value::text) FROM {DISCOVERY_SYNC_STATE_TABLE} WHERE state_key = $1 OR sync_key = $1"
         ))
         .bind(DISCOVERY_CDN_CURSOR_KEY)
         .fetch_optional(postgres.pool())
@@ -5483,7 +5642,7 @@ async fn write_sync_cursor(state: &AppState, cursor: i64) -> Result<()> {
         sqlx::query(&format!(
             r#"
             INSERT INTO {DISCOVERY_SYNC_STATE_TABLE}(state_key, state_value, sync_key, sync_value, updated_at)
-            VALUES ($1, $2, $1, $2::jsonb, $3::timestamptz)
+            VALUES ($1, $2::jsonb, $1, $2::jsonb, $3::timestamptz)
             ON CONFLICT(state_key)
             DO UPDATE SET
                 state_value = excluded.state_value,
