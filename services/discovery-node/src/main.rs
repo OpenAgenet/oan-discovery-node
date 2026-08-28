@@ -1019,6 +1019,12 @@ async fn main() -> Result<()> {
             discovery_debug_export_loop(debug_state).await;
         });
     }
+    if state.postgres.is_some() && semantic_search_available(&state) {
+        let semantic_state = state.clone();
+        tokio::spawn(async move {
+            semantic_index_compensation_loop(semantic_state).await;
+        });
+    }
 
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
     println!("discovery-node listening on http://{addr}");
@@ -3759,8 +3765,12 @@ async fn upsert_indexed_resource_packages_batch(
         tx.commit().await?;
         delete_rejected_packages_by_did(state, &accepted_dids).await?;
         if semantic_search_available(state) {
-            if let Err(err) =
-                upsert_semantic_index_batch(state, &projected, SemanticRebuildStage::Both).await
+            if let Err(err) = upsert_semantic_index_batch_with_retries(
+                state,
+                &projected,
+                SemanticRebuildStage::Both,
+            )
+            .await
             {
                 eprintln!("semantic index upsert failed: {err}");
             }
@@ -3801,6 +3811,88 @@ async fn upsert_semantic_index_batch(
 ) -> Result<()> {
     let engine = DiscoverySearchEngine::from_config(&state.config.semantic_search)?;
     engine.upsert_batch(state, projected, stage).await
+}
+
+async fn upsert_semantic_index_batch_with_retries(
+    state: &AppState,
+    projected: &[DiscoveryProjectedPackage<'_>],
+    stage: SemanticRebuildStage,
+) -> Result<()> {
+    if projected.is_empty() {
+        return Ok(());
+    }
+    match upsert_semantic_index_batch(state, projected, stage).await {
+        Ok(()) => {
+            for item in projected {
+                clear_semantic_rebuild_skip_record(state, stage, &item.package.resource_did)
+                    .await?;
+            }
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("semantic index batch upsert failed: {err}; retrying individually");
+            let mut failed = 0usize;
+            for item in projected {
+                match upsert_semantic_index_batch(state, std::slice::from_ref(item), stage).await {
+                    Ok(()) => {
+                        clear_semantic_rebuild_skip_record(
+                            state,
+                            stage,
+                            &item.package.resource_did,
+                        )
+                        .await?;
+                    }
+                    Err(item_err) => {
+                        failed += 1;
+                        store_semantic_rebuild_skip(
+                            state,
+                            stage,
+                            item.cursor,
+                            item.package.resource_did.clone(),
+                            item_err.to_string(),
+                        )
+                        .await?;
+                    }
+                }
+            }
+            if failed > 0 {
+                eprintln!("semantic index single-item retries recorded {failed} skipped packages");
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn semantic_index_compensation_loop(state: AppState) {
+    sleep(TokioDuration::from_secs(60)).await;
+    loop {
+        if let Err(err) = compensate_semantic_indexes(&state).await {
+            eprintln!("semantic index compensation failed: {err}");
+        }
+        sleep(TokioDuration::from_secs(300)).await;
+    }
+}
+
+async fn compensate_semantic_indexes(state: &AppState) -> Result<()> {
+    if state.postgres.is_none() || !semantic_search_available(state) {
+        return Ok(());
+    }
+    let _sync_guard = state.resource_sync_lock.lock().await;
+    backfill_skipped_semantic_indexes(state, SemanticRebuildStage::Both).await?;
+    let pending = read_semantic_index_pending_packages(state, 100).await?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let projected = pending
+        .iter()
+        .map(|(cursor, package)| DiscoveryProjectedPackage {
+            cursor: *cursor,
+            package,
+            package_json: serde_json::to_value(package).unwrap_or_else(|_| json!({})),
+            projection: discovery_package_projection(package),
+        })
+        .collect::<Vec<_>>();
+    upsert_semantic_index_batch_with_retries(state, &projected, SemanticRebuildStage::Both).await
 }
 
 async fn upsert_pgvector_semantic_index_batch(
@@ -4056,6 +4148,51 @@ async fn count_intent_indexed_rows(state: &AppState) -> Result<Option<i64>> {
     .fetch_one(postgres.pool())
     .await?;
     Ok(Some(row.get::<i64, _>(0)))
+}
+
+async fn read_semantic_index_pending_packages(
+    state: &AppState,
+    limit: i64,
+) -> Result<Vec<(i64, ResourcePackage)>> {
+    let Some(postgres) = &state.postgres else {
+        return Ok(vec![]);
+    };
+    if !state.semantic.enabled {
+        return Ok(vec![]);
+    }
+    let rows = sqlx::query(&format!(
+        r#"
+        SELECT p.cursor, p.package_json::text, s.semantic_source_hash
+        FROM {DISCOVERY_PACKAGE_TABLE} p
+        LEFT JOIN {DISCOVERY_SEMANTIC_INDEX_TABLE} s
+          ON p.resource_did = s.resource_did
+         AND s.embedding_model = $1
+         AND s.embedding_version = $2
+        WHERE p.lifecycle_state = 'active'
+          AND p.resource_type = ANY($3)
+        ORDER BY p.cursor, p.resource_did
+        "#
+    ))
+    .bind(&state.semantic.embedding_model)
+    .bind(&state.semantic.embedding_version)
+    .bind(default_discoverable_resource_type_names())
+    .fetch_all(postgres.pool())
+    .await?;
+    let mut pending = Vec::new();
+    for row in rows {
+        let cursor = row.get::<i64, _>(0);
+        let package = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?;
+        let projection = discovery_package_projection(&package);
+        let doc = search_document_from_package(cursor, &package, &projection);
+        let indexed_hash = row.get::<Option<String>, _>(2);
+        if indexed_hash.as_deref() != Some(doc.semantic_source_hash.as_str()) {
+            pending.push((cursor, package));
+            if pending.len() >= limit.max(1) as usize {
+                break;
+            }
+        }
+    }
+    Ok(pending)
 }
 
 async fn clear_semantic_indexes_for_current_model(
