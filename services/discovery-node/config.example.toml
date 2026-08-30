@@ -26,6 +26,13 @@ index_dir = "../../data/discovery/index"
 database_url = "postgres://postgres:postgres@127.0.0.1:5432/oan_discovery"
 keys_dir = "../../data/discovery/keys"
 
+[stats_report]
+enabled = false
+node_id = "discovery-official"
+endpoint = "http://localhost:8787/api/internal/node-stats/report"
+token = "change-me"
+interval_seconds = 60
+
 [semanticSearch]
 enabled = false
 engine = "pgvector"

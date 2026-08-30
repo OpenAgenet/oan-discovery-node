@@ -35,8 +35,7 @@ use serde_json::{json, Value};
 use sqlx::{Postgres, QueryBuilder, Row, Sqlite};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    env,
-    fs,
+    env, fs,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
@@ -136,6 +135,8 @@ struct Config {
     cors: CorsConfig,
     #[serde(default)]
     debug: DebugConfig,
+    #[serde(default)]
+    stats_report: StatsReportConfig,
     #[serde(default, rename = "semanticSearch")]
     semantic_search: SemanticSearchConfig,
     upstream: UpstreamConfig,
@@ -187,8 +188,38 @@ struct PathConfig {
     database_url: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct StatsReportConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default = "default_stats_report_interval_seconds")]
+    interval_seconds: u64,
+}
+
+impl Default for StatsReportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            node_id: None,
+            endpoint: None,
+            token: None,
+            interval_seconds: default_stats_report_interval_seconds(),
+        }
+    }
+}
+
 fn default_debug_export_interval_ms() -> u64 {
     2_000
+}
+
+fn default_stats_report_interval_seconds() -> u64 {
+    60
 }
 
 fn default_true() -> bool {
@@ -972,6 +1003,7 @@ async fn main() -> Result<()> {
         .cloned()
         .unwrap_or_else(|| "services/discovery-node/config.example.toml".to_owned());
     let config = load_config(config_path)?;
+    validate_stats_report_config(&config.stats_report)?;
     let state = build_app_state(config.clone()).await?;
 
     let app = Router::new()
@@ -1023,6 +1055,12 @@ async fn main() -> Result<()> {
         let semantic_state = state.clone();
         tokio::spawn(async move {
             semantic_index_compensation_loop(semantic_state).await;
+        });
+    }
+    if state.config.stats_report.enabled {
+        let report_state = state.clone();
+        tokio::spawn(async move {
+            discovery_stats_report_loop(report_state).await;
         });
     }
 
@@ -1102,6 +1140,39 @@ fn load_config(path: String) -> Result<Config> {
         *database_url = resolve_database_url(base, database_url);
     }
     Ok(config)
+}
+
+fn validate_stats_report_config(config: &StatsReportConfig) -> Result<()> {
+    if !config.enabled {
+        return Ok(());
+    }
+    if config
+        .node_id
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(anyhow!("stats_report.node_id is required when enabled"));
+    }
+    if config
+        .endpoint
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(anyhow!("stats_report.endpoint is required when enabled"));
+    }
+    if config
+        .token
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(anyhow!("stats_report.token is required when enabled"));
+    }
+    if config.interval_seconds == 0 {
+        return Err(anyhow!(
+            "stats_report.interval_seconds must be greater than 0"
+        ));
+    }
+    Ok(())
 }
 
 async fn initialize_discovery_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
@@ -2218,7 +2289,8 @@ fn semantic_resource_scores(
 ) -> SemanticQueryHit {
     let projection = discovery_package_projection(package);
     let doc = search_document_from_package(0, package, &projection);
-    let tag_score = weighted_token_similarity(&query_projection.expanded_tokens, &semantic_tag_text(&doc));
+    let tag_score =
+        weighted_token_similarity(&query_projection.expanded_tokens, &semantic_tag_text(&doc));
     let context_score = weighted_token_similarity(
         &query_projection.expanded_tokens,
         &semantic_context_text(&doc),
@@ -2240,8 +2312,10 @@ fn semantic_resource_scores(
         let tag_bonus = if tag_score > 0.0 { 0.04 } else { 0.0 };
         (0.34, 0.16, tag_bonus)
     };
-    let semantic_score =
-        (0.30 * bm25_score) + (tag_weight * tag_score) + (context_weight * context_score) + (0.20 * intent_score);
+    let semantic_score = (0.30 * bm25_score)
+        + (tag_weight * tag_score)
+        + (context_weight * context_score)
+        + (0.20 * intent_score);
     let final_score = (semantic_score + structured_score + tag_bonus).clamp(0.0, 1.0);
     SemanticQueryHit {
         package: package.clone(),
@@ -2842,12 +2916,18 @@ async fn resource_query(
 }
 
 async fn api_query_stats(State(state): State<AppState>) -> ApiResult<Value> {
-    let today = Utc::now().date_naive();
+    discovery_query_stats_body(&state)
+        .await
+        .map(Json)
+        .map_err(ApiError::internal)
+}
+
+async fn discovery_query_stats_body(state: &AppState) -> Result<Value> {
+    let generated_at = Utc::now();
+    let today = generated_at.date_naive();
     let week_start = today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64);
     let month_start = today.with_day(1).unwrap_or(today);
-    let records = read_discovery_query_stats(&state)
-        .await
-        .map_err(ApiError::internal)?;
+    let records = read_discovery_query_stats(&state).await?;
     let mut today_count = 0i64;
     let mut week_count = 0i64;
     let mut month_count = 0i64;
@@ -2865,12 +2945,14 @@ async fn api_query_stats(State(state): State<AppState>) -> ApiResult<Value> {
             month_count += record.query_count;
         }
     }
-    Ok(Json(json!({
+    Ok(json!({
         "discoveryDid": state.did,
+        "generatedAt": generated_at.to_rfc3339(),
+        "windowTimezone": "UTC",
         "todayQueryCount": today_count,
         "weekQueryCount": week_count,
         "monthQueryCount": month_count
-    })))
+    }))
 }
 
 async fn run_resource_query(
@@ -3079,33 +3161,38 @@ async fn api_sync_history(State(state): State<AppState>) -> ApiResult<Value> {
 }
 
 async fn api_index_stats(State(state): State<AppState>) -> ApiResult<Value> {
+    discovery_index_stats_body(&state)
+        .await
+        .map(Json)
+        .map_err(ApiError::internal)
+}
+
+async fn discovery_index_stats_body(state: &AppState) -> Result<Value> {
+    let generated_at = Utc::now();
     if let Ok(cache) = state.index_stats_cache.try_lock() {
         if let Some(cached) = cache.as_ref() {
             if cached.captured_at.elapsed()
                 <= StdDuration::from_millis(DISCOVERY_INDEX_STATS_CACHE_TTL_MS)
             {
-                return Ok(Json(cached.body.clone()));
+                return Ok(cached.body.clone());
             }
         }
     }
-    let sync_cursor = read_sync_cursor(&state).await.map_err(ApiError::internal)?;
+    let sync_cursor = read_sync_cursor(&state).await?;
     let mut body = if let Some(postgres) = &state.postgres {
         let total_row = sqlx::query(&format!("SELECT COUNT(*) FROM {DISCOVERY_PACKAGE_TABLE}"))
             .fetch_one(postgres.pool())
-            .await
-            .map_err(|err| ApiError::internal(err.into()))?;
+            .await?;
         let type_rows = sqlx::query(&format!(
             "SELECT resource_type, COUNT(*) FROM {DISCOVERY_PACKAGE_TABLE} GROUP BY resource_type"
         ))
         .fetch_all(postgres.pool())
-        .await
-        .map_err(|err| ApiError::internal(err.into()))?;
+        .await?;
         let tag_rows = sqlx::query(&format!(
             "SELECT tag, COUNT(*) FROM {DISCOVERY_PACKAGE_TABLE}, unnest(capability_tags) AS tag GROUP BY tag"
         ))
         .fetch_all(postgres.pool())
-        .await
-        .map_err(|err| ApiError::internal(err.into()))?;
+        .await?;
         let mut resource_type_counts = serde_json::Map::new();
         for row in type_rows {
             resource_type_counts.insert(row.get::<String, _>(0), json!(row.get::<i64, _>(1)));
@@ -3123,9 +3210,7 @@ async fn api_index_stats(State(state): State<AppState>) -> ApiResult<Value> {
             "syncCursor": sync_cursor
         })
     } else {
-        let packages = read_indexed_resource_packages(&state)
-            .await
-            .map_err(ApiError::internal)?;
+        let packages = read_indexed_resource_packages(&state).await?;
         let mut tag_counts = serde_json::Map::new();
         let mut resource_type_counts = serde_json::Map::new();
         for package in &packages {
@@ -3151,6 +3236,8 @@ async fn api_index_stats(State(state): State<AppState>) -> ApiResult<Value> {
         })
     };
     if let Value::Object(map) = &mut body {
+        map.insert("generatedAt".to_owned(), json!(generated_at.to_rfc3339()));
+        map.insert("windowTimezone".to_owned(), json!("UTC"));
         map.insert(
             "semanticSearch".to_owned(),
             semantic_status_json(&state, false, None),
@@ -3170,7 +3257,93 @@ async fn api_index_stats(State(state): State<AppState>) -> ApiResult<Value> {
             body: body.clone(),
         });
     }
-    Ok(Json(body))
+    Ok(body)
+}
+
+async fn discovery_stats_report_loop(state: AppState) {
+    loop {
+        if let Err(err) = report_discovery_stats_once(&state).await {
+            eprintln!("discovery stats report failed: {err}");
+        }
+        sleep(TokioDuration::from_secs(
+            state.config.stats_report.interval_seconds,
+        ))
+        .await;
+    }
+}
+
+async fn report_discovery_stats_once(state: &AppState) -> Result<()> {
+    let config = &state.config.stats_report;
+    let query_stats = discovery_query_stats_body(state).await?;
+    let index_stats = discovery_index_stats_body(state).await?;
+    let endpoint = config
+        .endpoint
+        .as_deref()
+        .ok_or_else(|| anyhow!("stats_report.endpoint is required"))?;
+    let token = config
+        .token
+        .as_deref()
+        .ok_or_else(|| anyhow!("stats_report.token is required"))?;
+    let type_counts = &index_stats["resourceTypeCounts"];
+    let indexed_resource_count = json_number_or_null(&index_stats["indexedResourceCount"]);
+    let payload = json!({
+        "nodeId": config
+            .node_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("stats_report.node_id is required"))?,
+        "role": "discovery",
+        "status": "online",
+        "generatedAt": index_stats["generatedAt"],
+        "resourceTotals": {
+            "visibleResources": indexed_resource_count.clone(),
+            "indexedResources": indexed_resource_count
+        },
+        "resourcesByType": {
+            "agentService": json_number_or_zero(&type_counts["agent_service"]),
+            "skill": json_number_or_zero(&type_counts["skill"]),
+            "mcpServer": json_number_or_zero(&type_counts["mcp_server"]),
+            "toolApi": json_number_or_zero(&type_counts["tool_api"])
+        },
+        "discoveryCallWindows": {
+            "today": json_number_or_zero(&query_stats["todayQueryCount"]),
+            "thisWeek": json_number_or_zero(&query_stats["weekQueryCount"]),
+            "thisMonth": json_number_or_zero(&query_stats["monthQueryCount"])
+        },
+        "indexState": {
+            "lastIndexedAt": index_stats["generatedAt"],
+            "semanticEnabled": index_stats["semanticSearch"]["enabled"],
+            "semanticIndexedResources": json_number_or_null(&index_stats["semanticIndexedCount"])
+        }
+    });
+    let response = state
+        .client
+        .post(endpoint)
+        .bearer_auth(token)
+        .json(&payload)
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!("homepage returned {status}: {body}"));
+    }
+    Ok(())
+}
+
+fn json_number_or_zero(value: &Value) -> Value {
+    json!(nonnegative_json_number(value).unwrap_or(0))
+}
+
+fn json_number_or_null(value: &Value) -> Value {
+    nonnegative_json_number(value).map_or(Value::Null, |number| json!(number))
+}
+
+fn nonnegative_json_number(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_i64()
+            .and_then(|number| (number >= 0).then_some(number as u64))
+    })
 }
 
 async fn api_index_resources(State(state): State<AppState>) -> ApiResult<Value> {
@@ -3517,7 +3690,10 @@ async fn audit_resolved_rejected_packages(
         .filter(|package| {
             package.metadata.lifecycle_state == "active"
                 && is_user_consumable_resource_type(&package.resource_type)
-                && authorized_domains_cover(&discovery_domains, &package.metadata.authorized_domains)
+                && authorized_domains_cover(
+                    &discovery_domains,
+                    &package.metadata.authorized_domains,
+                )
         })
         .map(|package| package.resource_did)
         .collect::<HashSet<_>>();
@@ -4388,7 +4564,8 @@ async fn rebuild_semantic_indexes(
         recovered_packages: 0,
         retries,
         last_cursor,
-        safe_to_delete_old_indexes: skipped_packages == 0 && matches!(stage, SemanticRebuildStage::Both),
+        safe_to_delete_old_indexes: skipped_packages == 0
+            && matches!(stage, SemanticRebuildStage::Both),
         skipped_reason: None,
     })
 }
@@ -4426,13 +4603,14 @@ async fn backfill_skipped_semantic_indexes(
             context_indexed_count: count_semantic_indexed_resources(state)
                 .await?
                 .unwrap_or_default() as usize,
-            intent_indexed_count: count_intent_indexed_rows(state).await?.unwrap_or_default() as usize,
+            intent_indexed_count: count_intent_indexed_rows(state).await?.unwrap_or_default()
+                as usize,
             skipped_packages: 0,
             recovered_packages: 0,
             retries: 0,
             last_cursor: None,
-        safe_to_delete_old_indexes: matches!(stage, SemanticRebuildStage::Both),
-        skipped_reason: None,
+            safe_to_delete_old_indexes: matches!(stage, SemanticRebuildStage::Both),
+            skipped_reason: None,
         });
     }
 
@@ -4491,7 +4669,8 @@ async fn backfill_skipped_semantic_indexes(
         recovered_packages: recovered,
         retries,
         last_cursor,
-        safe_to_delete_old_indexes: skipped_packages == 0 && matches!(stage, SemanticRebuildStage::Both),
+        safe_to_delete_old_indexes: skipped_packages == 0
+            && matches!(stage, SemanticRebuildStage::Both),
         skipped_reason: None,
     })
 }
@@ -4500,14 +4679,19 @@ async fn clear_semantic_rebuild_progress(
     state: &AppState,
     stage: SemanticRebuildStage,
 ) -> Result<()> {
-    clear_discovery_sync_state_like(state, &format!("semantic_rebuild_progress:{}%", stage.as_str())).await
+    clear_discovery_sync_state_like(
+        state,
+        &format!("semantic_rebuild_progress:{}%", stage.as_str()),
+    )
+    .await
 }
 
 async fn clear_semantic_rebuild_skip_records(
     state: &AppState,
     stage: Option<SemanticRebuildStage>,
 ) -> Result<()> {
-    clear_discovery_sync_state_like(state, &format!("{}%", semantic_rebuild_skip_prefix(stage))).await
+    clear_discovery_sync_state_like(state, &format!("{}%", semantic_rebuild_skip_prefix(stage)))
+        .await
 }
 
 async fn store_semantic_rebuild_progress(
@@ -4922,7 +5106,11 @@ async fn query_indexed_resource_packages(
             builder.push_bind(vec![protocol.to_ascii_lowercase()]);
         }
         let tag_tokens = semantic_query_tag_tokens(query);
-        let query_text = query.query.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty());
+        let query_text = query
+            .query
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty());
         if query_text.is_some() {
             let text = query_text.expect("checked query text");
             builder.push(" AND (");
@@ -4934,18 +5122,15 @@ async fn query_indexed_resource_packages(
         }
         if !tag_tokens.is_empty() {
             builder.push(" ORDER BY ");
-            builder.push(
-                "ts_rank_cd(to_tsvector('simple', tag_text), plainto_tsquery('simple', ",
-            );
+            builder.push("ts_rank_cd(to_tsvector('simple', tag_text), plainto_tsquery('simple', ");
             if let Some(text) = query_text {
                 builder.push_bind(text.to_ascii_lowercase());
             } else {
                 builder.push_bind(tag_tokens.join(" "));
             }
             builder.push(")) DESC, ");
-            builder.push(
-                "ts_rank_cd(to_tsvector('simple', search_text), plainto_tsquery('simple', ",
-            );
+            builder
+                .push("ts_rank_cd(to_tsvector('simple', search_text), plainto_tsquery('simple', ");
             if let Some(text) = query_text {
                 builder.push_bind(text.to_ascii_lowercase());
             } else {
@@ -5651,11 +5836,14 @@ async fn record_discovery_query_stat(state: &AppState) -> Result<()> {
         return Ok(());
     }
     let path = Path::new("query-stats").join(format!("{today}.json"));
-    let mut record = state.data.read::<DiscoveryQueryStatRecord>(&path).unwrap_or(DiscoveryQueryStatRecord {
-        stat_date: today.clone(),
-        query_count: 0,
-        updated_at: String::new(),
-    });
+    let mut record = state
+        .data
+        .read::<DiscoveryQueryStatRecord>(&path)
+        .unwrap_or(DiscoveryQueryStatRecord {
+            stat_date: today.clone(),
+            query_count: 0,
+            updated_at: String::new(),
+        });
     record.query_count += 1;
     record.updated_at = updated_at.to_rfc3339();
     state.data.write(path, &record)?;
@@ -5664,37 +5852,37 @@ async fn record_discovery_query_stat(state: &AppState) -> Result<()> {
 
 async fn read_discovery_query_stats(state: &AppState) -> Result<Vec<DiscoveryQueryStatRecord>> {
     if let Some(sqlite) = &state.sqlite {
-        let rows = sqlx::query_as::<_, (String, i64, String)>(
-            &format!(
-                "SELECT stat_date, query_count, updated_at::text FROM {DISCOVERY_QUERY_STATS_TABLE}"
-            ),
-        )
+        let rows = sqlx::query_as::<_, (String, i64, String)>(&format!(
+            "SELECT stat_date, query_count, updated_at::text FROM {DISCOVERY_QUERY_STATS_TABLE}"
+        ))
         .fetch_all(sqlite.pool())
         .await?;
         return Ok(rows
             .into_iter()
-            .map(|(stat_date, query_count, updated_at)| DiscoveryQueryStatRecord {
-                stat_date,
-                query_count,
-                updated_at,
-            })
+            .map(
+                |(stat_date, query_count, updated_at)| DiscoveryQueryStatRecord {
+                    stat_date,
+                    query_count,
+                    updated_at,
+                },
+            )
             .collect());
     }
     if let Some(postgres) = &state.postgres {
-        let rows = sqlx::query_as::<_, (String, i64, String)>(
-            &format!(
-                "SELECT stat_date, query_count, updated_at::text FROM {DISCOVERY_QUERY_STATS_TABLE}"
-            ),
-        )
+        let rows = sqlx::query_as::<_, (String, i64, String)>(&format!(
+            "SELECT stat_date, query_count, updated_at::text FROM {DISCOVERY_QUERY_STATS_TABLE}"
+        ))
         .fetch_all(postgres.pool())
         .await?;
         return Ok(rows
             .into_iter()
-            .map(|(stat_date, query_count, updated_at)| DiscoveryQueryStatRecord {
-                stat_date,
-                query_count,
-                updated_at,
-            })
+            .map(
+                |(stat_date, query_count, updated_at)| DiscoveryQueryStatRecord {
+                    stat_date,
+                    query_count,
+                    updated_at,
+                },
+            )
             .collect());
     }
     let mut records = Vec::new();
@@ -6118,7 +6306,10 @@ fn discovery_authorized_domains(bulletin: &Value, discovery_did: &str) -> Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{routing::get, Router};
+    use axum::{
+        routing::{get, post},
+        Router,
+    };
     use chrono::Utc;
     use oan_core::{
         CryptoSuite, OanMetadata, ProtocolBinding, ResourceDescription, ServiceEndpoint,
@@ -6292,6 +6483,7 @@ mod tests {
                 },
                 cors: CorsConfig::default(),
                 debug: DebugConfig::default(),
+                stats_report: StatsReportConfig::default(),
                 semantic_search: SemanticSearchConfig::default(),
                 upstream: UpstreamConfig {
                     root_endpoint: "http://127.0.0.1:8001".to_owned(),
@@ -7128,6 +7320,44 @@ mod tests {
         assert_eq!(stats.0["indexedResourceCount"], 1);
         assert_eq!(stats.0["resourceTypeCounts"]["skill"], 1);
         assert_eq!(stats.0["syncCursor"], 0);
+    }
+
+    #[tokio::test]
+    async fn discovery_stats_report_payload_matches_query_and_index_stats() {
+        async fn handler(Json(request): Json<Value>) -> Json<Value> {
+            assert_eq!(request["nodeId"], "discovery-test");
+            assert_eq!(request["role"], "discovery");
+            assert_eq!(request["status"], "online");
+            assert_eq!(request["resourceTotals"]["visibleResources"], 1);
+            assert_eq!(request["resourceTotals"]["indexedResources"], 1);
+            assert_eq!(request["resourcesByType"]["skill"], 1);
+            assert_eq!(request["discoveryCallWindows"]["today"], 1);
+            assert_eq!(request["indexState"]["semanticEnabled"], false);
+            assert!(request["indexState"]["semanticIndexedResources"].is_null());
+            Json(json!({ "status": "ok" }))
+        }
+        let app = Router::new().route("/api/internal/node-stats/report", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        state.config.stats_report = StatsReportConfig {
+            enabled: true,
+            node_id: Some("discovery-test".to_owned()),
+            endpoint: Some(format!("http://{addr}/api/internal/node-stats/report")),
+            token: Some("test-token".to_owned()),
+            interval_seconds: 60,
+        };
+        write_indexed_resource_packages(&state, &[sample_resource_package()])
+            .await
+            .unwrap();
+        record_discovery_query_stat(&state).await.unwrap();
+
+        report_discovery_stats_once(&state).await.unwrap();
     }
 
     #[tokio::test]
