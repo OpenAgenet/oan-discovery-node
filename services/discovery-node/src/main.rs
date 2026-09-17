@@ -5653,6 +5653,7 @@ fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<Resour
         }],
         authentication: vec![format!("{did}#key-1")],
         assertion_method: vec![format!("{did}#key-1")],
+        capability_invocation: vec![format!("{did}#key-1")],
         service: vec![service.clone()],
         oan_metadata: Some(OanMetadata {
             subject_type: seed.resource_type.clone(),
@@ -6344,6 +6345,7 @@ mod tests {
             }],
             authentication: vec![format!("{did}#key-1")],
             assertion_method: vec![format!("{did}#key-1")],
+            capability_invocation: vec![format!("{did}#key-1")],
             service: vec![ServiceEndpoint {
                 id: format!("{did}#download"),
                 service_type: "SkillPackageDownload".to_owned(),
@@ -6520,6 +6522,7 @@ mod tests {
             verification_method: vec![],
             authentication: vec![],
             assertion_method: vec![],
+            capability_invocation: vec![],
             service: vec![],
             oan_metadata: Some(OanMetadata {
                 subject_type: ResourceType::InfrastructureNode,
@@ -6677,7 +6680,8 @@ mod tests {
                 public_key_jwk: Some(public_key_jwk(&verifying_key)),
             }],
             authentication: vec![key_id.clone()],
-            assertion_method: vec![key_id],
+            assertion_method: vec![key_id.clone()],
+            capability_invocation: vec![key_id],
             service: vec![],
             oan_metadata: Some(OanMetadata {
                 subject_type: ResourceType::InfrastructureNode,
