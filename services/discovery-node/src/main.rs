@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use axum::{
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::{HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env, fs,
+    io::{BufWriter, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
@@ -63,6 +64,9 @@ const REJECT_STATUS_DEAD: &str = "dead";
 const LATE_PACKAGE_RETRY_INTERVAL_SECONDS: u64 = 120;
 const LATE_PACKAGE_MAX_RETRY_COUNT: u64 = 3;
 const LATE_PACKAGE_MAX_ITEMS: usize = 100;
+const DISCOVERY_DEFAULT_PAGE_SIZE: u32 = 100;
+const DISCOVERY_MAX_PAGE_SIZE: u32 = 500;
+const DISCOVERY_SEMANTIC_REBUILD_PAGE_SIZE: u32 = 100;
 #[cfg(not(test))]
 const LATE_PACKAGE_IDLE_STOP_CYCLES: u64 = 5;
 
@@ -106,7 +110,7 @@ struct DiscoveryNotificationItem {
 
 #[derive(Clone, Debug)]
 enum PackageFetchOutcome {
-    Found(ResourcePackage),
+    Found(Box<ResourcePackage>),
     Unavailable(String),
     PermanentFailure(String),
 }
@@ -143,6 +147,20 @@ impl Default for ResolvedRejectedPackageCleanupRequest {
 struct IndexedResourceVisibilityRequest {
     #[serde(rename = "resourceDids")]
     resource_dids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct DiscoveryPageQuery {
+    #[serde(rename = "afterCursor", default)]
+    after_cursor: Option<i64>,
+    #[serde(rename = "afterResourceDid", default)]
+    after_resource_did: Option<String>,
+    #[serde(rename = "afterKey", default)]
+    after_key: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    status: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -640,6 +658,21 @@ struct DiscoveryProjectedPackage<'a> {
 }
 
 #[derive(Clone, Debug)]
+struct CursorPage<T> {
+    items: Vec<T>,
+    next_cursor: i64,
+    next_resource_did: Option<String>,
+    has_more: bool,
+}
+
+#[derive(Clone, Debug)]
+struct KeyPage<T> {
+    items: Vec<T>,
+    next_key: Option<String>,
+    has_more: bool,
+}
+
+#[derive(Clone, Debug)]
 struct SearchDocument {
     resource_did: String,
     cursor: i64,
@@ -754,6 +787,8 @@ struct SemanticRebuildProgressRecord {
     phase: String,
     #[serde(default)]
     last_cursor: Option<i64>,
+    #[serde(rename = "lastResourceDid", default)]
+    last_resource_did: Option<String>,
     #[serde(default)]
     processed: usize,
     #[serde(default)]
@@ -2295,7 +2330,7 @@ fn bm25_like_score(query_tokens: &[String], documents: &[Vec<String>], index: us
         };
         let doc_freq = documents
             .iter()
-            .filter(|tokens| tokens.iter().any(|candidate| *candidate == *token))
+            .filter(|tokens| tokens.contains(token))
             .count() as f32;
         let idf = (((documents.len() as f32 - doc_freq + 0.5) / (doc_freq + 0.5)) + 1.0).ln();
         let tf = tf as f32;
@@ -2575,15 +2610,9 @@ fn wake_late_package_retry_task(state: AppState) {
 
 #[cfg(not(test))]
 async fn has_late_resource_packages(state: &AppState) -> bool {
-    read_rejected_packages(state)
+    count_late_rejected_packages(state)
         .await
-        .map(|items| {
-            items.iter().any(|item| {
-                item.get("reason").and_then(Value::as_str)
-                    == Some(REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE)
-                    && rejected_package_status(item) == REJECT_STATUS_LATE
-            })
-        })
+        .map(|count| count > 0)
         .unwrap_or(false)
 }
 
@@ -2693,7 +2722,7 @@ async fn sync_resources_from_cdn_items(
         } else {
             match fetch_cdn_resource_package_classified(&state, &cdn_base, &item.resource_did).await
             {
-                Ok(PackageFetchOutcome::Found(package)) => package,
+                Ok(PackageFetchOutcome::Found(package)) => *package,
                 Ok(PackageFetchOutcome::Unavailable(reason)) => {
                     rejected.push(rejected_package_from_notification(
                         &item,
@@ -2888,7 +2917,7 @@ async fn fetch_cdn_resource_package_classified(
         )));
     }
     match response.json::<ResourcePackage>().await {
-        Ok(package) => Ok(PackageFetchOutcome::Found(package)),
+        Ok(package) => Ok(PackageFetchOutcome::Found(Box::new(package))),
         Err(err) => Ok(PackageFetchOutcome::PermanentFailure(format!(
             "cdn_decode_failed:{err}"
         ))),
@@ -3050,6 +3079,10 @@ fn rejected_package_retry_summary(items: &[Value]) -> Value {
                 && rejected_package_status(item) == REJECT_STATUS_DEAD
         })
         .count();
+    rejected_package_retry_summary_from_counts(late_count, dead_count)
+}
+
+fn rejected_package_retry_summary_from_counts(late_count: usize, dead_count: usize) -> Value {
     json!({
         "enabled": true,
         "state": if late_count > LATE_PACKAGE_MAX_ITEMS {
@@ -3198,7 +3231,7 @@ async fn discovery_query_stats_body(state: &AppState) -> Result<Value> {
     let today = generated_at.date_naive();
     let week_start = today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64);
     let month_start = today.with_day(1).unwrap_or(today);
-    let records = read_discovery_query_stats(&state).await?;
+    let records = read_discovery_query_stats(state).await?;
     let mut today_count = 0i64;
     let mut week_count = 0i64;
     let mut month_count = 0i64;
@@ -3382,7 +3415,7 @@ async fn api_status(State(state): State<AppState>) -> ApiResult<Value> {
     let indexed_resource_count = count_indexed_resource_packages(&state)
         .await
         .map_err(ApiError::internal)?;
-    let history = read_sync_history(&state)
+    let last_sync = read_latest_sync_history_item(&state)
         .await
         .map_err(ApiError::internal)?;
     let bulletin = fetch_bulletin(&state).await.ok();
@@ -3391,7 +3424,7 @@ async fn api_status(State(state): State<AppState>) -> ApiResult<Value> {
         "rootEndpoint": state.config.upstream.root_endpoint,
         "cdnEndpoint": state.config.upstream.cdn_endpoint,
         "indexedResourceCount": indexed_resource_count,
-        "lastSync": history.last(),
+        "lastSync": last_sync,
         "rootAuthorizationStatus": bulletin.as_ref().map(|b| discovery_authorization_status(b, &state.did)).unwrap_or_else(|| "unknown".to_owned()),
         "semanticSearch": semantic_status_json(&state, false, None)
     })))
@@ -3424,11 +3457,21 @@ async fn api_authorized_domains(State(state): State<AppState>) -> ApiResult<Valu
     })))
 }
 
-async fn api_sync_history(State(state): State<AppState>) -> ApiResult<Value> {
-    let history = read_sync_history(&state)
+async fn api_sync_history(
+    State(state): State<AppState>,
+    Query(query): Query<DiscoveryPageQuery>,
+) -> ApiResult<Value> {
+    let limit = validated_discovery_page_limit(query.limit)?;
+    let page = read_sync_history_page(&state, query.after_key.as_deref(), limit)
         .await
         .map_err(ApiError::internal)?;
-    Ok(Json(json!({ "items": history, "count": history.len() })))
+    Ok(Json(json!({
+        "items": page.items,
+        "count": page.items.len(),
+        "afterKey": query.after_key,
+        "nextKey": page.next_key,
+        "hasMore": page.has_more
+    })))
 }
 
 async fn api_index_stats(State(state): State<AppState>) -> ApiResult<Value> {
@@ -3449,7 +3492,7 @@ async fn discovery_index_stats_body(state: &AppState) -> Result<Value> {
             }
         }
     }
-    let sync_cursor = read_sync_cursor(&state).await?;
+    let sync_cursor = read_sync_cursor(state).await?;
     let mut body = if let Some(postgres) = &state.postgres {
         let total_row = sqlx::query(&format!("SELECT COUNT(*) FROM {DISCOVERY_PACKAGE_TABLE}"))
             .fetch_one(postgres.pool())
@@ -3481,7 +3524,7 @@ async fn discovery_index_stats_body(state: &AppState) -> Result<Value> {
             "syncCursor": sync_cursor
         })
     } else {
-        let packages = read_indexed_resource_packages(&state).await?;
+        let packages = read_indexed_resource_packages(state).await?;
         let mut tag_counts = serde_json::Map::new();
         let mut resource_type_counts = serde_json::Map::new();
         for package in &packages {
@@ -3511,11 +3554,11 @@ async fn discovery_index_stats_body(state: &AppState) -> Result<Value> {
         map.insert("windowTimezone".to_owned(), json!("UTC"));
         map.insert(
             "semanticSearch".to_owned(),
-            semantic_status_json(&state, false, None),
+            semantic_status_json(state, false, None),
         );
         map.insert(
             "semanticIndexedCount".to_owned(),
-            match count_semantic_indexed_resources(&state).await {
+            match count_semantic_indexed_resources(state).await {
                 Ok(Some(count)) => json!(count),
                 Ok(None) => Value::Null,
                 Err(err) => json!({ "error": err.to_string() }),
@@ -3617,27 +3660,29 @@ fn nonnegative_json_number(value: &Value) -> Option<u64> {
     })
 }
 
-async fn api_index_resources(State(state): State<AppState>) -> ApiResult<Value> {
-    let packages = read_indexed_resource_packages(&state)
-        .await
-        .map_err(ApiError::internal)?;
-    let items = packages
-        .into_iter()
-        .map(|package| {
-            json!({
-                "resourceDid": package.resource_did,
-                "resourceType": package.resource_type,
-                "name": package.metadata.name,
-                "description": package.metadata.description,
-                "capabilityTags": package.metadata.capability_tags,
-                "services": package.metadata.services,
-                "lifecycleState": package.metadata.lifecycle_state,
-                "version": package.package_version,
-                "updatedAt": package.metadata.updated_at
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok(Json(json!({ "items": items, "count": items.len() })))
+async fn api_index_resources(
+    State(state): State<AppState>,
+    Query(query): Query<DiscoveryPageQuery>,
+) -> ApiResult<Value> {
+    let limit = validated_discovery_page_limit(query.limit)?;
+    let after_cursor = query.after_cursor.unwrap_or(0).max(0);
+    let page = read_indexed_resource_summary_page(
+        &state,
+        after_cursor,
+        query.after_resource_did.as_deref(),
+        limit,
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "items": page.items,
+        "count": page.items.len(),
+        "afterCursor": after_cursor,
+        "afterResourceDid": query.after_resource_did,
+        "nextCursor": page.next_cursor,
+        "nextResourceDid": page.next_resource_did,
+        "hasMore": page.has_more
+    })))
 }
 
 async fn api_index_resource_visibility(
@@ -3807,14 +3852,29 @@ async fn api_query_explain(
     })))
 }
 
-async fn api_rejected_packages(State(state): State<AppState>) -> ApiResult<Value> {
-    let items = read_rejected_packages(&state)
+async fn api_rejected_packages(
+    State(state): State<AppState>,
+    Query(query): Query<DiscoveryPageQuery>,
+) -> ApiResult<Value> {
+    let limit = validated_discovery_page_limit(query.limit)?;
+    let page = read_rejected_packages_page(
+        &state,
+        query.after_key.as_deref(),
+        limit,
+        query.status.as_deref(),
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    let retry = rejected_package_retry_summary_from_store(&state)
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(json!({
-        "items": items,
-        "count": items.len(),
-        "retry": rejected_package_retry_summary(&items)
+        "items": page.items,
+        "count": page.items.len(),
+        "afterKey": query.after_key,
+        "nextKey": page.next_key,
+        "hasMore": page.has_more,
+        "retry": retry
     })))
 }
 
@@ -3854,73 +3914,81 @@ async fn backfill_rejected_resource_packages(
 ) -> Result<Value> {
     let max_items = request.max_items.unwrap_or(100).max(1);
     let requested_dids = request.resource_dids.into_iter().collect::<BTreeSet<_>>();
-    let rejected = read_rejected_packages(state).await?;
     let mut attempted = 0usize;
     let mut recovered = Vec::<Value>::new();
     let mut failed = Vec::<Value>::new();
     let mut skipped = 0usize;
-
-    for item in rejected.iter() {
-        let reason = item
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let resource_did = item
-            .get("resourceDid")
-            .or_else(|| item.get("did"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if reason != REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE
-            || rejected_package_status(item) == REJECT_STATUS_DEAD
-            || resource_did.is_empty()
-            || (!requested_dids.is_empty() && !requested_dids.contains(resource_did))
-        {
-            skipped += 1;
-            continue;
+    let mut after_key = None::<String>;
+    loop {
+        let page = read_rejected_packages_page(
+            state,
+            after_key.as_deref(),
+            DISCOVERY_DEFAULT_PAGE_SIZE,
+            None,
+        )
+        .await?;
+        if page.items.is_empty() {
+            break;
         }
-        if attempted >= max_items {
-            skipped += 1;
-            continue;
-        }
-        attempted += 1;
-        let cursor = item
-            .get("cursor")
-            .and_then(Value::as_i64)
-            .unwrap_or_default();
-        match recover_rejected_package_once(state, cdn_base, item).await? {
-            RejectedPackageRecoveryResult::Recovered => {
-                recovered.push(json!({
-                    "resourceDid": resource_did,
-                    "cursor": cursor
-                }));
+        for item in page.items {
+            let reason = item
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let resource_did = item
+                .get("resourceDid")
+                .or_else(|| item.get("did"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if reason != REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE
+                || rejected_package_status(&item) == REJECT_STATUS_DEAD
+                || resource_did.is_empty()
+                || (!requested_dids.is_empty() && !requested_dids.contains(resource_did))
+            {
+                skipped += 1;
+                continue;
             }
-            RejectedPackageRecoveryResult::StillLate(updated) => failed.push(json!({
-                "resourceDid": resource_did,
-                "cursor": cursor,
-                "reason": REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE,
-                "status": updated["status"],
-                "retryCount": updated["retryCount"],
-                "lastError": updated["lastError"]
-            })),
-            RejectedPackageRecoveryResult::Dead(updated) => failed.push(json!({
-                "resourceDid": resource_did,
-                "cursor": cursor,
-                "reason": REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE,
-                "status": updated["status"],
-                "retryCount": updated["retryCount"],
-                "lastError": updated["lastError"]
-            })),
-            RejectedPackageRecoveryResult::ReplacementRejected(updated) => failed.push(json!({
-                "resourceDid": resource_did,
-                "cursor": cursor,
-                "reason": updated["reason"],
-                "status": updated["status"],
-                "lastError": updated["lastError"]
-            })),
+            if attempted >= max_items {
+                skipped += 1;
+                continue;
+            }
+            attempted += 1;
+            let cursor = item
+                .get("cursor")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            match recover_rejected_package_once(state, cdn_base, &item).await? {
+                RejectedPackageRecoveryResult::Recovered => {
+                    recovered.push(json!({
+                        "resourceDid": resource_did,
+                        "cursor": cursor
+                    }));
+                }
+                RejectedPackageRecoveryResult::StillLate(updated)
+                | RejectedPackageRecoveryResult::Dead(updated) => failed.push(json!({
+                    "resourceDid": resource_did,
+                    "cursor": cursor,
+                    "reason": REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE,
+                    "status": updated["status"],
+                    "retryCount": updated["retryCount"],
+                    "lastError": updated["lastError"]
+                })),
+                RejectedPackageRecoveryResult::ReplacementRejected(updated) => failed.push(json!({
+                    "resourceDid": resource_did,
+                    "cursor": cursor,
+                    "reason": updated["reason"],
+                    "status": updated["status"],
+                    "lastError": updated["lastError"]
+                })),
+            }
         }
+        if !page.has_more {
+            break;
+        }
+        after_key = page.next_key;
     }
 
-    let remaining_rejected_count = read_rejected_packages(state).await?.len();
+    let remaining_rejected_count = count_rejected_packages(state).await?;
 
     Ok(json!({
         "status": "backfilled",
@@ -3937,16 +4005,7 @@ async fn backfill_rejected_resource_packages(
 
 async fn retry_late_resource_packages_once(state: &AppState, max_items: usize) -> Result<Value> {
     let _sync_guard = state.resource_sync_lock.lock().await;
-    let rejected = read_rejected_packages(state).await?;
-    let late_items = rejected
-        .iter()
-        .filter(|item| {
-            item.get("reason").and_then(Value::as_str)
-                == Some(REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE)
-                && rejected_package_status(item) == REJECT_STATUS_LATE
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let late_items = read_late_rejected_packages(state, LATE_PACKAGE_MAX_ITEMS + 1).await?;
     if late_items.len() > LATE_PACKAGE_MAX_ITEMS {
         return Ok(json!({
             "state": "suspended",
@@ -3977,15 +4036,7 @@ async fn retry_late_resource_packages_once(state: &AppState, max_items: usize) -
             | RejectedPackageRecoveryResult::ReplacementRejected(_) => failed += 1,
         }
     }
-    let remaining = read_rejected_packages(state).await?;
-    let late_count = remaining
-        .iter()
-        .filter(|item| {
-            item.get("reason").and_then(Value::as_str)
-                == Some(REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE)
-                && rejected_package_status(item) == REJECT_STATUS_LATE
-        })
-        .count();
+    let late_count = count_late_rejected_packages(state).await?;
     Ok(json!({
         "state": if late_count > 0 { "running" } else { "idle" },
         "lateCount": late_count,
@@ -3993,6 +4044,126 @@ async fn retry_late_resource_packages_once(state: &AppState, max_items: usize) -
         "recoveredCount": recovered,
         "failedCount": failed
     }))
+}
+
+async fn read_late_rejected_packages(state: &AppState, limit: usize) -> Result<Vec<Value>> {
+    let limit = limit.max(1);
+    if let Some(sqlite) = &state.sqlite {
+        let rows = sqlx::query(&format!(
+            r#"
+            SELECT item_json
+            FROM {DISCOVERY_REJECTED_TABLE}
+            WHERE json_extract(item_json, '$.reason') = ?
+              AND COALESCE(json_extract(item_json, '$.status'), ?) = ?
+            ORDER BY reject_key
+            LIMIT ?
+            "#
+        ))
+        .bind(REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE)
+        .bind(REJECT_STATUS_LATE)
+        .bind(REJECT_STATUS_LATE)
+        .bind(limit as i64)
+        .fetch_all(sqlite.pool())
+        .await?;
+        return rows
+            .into_iter()
+            .map(|row| serde_json::from_str::<Value>(&row.get::<String, _>(0)).map_err(Into::into))
+            .collect();
+    }
+    if let Some(postgres) = &state.postgres {
+        let rows = sqlx::query(&format!(
+            r#"
+            SELECT item_json::text
+            FROM {DISCOVERY_REJECTED_TABLE}
+            WHERE item_json->>'reason' = $1
+              AND COALESCE(item_json->>'status', $2) = $2
+            ORDER BY reject_key
+            LIMIT $3
+            "#
+        ))
+        .bind(REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE)
+        .bind(REJECT_STATUS_LATE)
+        .bind(limit as i64)
+        .fetch_all(postgres.pool())
+        .await?;
+        return rows
+            .into_iter()
+            .map(|row| serde_json::from_str::<Value>(&row.get::<String, _>(0)).map_err(Into::into))
+            .collect();
+    }
+    Ok(read_rejected_packages(state)
+        .await?
+        .into_iter()
+        .filter(|item| {
+            item.get("reason").and_then(Value::as_str)
+                == Some(REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE)
+                && rejected_package_status(item) == REJECT_STATUS_LATE
+        })
+        .take(limit)
+        .collect())
+}
+
+async fn count_late_rejected_packages(state: &AppState) -> Result<usize> {
+    if let Some(sqlite) = &state.sqlite {
+        let row = sqlx::query(&format!(
+            r#"
+            SELECT COUNT(*)
+            FROM {DISCOVERY_REJECTED_TABLE}
+            WHERE json_extract(item_json, '$.reason') = ?
+              AND COALESCE(json_extract(item_json, '$.status'), ?) = ?
+            "#
+        ))
+        .bind(REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE)
+        .bind(REJECT_STATUS_LATE)
+        .bind(REJECT_STATUS_LATE)
+        .fetch_one(sqlite.pool())
+        .await?;
+        return Ok(row.get::<i64, _>(0) as usize);
+    }
+    if let Some(postgres) = &state.postgres {
+        let row = sqlx::query(&format!(
+            r#"
+            SELECT COUNT(*)
+            FROM {DISCOVERY_REJECTED_TABLE}
+            WHERE item_json->>'reason' = $1
+              AND COALESCE(item_json->>'status', $2) = $2
+            "#
+        ))
+        .bind(REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE)
+        .bind(REJECT_STATUS_LATE)
+        .fetch_one(postgres.pool())
+        .await?;
+        return Ok(row.get::<i64, _>(0) as usize);
+    }
+    Ok(read_rejected_packages(state)
+        .await?
+        .into_iter()
+        .filter(|item| {
+            item.get("reason").and_then(Value::as_str)
+                == Some(REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE)
+                && rejected_package_status(item) == REJECT_STATUS_LATE
+        })
+        .count())
+}
+
+async fn count_rejected_packages(state: &AppState) -> Result<usize> {
+    if let Some(sqlite) = &state.sqlite {
+        let row = sqlx::query(&format!("SELECT COUNT(*) FROM {DISCOVERY_REJECTED_TABLE}"))
+            .fetch_one(sqlite.pool())
+            .await?;
+        return Ok(row.get::<i64, _>(0) as usize);
+    }
+    if let Some(postgres) = &state.postgres {
+        let row = sqlx::query(&format!("SELECT COUNT(*) FROM {DISCOVERY_REJECTED_TABLE}"))
+            .fetch_one(postgres.pool())
+            .await?;
+        return Ok(row.get::<i64, _>(0) as usize);
+    }
+    Ok(state
+        .index
+        .read::<Vec<Value>>("rejected-packages.json")
+        .unwrap_or_default()
+        .len())
 }
 
 enum RejectedPackageRecoveryResult {
@@ -4019,7 +4190,7 @@ async fn recover_rejected_package_once(
             "missing_resource_did",
             "missing_resource_did",
         );
-        write_rejected_packages(state, &[replacement.clone()]).await?;
+        write_rejected_packages(state, std::slice::from_ref(&replacement)).await?;
         return Ok(RejectedPackageRecoveryResult::ReplacementRejected(
             replacement,
         ));
@@ -4039,7 +4210,7 @@ async fn recover_rejected_package_once(
             "missing_notification_context",
             "missing_notification_context",
         );
-        write_rejected_packages(state, &[replacement.clone()]).await?;
+        write_rejected_packages(state, std::slice::from_ref(&replacement)).await?;
         return Ok(RejectedPackageRecoveryResult::ReplacementRejected(
             replacement,
         ));
@@ -4054,13 +4225,14 @@ async fn recover_rejected_package_once(
             "missing_notification_context",
             "missing_notification_context",
         );
-        write_rejected_packages(state, &[replacement.clone()]).await?;
+        write_rejected_packages(state, std::slice::from_ref(&replacement)).await?;
         return Ok(RejectedPackageRecoveryResult::ReplacementRejected(
             replacement,
         ));
     }
     match fetch_cdn_resource_package_classified(state, cdn_base, &resource_did).await? {
         PackageFetchOutcome::Found(package) => {
+            let package = *package;
             let discovery_domains = local_discovery_authorized_domains(state)?;
             let reject_reason = if package.resource_did != resource_did {
                 Some("resource_did_mismatch".to_owned())
@@ -4078,7 +4250,7 @@ async fn recover_rejected_package_once(
             if let Some(reason) = reject_reason {
                 let replacement =
                     update_rejected_package_validation_failure(item, &reason, &reason);
-                write_rejected_packages(state, &[replacement.clone()]).await?;
+                write_rejected_packages(state, std::slice::from_ref(&replacement)).await?;
                 return Ok(RejectedPackageRecoveryResult::ReplacementRejected(
                     replacement,
                 ));
@@ -4089,7 +4261,7 @@ async fn recover_rejected_package_once(
         }
         PackageFetchOutcome::Unavailable(reason) => {
             let updated = update_rejected_package_retry_failure(item, &reason);
-            write_rejected_packages(state, &[updated.clone()]).await?;
+            write_rejected_packages(state, std::slice::from_ref(&updated)).await?;
             if rejected_package_status(&updated) == REJECT_STATUS_DEAD {
                 Ok(RejectedPackageRecoveryResult::Dead(updated))
             } else {
@@ -4099,7 +4271,7 @@ async fn recover_rejected_package_once(
         PackageFetchOutcome::PermanentFailure(reason) => {
             let replacement =
                 update_rejected_package_validation_failure(item, "cdn_fetch_failed", &reason);
-            write_rejected_packages(state, &[replacement.clone()]).await?;
+            write_rejected_packages(state, std::slice::from_ref(&replacement)).await?;
             Ok(RejectedPackageRecoveryResult::ReplacementRejected(
                 replacement,
             ))
@@ -4143,49 +4315,70 @@ async fn audit_resolved_rejected_packages(
 ) -> Result<Value> {
     let max_items = request.max_items.unwrap_or(1_000).max(1);
     let requested_dids = request.resource_dids.into_iter().collect::<BTreeSet<_>>();
-    let discovery_domains = local_discovery_authorized_domains(state)?;
-    let visible_dids = read_indexed_resource_packages(state)
-        .await?
-        .into_iter()
-        .filter(|package| {
-            package.metadata.lifecycle_state == "active"
-                && is_user_consumable_resource_type(&package.resource_type)
-                && authorized_domains_cover(
-                    &discovery_domains,
-                    &package.metadata.authorized_domains,
-                )
-        })
-        .map(|package| package.resource_did)
-        .collect::<HashSet<_>>();
-    let rejected = read_rejected_packages(state).await?;
     let mut resolved = Vec::new();
     let mut reject_keys = Vec::new();
-
-    for item in rejected.iter() {
-        if resolved.len() >= max_items {
+    let mut resource_cursor = 0_i64;
+    let mut resource_did = None::<String>;
+    while resolved.len() < max_items {
+        let page = read_visible_indexed_resource_did_page(
+            state,
+            resource_cursor,
+            resource_did.as_deref(),
+            DISCOVERY_DEFAULT_PAGE_SIZE,
+        )
+        .await?;
+        if page.items.is_empty() {
             break;
         }
-        let reason = item
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if !is_resolvable_historical_reject_reason(reason) {
-            continue;
+        let visible_dids = page.items.into_iter().collect::<HashSet<_>>();
+        let mut reject_cursor = None::<String>;
+        while resolved.len() < max_items {
+            let rejected_page = read_rejected_packages_page(
+                state,
+                reject_cursor.as_deref(),
+                DISCOVERY_DEFAULT_PAGE_SIZE,
+                None,
+            )
+            .await?;
+            if rejected_page.items.is_empty() {
+                break;
+            }
+            for item in rejected_page.items {
+                if resolved.len() >= max_items {
+                    break;
+                }
+                let reason = item
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !is_resolvable_historical_reject_reason(reason) {
+                    continue;
+                }
+                let resource_did = rejected_package_resource_did(&item);
+                if resource_did.is_empty()
+                    || !visible_dids.contains(resource_did)
+                    || (!requested_dids.is_empty() && !requested_dids.contains(resource_did))
+                {
+                    continue;
+                }
+                resolved.push(json!({
+                    "resourceDid": resource_did,
+                    "cursor": item.get("cursor").cloned().unwrap_or(Value::Null),
+                    "reason": reason,
+                    "rejectKey": rejected_package_key(&item)
+                }));
+                reject_keys.push(rejected_package_key(&item));
+            }
+            if !rejected_page.has_more {
+                break;
+            }
+            reject_cursor = rejected_page.next_key;
         }
-        let resource_did = rejected_package_resource_did(item);
-        if resource_did.is_empty()
-            || !visible_dids.contains(resource_did)
-            || (!requested_dids.is_empty() && !requested_dids.contains(resource_did))
-        {
-            continue;
+        if !page.has_more {
+            break;
         }
-        resolved.push(json!({
-            "resourceDid": resource_did,
-            "cursor": item.get("cursor").cloned().unwrap_or(Value::Null),
-            "reason": reason,
-            "rejectKey": rejected_package_key(item)
-        }));
-        reject_keys.push(rejected_package_key(item));
+        resource_cursor = page.next_cursor;
+        resource_did = page.next_resource_did;
     }
 
     if !request.dry_run {
@@ -4818,35 +5011,47 @@ async fn read_semantic_index_pending_packages(
     if !state.semantic.enabled {
         return Ok(vec![]);
     }
-    let rows = sqlx::query(&format!(
-        r#"
-        SELECT p.cursor, p.package_json::text, s.semantic_source_hash
-        FROM {DISCOVERY_PACKAGE_TABLE} p
-        LEFT JOIN {DISCOVERY_SEMANTIC_INDEX_TABLE} s
-          ON p.resource_did = s.resource_did
-         AND s.embedding_model = $1
-         AND s.embedding_version = $2
-        WHERE p.lifecycle_state = 'active'
-          AND p.resource_type = ANY($3)
-        ORDER BY p.cursor, p.resource_did
-        "#
-    ))
-    .bind(&state.semantic.embedding_model)
-    .bind(&state.semantic.embedding_version)
-    .bind(default_discoverable_resource_type_names())
-    .fetch_all(postgres.pool())
-    .await?;
+    let limit = limit.max(1) as usize;
     let mut pending = Vec::new();
-    for row in rows {
-        let cursor = row.get::<i64, _>(0);
-        let package = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?;
-        let projection = discovery_package_projection(&package);
-        let doc = search_document_from_package(cursor, &package, &projection);
-        let indexed_hash = row.get::<Option<String>, _>(2);
-        if indexed_hash.as_deref() != Some(doc.semantic_source_hash.as_str()) {
-            pending.push((cursor, package));
-            if pending.len() >= limit.max(1) as usize {
-                break;
+    let mut after_cursor = 0_i64;
+    loop {
+        let rows = sqlx::query(&format!(
+            r#"
+            SELECT p.cursor, p.package_json::text, s.semantic_source_hash
+            FROM {DISCOVERY_PACKAGE_TABLE} p
+            LEFT JOIN {DISCOVERY_SEMANTIC_INDEX_TABLE} s
+              ON p.resource_did = s.resource_did
+             AND s.embedding_model = $1
+             AND s.embedding_version = $2
+            WHERE p.cursor > $3
+              AND p.lifecycle_state = 'active'
+              AND p.resource_type = ANY($4)
+            ORDER BY p.cursor, p.resource_did
+            LIMIT $5
+            "#
+        ))
+        .bind(&state.semantic.embedding_model)
+        .bind(&state.semantic.embedding_version)
+        .bind(after_cursor)
+        .bind(default_discoverable_resource_type_names())
+        .bind(i64::from(DISCOVERY_SEMANTIC_REBUILD_PAGE_SIZE))
+        .fetch_all(postgres.pool())
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            let cursor = row.get::<i64, _>(0);
+            after_cursor = cursor;
+            let package = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?;
+            let projection = discovery_package_projection(&package);
+            let doc = search_document_from_package(cursor, &package, &projection);
+            let indexed_hash = row.get::<Option<String>, _>(2);
+            if indexed_hash.as_deref() != Some(doc.semantic_source_hash.as_str()) {
+                pending.push((cursor, package));
+                if pending.len() >= limit {
+                    return Ok(pending);
+                }
             }
         }
     }
@@ -4881,6 +5086,143 @@ async fn clear_semantic_indexes_for_current_model(
     Ok(())
 }
 
+async fn count_visible_indexed_resource_packages(state: &AppState) -> Result<usize> {
+    let mut count = 0usize;
+    let mut cursor = 0_i64;
+    let mut resource_did = None::<String>;
+    loop {
+        let page = read_visible_indexed_resource_page(
+            state,
+            cursor,
+            resource_did.as_deref(),
+            DISCOVERY_SEMANTIC_REBUILD_PAGE_SIZE,
+        )
+        .await?;
+        count += page.items.len();
+        if !page.has_more {
+            break;
+        }
+        cursor = page.next_cursor;
+        resource_did = page.next_resource_did;
+    }
+    Ok(count)
+}
+
+async fn read_visible_indexed_resource_page(
+    state: &AppState,
+    after_cursor: i64,
+    after_resource_did: Option<&str>,
+    limit: u32,
+) -> Result<CursorPage<(i64, ResourcePackage)>> {
+    let discovery_domains = local_discovery_authorized_domains(state)?;
+    let mut visible = Vec::new();
+    let mut cursor = after_cursor;
+    let mut resource_did = after_resource_did.map(ToOwned::to_owned);
+    loop {
+        let page = read_indexed_resource_page(state, cursor, resource_did.as_deref(), limit.max(1))
+            .await?;
+        if page.items.is_empty() {
+            return Ok(CursorPage {
+                items: visible,
+                next_cursor: cursor,
+                next_resource_did: resource_did,
+                has_more: false,
+            });
+        }
+        cursor = page.next_cursor;
+        resource_did = page.next_resource_did.clone();
+        visible.extend(page.items.into_iter().filter(|(_, package)| {
+            package.metadata.lifecycle_state == "active"
+                && is_user_consumable_resource_type(&package.resource_type)
+                && authorized_domains_cover(
+                    &discovery_domains,
+                    &package.metadata.authorized_domains,
+                )
+        }));
+        if visible.len() >= limit.max(1) as usize {
+            visible.truncate(limit.max(1) as usize);
+            let next_cursor = visible.last().map(|(cursor, _)| *cursor).unwrap_or(cursor);
+            let next_resource_did = visible
+                .last()
+                .map(|(_, package)| package.resource_did.clone());
+            return Ok(CursorPage {
+                items: visible,
+                next_cursor,
+                next_resource_did,
+                has_more: true,
+            });
+        }
+        if !page.has_more {
+            return Ok(CursorPage {
+                items: visible,
+                next_cursor: cursor,
+                next_resource_did: resource_did,
+                has_more: false,
+            });
+        }
+    }
+}
+
+fn projected_discovery_packages<'a>(
+    packages: &'a [(i64, ResourcePackage)],
+) -> Vec<DiscoveryProjectedPackage<'a>> {
+    packages
+        .iter()
+        .map(|(cursor, package)| DiscoveryProjectedPackage {
+            cursor: *cursor,
+            package,
+            package_json: serde_json::to_value(package).unwrap_or_else(|_| json!({})),
+            projection: discovery_package_projection(package),
+        })
+        .collect()
+}
+
+async fn process_semantic_rebuild_batch(
+    state: &AppState,
+    stage: SemanticRebuildStage,
+    page: &[(i64, ResourcePackage)],
+    batch_size: usize,
+) -> Result<usize> {
+    let mut processed = 0usize;
+    for chunk in page.chunks(batch_size.max(1)) {
+        let projected = projected_discovery_packages(chunk);
+        upsert_semantic_index_batch(state, &projected, stage).await?;
+        processed += chunk.len();
+    }
+    Ok(processed)
+}
+
+async fn process_semantic_rebuild_skip_batch(
+    state: &AppState,
+    stage: SemanticRebuildStage,
+    page: &[(i64, ResourcePackage)],
+    skipped_packages: &mut usize,
+) -> Result<usize> {
+    let mut processed = 0usize;
+    for (cursor, package) in page {
+        let single = [(*cursor, package.clone())];
+        let projected = projected_discovery_packages(&single);
+        match upsert_semantic_index_batch(state, &projected, stage).await {
+            Ok(()) => {
+                processed += 1;
+            }
+            Err(err) => {
+                *skipped_packages += 1;
+                processed += 1;
+                store_semantic_rebuild_skip(
+                    state,
+                    stage,
+                    *cursor,
+                    package.resource_did.clone(),
+                    err.to_string(),
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(processed)
+}
+
 async fn rebuild_semantic_indexes(
     state: &AppState,
     reset: bool,
@@ -4903,16 +5245,6 @@ async fn rebuild_semantic_indexes(
             skipped_reason: state.semantic.fallback_reason.clone(),
         });
     }
-    let packages = read_indexed_resource_packages(state).await?;
-    let visible = packages
-        .iter()
-        .enumerate()
-        .map(|(index, package)| (index as i64 + 1, package))
-        .filter(|(_, package)| {
-            package.metadata.lifecycle_state == "active"
-                && is_user_consumable_resource_type(&package.resource_type)
-        })
-        .collect::<Vec<_>>();
     let progress = if reset {
         None
     } else {
@@ -4920,18 +5252,21 @@ async fn rebuild_semantic_indexes(
     };
     let mut skipped_packages = 0usize;
     let mut retries = 0usize;
-    let mut last_cursor = None;
-    let mut index = progress
+    let mut processed = progress
         .as_ref()
-        .and_then(|record| {
-            visible
-                .iter()
-                .position(|(cursor, _)| Some(*cursor) == record.last_cursor)
-                .map(|pos| pos + 1)
-        })
-        .unwrap_or(0usize);
+        .map(|record| record.processed)
+        .unwrap_or(0);
+    let total = count_visible_indexed_resource_packages(state).await?;
+    let mut cursor = progress
+        .as_ref()
+        .and_then(|record| record.last_cursor)
+        .unwrap_or(0);
+    let mut last_cursor = progress.as_ref().and_then(|record| record.last_cursor);
+    let mut last_resource_did = progress
+        .as_ref()
+        .and_then(|record| record.last_resource_did.clone());
     let mut batch_size = state.config.semantic_search.embedding.batch_size.max(1);
-    if index > 0 {
+    if cursor > 0 {
         skipped_packages = 0;
         retries = 0;
     } else {
@@ -4939,28 +5274,34 @@ async fn rebuild_semantic_indexes(
         clear_semantic_rebuild_progress(state, stage).await?;
         clear_semantic_rebuild_skip_records(state, Some(stage)).await?;
     }
-    while index < visible.len() {
-        let end = (index + batch_size).min(visible.len());
-        let projected = visible[index..end]
-            .iter()
-            .map(|(cursor, package)| DiscoveryProjectedPackage {
-                cursor: *cursor,
-                package,
-                package_json: serde_json::to_value(package).unwrap_or_else(|_| json!({})),
-                projection: discovery_package_projection(package),
-            })
-            .collect::<Vec<_>>();
-        match upsert_semantic_index_batch(state, &projected, stage).await {
-            Ok(()) => {
-                last_cursor = projected.last().map(|item| item.cursor);
-                index = end;
+    loop {
+        let page_limit = batch_size
+            .min(DISCOVERY_SEMANTIC_REBUILD_PAGE_SIZE as usize)
+            .max(1) as u32;
+        let page = read_visible_indexed_resource_page(
+            state,
+            cursor,
+            last_resource_did.as_deref(),
+            page_limit,
+        )
+        .await?;
+        if page.items.is_empty() {
+            break;
+        }
+        match process_semantic_rebuild_batch(state, stage, &page.items, batch_size).await {
+            Ok(done) => {
+                processed += done;
+                last_cursor = page.items.last().map(|(cursor, _)| *cursor);
+                last_resource_did = page.next_resource_did.clone();
+                cursor = page.next_cursor;
                 store_semantic_rebuild_progress(
                     state,
                     stage,
                     "running",
                     last_cursor,
-                    index,
-                    visible.len(),
+                    last_resource_did.clone(),
+                    processed,
+                    total,
                     skipped_packages,
                     retries,
                     batch_size,
@@ -4976,8 +5317,9 @@ async fn rebuild_semantic_indexes(
                         stage,
                         "throttled",
                         last_cursor,
-                        index,
-                        visible.len(),
+                        last_resource_did.clone(),
+                        processed,
+                        total,
                         skipped_packages,
                         retries,
                         batch_size,
@@ -4985,34 +5327,35 @@ async fn rebuild_semantic_indexes(
                     .await?;
                     continue;
                 }
-                if let Some(failed) = projected.first() {
-                    skipped_packages += 1;
-                    index = end;
-                    last_cursor = Some(failed.cursor);
-                    store_semantic_rebuild_skip(
-                        state,
-                        stage,
-                        failed.cursor,
-                        failed.package.resource_did.clone(),
-                        err.to_string(),
-                    )
-                    .await?;
+                processed += process_semantic_rebuild_skip_batch(
+                    state,
+                    stage,
+                    &page.items,
+                    &mut skipped_packages,
+                )
+                .await?;
+                last_cursor = page.items.last().map(|(cursor, _)| *cursor);
+                last_resource_did = page.next_resource_did.clone();
+                cursor = page.next_cursor;
+                if last_cursor.is_some() {
                     store_semantic_rebuild_progress(
                         state,
                         stage,
                         "skip",
                         last_cursor,
-                        index,
-                        visible.len(),
+                        last_resource_did.clone(),
+                        processed,
+                        total,
                         skipped_packages,
                         retries,
                         batch_size,
                     )
                     .await?;
-                    continue;
                 }
-                return Err(err);
             }
+        }
+        if !page.has_more {
+            break;
         }
     }
     let final_phase = if skipped_packages == 0 {
@@ -5025,8 +5368,9 @@ async fn rebuild_semantic_indexes(
         stage,
         final_phase,
         last_cursor,
-        index,
-        visible.len(),
+        last_resource_did.clone(),
+        processed,
+        total,
         skipped_packages,
         retries,
         batch_size,
@@ -5037,7 +5381,7 @@ async fn rebuild_semantic_indexes(
         stage: stage.as_str().to_owned(),
         backend: discovery_backend_name(state),
         semantic_enabled: true,
-        package_count: visible.len(),
+        package_count: total,
         context_indexed_count: count_semantic_indexed_resources(state)
             .await?
             .unwrap_or_default() as usize,
@@ -5096,24 +5440,19 @@ async fn backfill_skipped_semantic_indexes(
         });
     }
 
-    let indexed = read_indexed_resource_packages(state).await?;
-    let by_did = indexed
-        .into_iter()
-        .map(|package| (package.resource_did.clone(), package))
-        .collect::<BTreeMap<_, _>>();
     let mut recovered = 0usize;
     let mut skipped_packages = 0usize;
     let mut retries = 0usize;
     let mut last_cursor = None;
 
     for record in skipped {
-        if let Some(package) = by_did.get(&record.resource_did) {
+        if let Some(package) = read_indexed_resource_package(state, &record.resource_did).await? {
             let cursor = record.cursor.max(1);
             let projected = DiscoveryProjectedPackage {
                 cursor,
-                package,
-                package_json: serde_json::to_value(package).unwrap_or_else(|_| json!({})),
-                projection: discovery_package_projection(package),
+                package: &package,
+                package_json: serde_json::to_value(&package).unwrap_or_else(|_| json!({})),
+                projection: discovery_package_projection(&package),
             };
             match upsert_semantic_index_batch(state, &[projected], stage).await {
                 Ok(()) => {
@@ -5176,11 +5515,13 @@ async fn clear_semantic_rebuild_skip_records(
         .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn store_semantic_rebuild_progress(
     state: &AppState,
     stage: SemanticRebuildStage,
     phase: &str,
     last_cursor: Option<i64>,
+    last_resource_did: Option<String>,
     processed: usize,
     total: usize,
     skipped_packages: usize,
@@ -5191,6 +5532,7 @@ async fn store_semantic_rebuild_progress(
         stage: stage.as_str().to_owned(),
         phase: phase.to_owned(),
         last_cursor,
+        last_resource_did,
         processed,
         total,
         skipped_packages,
@@ -5615,8 +5957,7 @@ async fn query_indexed_resource_packages(
             .as_ref()
             .map(|value| value.trim())
             .filter(|value| !value.is_empty());
-        if query_text.is_some() {
-            let text = query_text.expect("checked query text");
+        if let Some(text) = query_text {
             builder.push(" AND (");
             builder.push("to_tsvector('simple', tag_text) @@ plainto_tsquery('simple', ");
             builder.push_bind(text.to_ascii_lowercase());
@@ -5642,7 +5983,13 @@ async fn query_indexed_resource_packages(
             }
             builder.push(")) DESC, updated_at DESC, resource_did LIMIT ");
         } else if should_use_sql_text_prefilter(query) {
-            let text = query.query.as_ref().expect("checked query text");
+            let Some(text) = query
+                .query
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+            else {
+                unreachable!("text prefilter requires a non-empty query");
+            };
             builder.push(
                 " ORDER BY ts_rank_cd(to_tsvector('simple', search_text), plainto_tsquery('simple', ",
             );
@@ -5999,6 +6346,196 @@ fn discovery_sql_candidate_limit_for_query(query: &ResourceDiscoveryQuery) -> i6
     }
     let requested = query.limit.max(1) as i64;
     (requested * 50).clamp(200, 5_000).max(requested)
+}
+
+fn validated_discovery_page_limit(limit: Option<u32>) -> std::result::Result<u32, ApiError> {
+    let limit = limit.unwrap_or(DISCOVERY_DEFAULT_PAGE_SIZE);
+    if limit == 0 || limit > DISCOVERY_MAX_PAGE_SIZE {
+        return Err(ApiError::bad_request("invalid_discovery_page_limit"));
+    }
+    Ok(limit)
+}
+
+fn resource_package_summary(cursor: i64, package: &ResourcePackage) -> Value {
+    json!({
+        "cursor": cursor,
+        "resourceDid": package.resource_did,
+        "resourceType": package.resource_type,
+        "name": package.metadata.name,
+        "description": package.metadata.description,
+        "capabilityTags": package.metadata.capability_tags,
+        "services": package.metadata.services,
+        "lifecycleState": package.metadata.lifecycle_state,
+        "version": package.package_version,
+        "updatedAt": package.metadata.updated_at
+    })
+}
+
+async fn read_indexed_resource_page(
+    state: &AppState,
+    after_cursor: i64,
+    after_resource_did: Option<&str>,
+    limit: u32,
+) -> Result<CursorPage<(i64, ResourcePackage)>> {
+    let page_limit = i64::from(limit.max(1));
+    let fetch_limit = page_limit + 1;
+    let mut items = Vec::new();
+    if let Some(sqlite) = &state.sqlite {
+        let rows = if let Some(after_resource_did) = after_resource_did {
+            sqlx::query(&format!(
+                r#"
+                SELECT cursor, package_json
+                FROM {DISCOVERY_PACKAGE_TABLE}
+                WHERE cursor > ? OR (cursor = ? AND resource_did > ?)
+                ORDER BY cursor, resource_did
+                LIMIT ?
+                "#
+            ))
+            .bind(after_cursor)
+            .bind(after_cursor)
+            .bind(after_resource_did)
+            .bind(fetch_limit)
+            .fetch_all(sqlite.pool())
+            .await?
+        } else {
+            sqlx::query(&format!(
+                r#"
+                SELECT cursor, package_json
+                FROM {DISCOVERY_PACKAGE_TABLE}
+                WHERE cursor > ?
+                ORDER BY cursor, resource_did
+                LIMIT ?
+                "#
+            ))
+            .bind(after_cursor)
+            .bind(fetch_limit)
+            .fetch_all(sqlite.pool())
+            .await?
+        };
+        for row in rows {
+            items.push((
+                row.get::<i64, _>(0),
+                serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?,
+            ));
+        }
+    } else if let Some(postgres) = &state.postgres {
+        let rows = if let Some(after_resource_did) = after_resource_did {
+            sqlx::query(&format!(
+                r#"
+                SELECT cursor, package_json::text
+                FROM {DISCOVERY_PACKAGE_TABLE}
+                WHERE cursor > $1 OR (cursor = $1 AND resource_did > $2)
+                ORDER BY cursor, resource_did
+                LIMIT $3
+                "#
+            ))
+            .bind(after_cursor)
+            .bind(after_resource_did)
+            .bind(fetch_limit)
+            .fetch_all(postgres.pool())
+            .await?
+        } else {
+            sqlx::query(&format!(
+                r#"
+                SELECT cursor, package_json::text
+                FROM {DISCOVERY_PACKAGE_TABLE}
+                WHERE cursor > $1
+                ORDER BY cursor, resource_did
+                LIMIT $2
+                "#
+            ))
+            .bind(after_cursor)
+            .bind(fetch_limit)
+            .fetch_all(postgres.pool())
+            .await?
+        };
+        for row in rows {
+            items.push((
+                row.get::<i64, _>(0),
+                serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?,
+            ));
+        }
+    } else {
+        let mut indexed = state
+            .index
+            .read::<Vec<ResourcePackage>>("resource-capabilities.json")
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(index, package)| (index as i64 + 1, package))
+            .filter(|(cursor, package)| {
+                *cursor > after_cursor
+                    || (*cursor == after_cursor
+                        && after_resource_did
+                            .map(|did| package.resource_did.as_str() > did)
+                            .unwrap_or(false))
+            })
+            .collect::<Vec<_>>();
+        indexed.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then(left.1.resource_did.cmp(&right.1.resource_did))
+        });
+        items = indexed.into_iter().take(fetch_limit as usize).collect();
+    }
+    let has_more = items.len() as i64 > page_limit;
+    if has_more {
+        items.truncate(page_limit as usize);
+    }
+    let next_cursor = items
+        .last()
+        .map(|(cursor, _)| *cursor)
+        .unwrap_or(after_cursor);
+    let next_resource_did = items
+        .last()
+        .map(|(_, package)| package.resource_did.clone());
+    Ok(CursorPage {
+        items,
+        next_cursor,
+        next_resource_did,
+        has_more,
+    })
+}
+
+async fn read_indexed_resource_summary_page(
+    state: &AppState,
+    after_cursor: i64,
+    after_resource_did: Option<&str>,
+    limit: u32,
+) -> Result<CursorPage<Value>> {
+    let page = read_indexed_resource_page(state, after_cursor, after_resource_did, limit).await?;
+    Ok(CursorPage {
+        next_cursor: page.next_cursor,
+        next_resource_did: page.next_resource_did,
+        has_more: page.has_more,
+        items: page
+            .items
+            .into_iter()
+            .map(|(cursor, package)| resource_package_summary(cursor, &package))
+            .collect(),
+    })
+}
+
+async fn read_visible_indexed_resource_did_page(
+    state: &AppState,
+    after_cursor: i64,
+    after_resource_did: Option<&str>,
+    limit: u32,
+) -> Result<CursorPage<String>> {
+    let page =
+        read_visible_indexed_resource_page(state, after_cursor, after_resource_did, limit).await?;
+    let next_cursor = page.next_cursor;
+    let has_more = page.has_more;
+    Ok(CursorPage {
+        items: page
+            .items
+            .into_iter()
+            .map(|(_, package)| package.resource_did)
+            .collect(),
+        has_more,
+        next_cursor,
+        next_resource_did: page.next_resource_did,
+    })
 }
 
 async fn read_indexed_resource_packages(state: &AppState) -> Result<Vec<ResourcePackage>> {
@@ -6548,11 +7085,11 @@ async fn merge_rejected_packages(state: &AppState, rejected: &[Value]) -> Result
     if rejected.is_empty() {
         return Ok(());
     }
-    let existing = read_rejected_packages(state).await?;
-    let existing_by_key = existing
-        .into_iter()
-        .map(|item| (rejected_package_key(&item), item))
-        .collect::<BTreeMap<_, _>>();
+    let keys = rejected
+        .iter()
+        .map(rejected_package_key)
+        .collect::<Vec<_>>();
+    let existing_by_key = read_rejected_packages_by_keys(state, &keys).await?;
     let merged = rejected
         .iter()
         .map(|item| {
@@ -6561,6 +7098,60 @@ async fn merge_rejected_packages(state: &AppState, rejected: &[Value]) -> Result
         })
         .collect::<Vec<_>>();
     write_rejected_packages(state, &merged).await
+}
+
+async fn read_rejected_packages_by_keys(
+    state: &AppState,
+    reject_keys: &[String],
+) -> Result<BTreeMap<String, Value>> {
+    if reject_keys.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    if let Some(sqlite) = &state.sqlite {
+        let mut out = BTreeMap::new();
+        for reject_key in reject_keys {
+            if let Some(row) = sqlx::query(&format!(
+                "SELECT item_json FROM {DISCOVERY_REJECTED_TABLE} WHERE reject_key = ?"
+            ))
+            .bind(reject_key)
+            .fetch_optional(sqlite.pool())
+            .await?
+            {
+                out.insert(
+                    reject_key.clone(),
+                    serde_json::from_str::<Value>(&row.get::<String, _>(0))?,
+                );
+            }
+        }
+        return Ok(out);
+    }
+    if let Some(postgres) = &state.postgres {
+        let mut out = BTreeMap::new();
+        for reject_key in reject_keys {
+            if let Some(row) = sqlx::query(&format!(
+                "SELECT item_json::text FROM {DISCOVERY_REJECTED_TABLE} WHERE reject_key = $1"
+            ))
+            .bind(reject_key)
+            .fetch_optional(postgres.pool())
+            .await?
+            {
+                out.insert(
+                    reject_key.clone(),
+                    serde_json::from_str::<Value>(&row.get::<String, _>(0))?,
+                );
+            }
+        }
+        return Ok(out);
+    }
+    let key_set = reject_keys.iter().collect::<HashSet<_>>();
+    Ok(read_rejected_packages(state)
+        .await?
+        .into_iter()
+        .filter_map(|item| {
+            let key = rejected_package_key(&item);
+            key_set.contains(&key).then_some((key, item))
+        })
+        .collect())
 }
 
 fn merge_rejected_package_item(existing: Option<&Value>, incoming: &Value) -> Value {
@@ -6694,32 +7285,208 @@ async fn delete_rejected_packages(state: &AppState, reject_keys: &[String]) -> R
     Ok(())
 }
 
-async fn read_sync_history(state: &AppState) -> Result<Vec<Value>> {
+async fn read_latest_sync_history_item(state: &AppState) -> Result<Option<Value>> {
     if let Some(sqlite) = &state.sqlite {
-        return sqlite
-            .read_namespace("discovery.sync_history")
-            .await
-            .map_err(Into::into);
+        let row = sqlx::query(
+            "SELECT value_json FROM json_records WHERE namespace = ? ORDER BY updated_at DESC, record_key DESC LIMIT 1",
+        )
+        .bind("discovery.sync_history")
+        .fetch_optional(sqlite.pool())
+        .await?;
+        return row
+            .map(|row| {
+                serde_json::from_str::<Value>(&row.get::<String, _>(0)).map_err(anyhow::Error::from)
+            })
+            .transpose();
     }
     if let Some(postgres) = &state.postgres {
-        return postgres
-            .read_namespace("discovery.sync_history")
-            .await
-            .map_err(Into::into);
+        let row = sqlx::query(
+            "SELECT value_json::text FROM json_records WHERE namespace = $1 ORDER BY updated_at DESC, record_key DESC LIMIT 1",
+        )
+        .bind("discovery.sync_history")
+        .fetch_optional(postgres.pool())
+        .await?;
+        return row
+            .map(|row| {
+                serde_json::from_str::<Value>(&row.get::<String, _>(0)).map_err(anyhow::Error::from)
+            })
+            .transpose();
     }
-    Ok(state.index.read("sync-history.json").unwrap_or_default())
+    Ok(state
+        .index
+        .read::<Vec<Value>>("sync-history.json")
+        .unwrap_or_default()
+        .into_iter()
+        .last())
+}
+
+async fn read_sync_history_page(
+    state: &AppState,
+    after_key: Option<&str>,
+    limit: u32,
+) -> Result<KeyPage<Value>> {
+    let fetch_limit = i64::from(limit.max(1) + 1);
+    let mut rows = Vec::<(String, Value)>::new();
+    if let Some(sqlite) = &state.sqlite {
+        let db_rows = if let Some(after_key) = after_key {
+            sqlx::query(
+                "SELECT record_key, value_json FROM json_records WHERE namespace = ? AND record_key > ? ORDER BY record_key LIMIT ?",
+            )
+            .bind("discovery.sync_history")
+            .bind(after_key)
+            .bind(fetch_limit)
+            .fetch_all(sqlite.pool())
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT record_key, value_json FROM json_records WHERE namespace = ? ORDER BY record_key LIMIT ?",
+            )
+            .bind("discovery.sync_history")
+            .bind(fetch_limit)
+            .fetch_all(sqlite.pool())
+            .await?
+        };
+        for row in db_rows {
+            rows.push((
+                row.get::<String, _>(0),
+                serde_json::from_str::<Value>(&row.get::<String, _>(1))?,
+            ));
+        }
+    } else if let Some(postgres) = &state.postgres {
+        let db_rows = if let Some(after_key) = after_key {
+            sqlx::query(
+                "SELECT record_key, value_json::text FROM json_records WHERE namespace = $1 AND record_key > $2 ORDER BY record_key LIMIT $3",
+            )
+            .bind("discovery.sync_history")
+            .bind(after_key)
+            .bind(fetch_limit)
+            .fetch_all(postgres.pool())
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT record_key, value_json::text FROM json_records WHERE namespace = $1 ORDER BY record_key LIMIT $2",
+            )
+            .bind("discovery.sync_history")
+            .bind(fetch_limit)
+            .fetch_all(postgres.pool())
+            .await?
+        };
+        for row in db_rows {
+            rows.push((
+                row.get::<String, _>(0),
+                serde_json::from_str::<Value>(&row.get::<String, _>(1))?,
+            ));
+        }
+    } else {
+        rows = state
+            .index
+            .read::<Vec<Value>>("sync-history.json")
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| ((index + 1).to_string(), item))
+            .filter(|(key, _)| {
+                after_key
+                    .and_then(|cursor| cursor.parse::<usize>().ok())
+                    .map(|cursor| key.parse::<usize>().unwrap_or_default() > cursor)
+                    .unwrap_or(true)
+            })
+            .collect();
+        rows.truncate(fetch_limit as usize);
+    }
+    key_page_from_rows(rows, limit)
 }
 
 async fn export_discovery_debug_snapshot(state: &AppState) -> Result<()> {
     if state.sqlite.is_none() && state.postgres.is_none() {
         return Ok(());
     }
-    let packages = read_indexed_resource_packages(state).await?;
-    state.index.write("resource-capabilities.json", &packages)?;
-    let rejected = read_rejected_packages(state).await?;
-    state.index.write("rejected-packages.json", &rejected)?;
-    let history = read_sync_history(state).await?;
-    state.index.write("sync-history.json", &history)?;
+    fs::create_dir_all(state.index.root())?;
+
+    let resource_path = state.index.resolve("resource-capabilities.json");
+    let resource_tmp_path = state.index.resolve("resource-capabilities.json.tmp");
+    let mut resource_writer = BufWriter::new(fs::File::create(&resource_tmp_path)?);
+    resource_writer.write_all(b"[\n")?;
+    let mut first = true;
+    let mut cursor = 0_i64;
+    loop {
+        let page =
+            read_indexed_resource_page(state, cursor, None, DISCOVERY_DEFAULT_PAGE_SIZE).await?;
+        if page.items.is_empty() {
+            break;
+        }
+        for (_, package) in page.items {
+            if !first {
+                resource_writer.write_all(b",\n")?;
+            }
+            serde_json::to_writer_pretty(&mut resource_writer, &package)?;
+            first = false;
+        }
+        if !page.has_more {
+            break;
+        }
+        cursor = page.next_cursor;
+    }
+    resource_writer.write_all(b"\n]\n")?;
+    resource_writer.flush()?;
+    fs::rename(&resource_tmp_path, &resource_path)?;
+
+    let rejected_path = state.index.resolve("rejected-packages.json");
+    let rejected_tmp_path = state.index.resolve("rejected-packages.json.tmp");
+    let mut rejected_writer = BufWriter::new(fs::File::create(&rejected_tmp_path)?);
+    rejected_writer.write_all(b"[\n")?;
+    let mut first = true;
+    let mut key = None::<String>;
+    loop {
+        let page =
+            read_rejected_packages_page(state, key.as_deref(), DISCOVERY_DEFAULT_PAGE_SIZE, None)
+                .await?;
+        if page.items.is_empty() {
+            break;
+        }
+        for item in page.items {
+            if !first {
+                rejected_writer.write_all(b",\n")?;
+            }
+            serde_json::to_writer_pretty(&mut rejected_writer, &item)?;
+            first = false;
+        }
+        if !page.has_more {
+            break;
+        }
+        key = page.next_key;
+    }
+    rejected_writer.write_all(b"\n]\n")?;
+    rejected_writer.flush()?;
+    fs::rename(&rejected_tmp_path, &rejected_path)?;
+
+    let history_path = state.index.resolve("sync-history.json");
+    let history_tmp_path = state.index.resolve("sync-history.json.tmp");
+    let mut history_writer = BufWriter::new(fs::File::create(&history_tmp_path)?);
+    history_writer.write_all(b"[\n")?;
+    let mut first = true;
+    let mut key = None::<String>;
+    loop {
+        let page =
+            read_sync_history_page(state, key.as_deref(), DISCOVERY_DEFAULT_PAGE_SIZE).await?;
+        if page.items.is_empty() {
+            break;
+        }
+        for item in page.items {
+            if !first {
+                history_writer.write_all(b",\n")?;
+            }
+            serde_json::to_writer_pretty(&mut history_writer, &item)?;
+            first = false;
+        }
+        if !page.has_more {
+            break;
+        }
+        key = page.next_key;
+    }
+    history_writer.write_all(b"\n]\n")?;
+    history_writer.flush()?;
+    fs::rename(&history_tmp_path, &history_path)?;
     Ok(())
 }
 
@@ -6754,6 +7521,166 @@ async fn read_rejected_packages(state: &AppState) -> Result<Vec<Value>> {
         .index
         .read("rejected-packages.json")
         .unwrap_or_default())
+}
+
+async fn read_rejected_packages_page(
+    state: &AppState,
+    after_key: Option<&str>,
+    limit: u32,
+    status: Option<&str>,
+) -> Result<KeyPage<Value>> {
+    let fetch_limit = i64::from(limit.max(1) + 1);
+    let mut rows = Vec::<(String, Value)>::new();
+    if let Some(sqlite) = &state.sqlite {
+        let mut builder = QueryBuilder::<Sqlite>::new(format!(
+            "SELECT reject_key, item_json FROM {DISCOVERY_REJECTED_TABLE}"
+        ));
+        let mut separated = false;
+        if let Some(after_key) = after_key {
+            builder.push(" WHERE reject_key > ");
+            builder.push_bind(after_key);
+            separated = true;
+        }
+        if let Some(status) = status {
+            builder.push(if separated { " AND " } else { " WHERE " });
+            builder.push("COALESCE(json_extract(item_json, '$.status'), ");
+            builder.push_bind(REJECT_STATUS_LATE);
+            builder.push(") = ");
+            builder.push_bind(status);
+        }
+        builder.push(" ORDER BY reject_key LIMIT ");
+        builder.push_bind(fetch_limit);
+        let db_rows = builder.build().fetch_all(sqlite.pool()).await?;
+        for row in db_rows {
+            let item = serde_json::from_str::<Value>(&row.get::<String, _>(1))?;
+            rows.push((row.get::<String, _>(0), item));
+        }
+    } else if let Some(postgres) = &state.postgres {
+        let mut builder = QueryBuilder::<Postgres>::new(format!(
+            "SELECT reject_key, item_json::text FROM {DISCOVERY_REJECTED_TABLE}"
+        ));
+        let mut separated = false;
+        if let Some(after_key) = after_key {
+            builder.push(" WHERE reject_key > ");
+            builder.push_bind(after_key);
+            separated = true;
+        }
+        if let Some(status) = status {
+            builder.push(if separated { " AND " } else { " WHERE " });
+            builder.push("COALESCE(item_json->>'status', ");
+            builder.push_bind(REJECT_STATUS_LATE);
+            builder.push(") = ");
+            builder.push_bind(status);
+        }
+        builder.push(" ORDER BY reject_key LIMIT ");
+        builder.push_bind(fetch_limit);
+        let db_rows = builder.build().fetch_all(postgres.pool()).await?;
+        for row in db_rows {
+            let item = serde_json::from_str::<Value>(&row.get::<String, _>(1))?;
+            rows.push((row.get::<String, _>(0), item));
+        }
+    } else {
+        rows = state
+            .index
+            .read::<Vec<Value>>("rejected-packages.json")
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| (rejected_package_key(&item), item))
+            .filter(|(key, item)| {
+                after_key
+                    .map(|cursor| key.as_str() > cursor)
+                    .unwrap_or(true)
+                    && status_matches_rejected_item(item, status)
+            })
+            .collect();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        rows.truncate(fetch_limit as usize);
+    }
+    key_page_from_rows(rows, limit)
+}
+
+fn key_page_from_rows<T>(mut rows: Vec<(String, T)>, limit: u32) -> Result<KeyPage<T>> {
+    let page_limit = limit.max(1) as usize;
+    let has_more = rows.len() > page_limit;
+    if has_more {
+        rows.truncate(page_limit);
+    }
+    let next_key = rows.last().map(|(key, _)| key.clone());
+    Ok(KeyPage {
+        items: rows.into_iter().map(|(_, item)| item).collect(),
+        next_key,
+        has_more,
+    })
+}
+
+fn status_matches_rejected_item(item: &Value, status: Option<&str>) -> bool {
+    status
+        .map(|status| rejected_package_status(item) == status)
+        .unwrap_or(true)
+}
+
+async fn rejected_package_retry_summary_from_store(state: &AppState) -> Result<Value> {
+    if let Some(sqlite) = &state.sqlite {
+        let rows = sqlx::query(&format!(
+            r#"
+            SELECT COALESCE(json_extract(item_json, '$.status'), ?), COUNT(*)
+            FROM {DISCOVERY_REJECTED_TABLE}
+            WHERE json_extract(item_json, '$.reason') = ?
+            GROUP BY COALESCE(json_extract(item_json, '$.status'), ?)
+            "#
+        ))
+        .bind(REJECT_STATUS_LATE)
+        .bind(REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE)
+        .bind(REJECT_STATUS_LATE)
+        .fetch_all(sqlite.pool())
+        .await?;
+        let late_count = rows
+            .iter()
+            .find(|row| row.get::<Option<String>, _>(0).as_deref() == Some(REJECT_STATUS_LATE))
+            .map(|row| row.get::<i64, _>(1) as usize)
+            .unwrap_or_default();
+        let dead_count = rows
+            .iter()
+            .find(|row| row.get::<Option<String>, _>(0).as_deref() == Some(REJECT_STATUS_DEAD))
+            .map(|row| row.get::<i64, _>(1) as usize)
+            .unwrap_or_default();
+        return Ok(rejected_package_retry_summary_from_counts(
+            late_count, dead_count,
+        ));
+    }
+    if let Some(postgres) = &state.postgres {
+        let rows = sqlx::query(&format!(
+            r#"
+            SELECT COALESCE(item_json->>'status', $1), COUNT(*)
+            FROM {DISCOVERY_REJECTED_TABLE}
+            WHERE item_json->>'reason' = $2
+            GROUP BY COALESCE(item_json->>'status', $1)
+            "#
+        ))
+        .bind(REJECT_STATUS_LATE)
+        .bind(REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE)
+        .fetch_all(postgres.pool())
+        .await?;
+        let late_count = rows
+            .iter()
+            .find(|row| row.get::<Option<String>, _>(0).as_deref() == Some(REJECT_STATUS_LATE))
+            .map(|row| row.get::<i64, _>(1) as usize)
+            .unwrap_or_default();
+        let dead_count = rows
+            .iter()
+            .find(|row| row.get::<Option<String>, _>(0).as_deref() == Some(REJECT_STATUS_DEAD))
+            .map(|row| row.get::<i64, _>(1) as usize)
+            .unwrap_or_default();
+        return Ok(rejected_package_retry_summary_from_counts(
+            late_count, dead_count,
+        ));
+    }
+    Ok(rejected_package_retry_summary(
+        &state
+            .index
+            .read::<Vec<Value>>("rejected-packages.json")
+            .unwrap_or_default(),
+    ))
 }
 
 fn validate_resource_package_for_index(
@@ -7630,6 +8557,7 @@ mod tests {
             SemanticRebuildStage::Context,
             "running",
             Some(3),
+            Some("did:oan:SKLG:context".to_owned()),
             10,
             1,
             0,
@@ -7643,6 +8571,7 @@ mod tests {
             SemanticRebuildStage::Intent,
             "running",
             Some(8),
+            Some("did:oan:SKLG:intent".to_owned()),
             10,
             2,
             1,
@@ -8435,6 +9364,262 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_index_resources_returns_bounded_cursor_pages() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        let first =
+            sample_resource_package_with_did("did:oan:SKLG:11111111111111111111111111111111");
+        let second =
+            sample_resource_package_with_did("did:oan:SKLG:22222222222222222222222222222222");
+        let third =
+            sample_resource_package_with_did("did:oan:SKLG:33333333333333333333333333333333");
+        upsert_indexed_resource_package(&state, 1, &first)
+            .await
+            .unwrap();
+        upsert_indexed_resource_package(&state, 2, &second)
+            .await
+            .unwrap();
+        upsert_indexed_resource_package(&state, 3, &third)
+            .await
+            .unwrap();
+
+        let first_page = api_index_resources(
+            State(state.clone()),
+            Query(DiscoveryPageQuery {
+                limit: Some(2),
+                ..DiscoveryPageQuery::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_page.0["count"], 2);
+        assert_eq!(first_page.0["nextCursor"], 2);
+        assert_eq!(first_page.0["hasMore"], true);
+
+        let second_page = api_index_resources(
+            State(state),
+            Query(DiscoveryPageQuery {
+                after_cursor: Some(2),
+                limit: Some(2),
+                ..DiscoveryPageQuery::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second_page.0["count"], 1);
+        assert_eq!(second_page.0["items"][0]["resourceDid"], third.resource_did);
+        assert_eq!(second_page.0["hasMore"], false);
+    }
+
+    #[tokio::test]
+    async fn api_index_resources_uses_resource_did_tiebreaker_for_equal_cursors() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        let first =
+            sample_resource_package_with_did("did:oan:SKLG:11111111111111111111111111111111");
+        let second =
+            sample_resource_package_with_did("did:oan:SKLG:22222222222222222222222222222222");
+        upsert_indexed_resource_package(&state, 7, &first)
+            .await
+            .unwrap();
+        upsert_indexed_resource_package(&state, 7, &second)
+            .await
+            .unwrap();
+
+        let first_page = api_index_resources(
+            State(state.clone()),
+            Query(DiscoveryPageQuery {
+                limit: Some(1),
+                ..DiscoveryPageQuery::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_page.0["items"].as_array().unwrap().len(), 1);
+        assert_eq!(first_page.0["nextCursor"], 7);
+        assert_eq!(
+            first_page.0["nextResourceDid"],
+            "did:oan:SKLG:11111111111111111111111111111111"
+        );
+        assert_eq!(first_page.0["hasMore"], true);
+
+        let second_page = api_index_resources(
+            State(state),
+            Query(DiscoveryPageQuery {
+                after_cursor: Some(7),
+                after_resource_did: first_page.0["nextResourceDid"]
+                    .as_str()
+                    .map(ToOwned::to_owned),
+                limit: Some(1),
+                ..DiscoveryPageQuery::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second_page.0["items"][0]["resourceDid"],
+            "did:oan:SKLG:22222222222222222222222222222222"
+        );
+        assert_eq!(second_page.0["hasMore"], false);
+    }
+
+    #[tokio::test]
+    async fn api_sync_history_pages_and_status_uses_latest_item() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        write_sync_history_store(&state, json!({"cursor": 1, "state": "first"}))
+            .await
+            .unwrap();
+        write_sync_history_store(&state, json!({"cursor": 2, "state": "second"}))
+            .await
+            .unwrap();
+        write_sync_history_store(&state, json!({"cursor": 3, "state": "third"}))
+            .await
+            .unwrap();
+
+        let page = api_sync_history(
+            State(state.clone()),
+            Query(DiscoveryPageQuery {
+                limit: Some(2),
+                ..DiscoveryPageQuery::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.0["count"], 2);
+        assert_eq!(page.0["hasMore"], true);
+        let next_key = page.0["nextKey"].as_str().unwrap().to_owned();
+
+        let tail = api_sync_history(
+            State(state.clone()),
+            Query(DiscoveryPageQuery {
+                after_key: Some(next_key),
+                limit: Some(2),
+                ..DiscoveryPageQuery::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tail.0["count"], 1);
+        assert_eq!(tail.0["items"][0]["state"], "third");
+
+        let status = api_status(State(state)).await.unwrap();
+        assert_eq!(status.0["lastSync"]["state"], "third");
+    }
+
+    #[test]
+    fn json_sync_history_page_uses_numeric_cursor_order() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        state
+            .index
+            .write(
+                "sync-history.json",
+                &(1..=12)
+                    .map(|cursor| json!({"cursor": cursor}))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let page = runtime
+            .block_on(read_sync_history_page(&state, Some("9"), 5))
+            .unwrap();
+        assert_eq!(page.items.len(), 3);
+        assert_eq!(page.items[0]["cursor"], 10);
+        assert_eq!(page.items[2]["cursor"], 12);
+    }
+
+    #[tokio::test]
+    async fn api_rejected_packages_pages_by_status_and_reports_global_retry_summary() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        write_rejected_packages(
+            &state,
+            &[
+                json!({
+                    "resourceDid": "did:oan:SKLG:late-1",
+                    "reason": REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE,
+                    "status": REJECT_STATUS_LATE
+                }),
+                json!({
+                    "resourceDid": "did:oan:SKLG:dead-1",
+                    "reason": REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE,
+                    "status": REJECT_STATUS_DEAD
+                }),
+                json!({
+                    "resourceDid": "did:oan:SKLG:invalid",
+                    "reason": "invalid_package",
+                    "status": REJECT_STATUS_LATE
+                }),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let page = api_rejected_packages(
+            State(state),
+            Query(DiscoveryPageQuery {
+                limit: Some(1),
+                status: Some(REJECT_STATUS_LATE.to_owned()),
+                ..DiscoveryPageQuery::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.0["count"], 1);
+        assert_eq!(page.0["hasMore"], true);
+        assert_eq!(page.0["items"][0]["status"], REJECT_STATUS_LATE);
+        assert_eq!(page.0["retry"]["lateCount"], 1);
+        assert_eq!(page.0["retry"]["deadCount"], 1);
+    }
+
+    #[tokio::test]
+    async fn late_retry_counts_legacy_unavailable_records_without_status() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        write_rejected_packages(
+            &state,
+            &[json!({
+                "resourceDid": "did:oan:SKLG:legacy-late",
+                "reason": REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE
+            })],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(count_late_rejected_packages(&state).await.unwrap(), 1);
+        assert_eq!(
+            read_late_rejected_packages(&state, 10).await.unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn visible_indexed_resource_page_respects_authorized_domains() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        write_discovery_document(&state, vec!["legal".to_owned()]);
+        let legal =
+            sample_resource_package_with_did("did:oan:SKLG:11111111111111111111111111111111");
+        let mut finance =
+            sample_resource_package_with_did("did:oan:SKLG:22222222222222222222222222222222");
+        set_package_authorized_domains(&mut finance, vec!["finance".to_owned()]);
+        upsert_indexed_resource_package(&state, 1, &legal)
+            .await
+            .unwrap();
+        upsert_indexed_resource_package(&state, 2, &finance)
+            .await
+            .unwrap();
+
+        let page = read_visible_indexed_resource_did_page(&state, 0, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(page.items, vec![legal.resource_did]);
+        assert!(!page.has_more);
+    }
+
+    #[tokio::test]
     async fn resource_query_reports_no_candidates_for_indexed_mismatch() {
         let dir = tempdir().unwrap();
         let state = app_state_with_sqlite(dir.path()).await;
@@ -8705,7 +9890,7 @@ mod tests {
         assert_eq!(status["embeddingProvider"], "http-embedding");
         assert_eq!(status["embeddingModel"], "gte-multilingual-base");
         assert_eq!(status["fallbackUsed"], true);
-        assert!(status["fallbackReason"].as_str().unwrap().len() > 0);
+        assert!(!status["fallbackReason"].as_str().unwrap().is_empty());
     }
 
     #[test]
