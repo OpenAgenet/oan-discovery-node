@@ -6388,7 +6388,7 @@ async fn read_indexed_resource_page(
     let page_limit = i64::from(limit.max(1));
     let mut items = Vec::new();
     let mut page_bytes = 0_usize;
-    let mut has_more = false;
+    let has_more;
     if let Some(sqlite) = &state.sqlite {
         if let Some(after_resource_did) = after_resource_did {
             let query = format!(
@@ -6419,7 +6419,7 @@ async fn read_indexed_resource_page(
                 items
                     .last()
                     .map(|(cursor, package)| (*cursor, package.resource_did.as_str()))
-                    .or_else(|| after_resource_did.map(|did| (after_cursor, did))),
+                    .or(Some((after_cursor, after_resource_did))),
             )
             .await?;
         } else {
@@ -6433,9 +6433,9 @@ async fn read_indexed_resource_page(
                 "#
             );
             let mut rows = sqlx::query(&query)
-            .bind(after_cursor)
-            .bind(page_limit)
-            .fetch(sqlite.pool());
+                .bind(after_cursor)
+                .bind(page_limit)
+                .fetch(sqlite.pool());
             while let Some(row) = rows.try_next().await? {
                 push_indexed_resource_page_item(
                     &mut items,
@@ -6481,7 +6481,7 @@ async fn read_indexed_resource_page(
                 items
                     .last()
                     .map(|(cursor, package)| (*cursor, package.resource_did.as_str()))
-                    .or_else(|| after_resource_did.map(|did| (after_cursor, did))),
+                    .or(Some((after_cursor, after_resource_did))),
             )
             .await?;
         } else {
@@ -6495,9 +6495,9 @@ async fn read_indexed_resource_page(
                 "#
             );
             let mut rows = sqlx::query(&query)
-            .bind(after_cursor)
-            .bind(page_limit)
-            .fetch(postgres.pool());
+                .bind(after_cursor)
+                .bind(page_limit)
+                .fetch(postgres.pool());
             while let Some(row) = rows.try_next().await? {
                 push_indexed_resource_page_item(
                     &mut items,
@@ -6535,6 +6535,7 @@ async fn read_indexed_resource_page(
                 .cmp(&right.0)
                 .then(left.1.resource_did.cmp(&right.1.resource_did))
         });
+        has_more = indexed.len() > page_limit as usize;
         items = indexed.into_iter().take(page_limit as usize).collect();
         let mut bounded_items = Vec::with_capacity(items.len());
         for (cursor, package) in items {
@@ -9734,6 +9735,46 @@ mod tests {
             second_page.0["items"][0]["resourceDid"],
             "did:oan:SKLG:22222222222222222222222222222222"
         );
+        assert_eq!(second_page.0["hasMore"], false);
+    }
+
+    #[tokio::test]
+    async fn json_index_resources_preserves_cursor_pagination_has_more() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let first = sample_resource_package_with_did("did:oan:SKLG:json-page-first");
+        let second = sample_resource_package_with_did("did:oan:SKLG:json-page-second");
+        state
+            .index
+            .write("resource-capabilities.json", &vec![first, second])
+            .unwrap();
+
+        let first_page = api_index_resources(
+            State(state.clone()),
+            Query(DiscoveryPageQuery {
+                limit: Some(1),
+                ..DiscoveryPageQuery::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_page.0["count"], 1);
+        assert_eq!(first_page.0["hasMore"], true);
+
+        let second_page = api_index_resources(
+            State(state),
+            Query(DiscoveryPageQuery {
+                after_cursor: first_page.0["nextCursor"].as_i64(),
+                after_resource_did: first_page.0["nextResourceDid"]
+                    .as_str()
+                    .map(ToOwned::to_owned),
+                limit: Some(1),
+                ..DiscoveryPageQuery::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second_page.0["count"], 1);
         assert_eq!(second_page.0["hasMore"], false);
     }
 
