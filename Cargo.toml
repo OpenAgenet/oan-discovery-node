@@ -8,7 +8,7 @@ resolver = "2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/OpenAgenet/oan-discovery-node"
-version = "1.0.0"
+version = "1.0.1"
 
 [workspace.dependencies]
 anyhow = "1"
