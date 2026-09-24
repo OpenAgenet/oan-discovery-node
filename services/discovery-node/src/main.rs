@@ -17,7 +17,7 @@ use futures::TryStreamExt;
 use jieba_rs::Jieba;
 use oan_core::{
     CryptoSuite, DidDocument, ImplementationLink, OanMetadata, ProtocolBinding,
-    ResourceDescription, ResourceType, ServiceEndpoint, VerificationMethod,
+    ResourceDescription, ResourceType, ServiceEndpoint, SubjectType, VerificationMethod,
 };
 use oan_crypto::{hash_json_with_suite, sha256_hex, signing_key_from_bytes};
 use oan_package::{
@@ -6872,6 +6872,7 @@ fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<Resour
     let did_document = DidDocument {
         context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
         id: did.clone(),
+        controller: Some(oan_core::DidController::Did(did.clone())),
         verification_method: vec![VerificationMethod {
             id: format!("{did}#key-1"),
             method_type: "Ed25519VerificationKey2020".to_owned(),
@@ -6885,13 +6886,20 @@ fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<Resour
         assertion_method: vec![format!("{did}#key-1")],
         capability_invocation: vec![format!("{did}#key-1")],
         service: vec![service.clone()],
+        proof: None,
         oan_metadata: Some(OanMetadata {
-            subject_type: seed.resource_type.clone(),
+            subject_type: match seed.resource_type {
+                ResourceType::AgentService => SubjectType::AgentService,
+                ResourceType::Skill => SubjectType::Skill,
+                ResourceType::McpServer => SubjectType::McpServer,
+                ResourceType::ToolApi => SubjectType::ToolApi,
+                _ => SubjectType::Unspecified,
+            },
             resource_type: seed.resource_type.clone(),
-            node_role: None,
+            external_identifiers: vec![],
             identity_type: None,
             controller_did: None,
-            publisher_did: Some("did:oan:AGUS:semantic-evaluation-publisher".to_owned()),
+            publisher_did: Some("did:oan:R4tYu:semantic-evaluation-publisher".to_owned()),
             issuer_did: None,
             ttl: None,
             resource_description: Some(description),
@@ -6926,8 +6934,14 @@ fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<Resour
         metadata: ResourceMetadata {
             resource_did: did.clone(),
             resource_type: seed.resource_type.clone(),
-            subject_type: seed.resource_type.clone(),
-            publisher_did: Some("did:oan:AGUS:semantic-evaluation-publisher".to_owned()),
+            subject_type: match seed.resource_type {
+                ResourceType::AgentService => SubjectType::AgentService,
+                ResourceType::Skill => SubjectType::Skill,
+                ResourceType::McpServer => SubjectType::McpServer,
+                ResourceType::ToolApi => SubjectType::ToolApi,
+                _ => SubjectType::Unspecified,
+            },
+            publisher_did: Some("did:oan:R4tYu:semantic-evaluation-publisher".to_owned()),
             subject_did: Some(did.clone()),
             name: seed.name.clone(),
             description: seed.description.clone(),
@@ -6943,7 +6957,7 @@ fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<Resour
             updated_at: Utc::now(),
         },
         root_proof: RootProof {
-            root_did: "did:oan:AGRT:semantic-evaluation-root".to_owned(),
+            root_did: "did:oan:QwErT:semantic-evaluation-root".to_owned(),
             bulletin_event_hash: None,
             signature: None,
             package_claims: None,
@@ -8038,8 +8052,8 @@ mod tests {
     };
     use chrono::Utc;
     use oan_core::{
-        CryptoSuite, OanMetadata, ProtocolBinding, ResourceDescription, ServiceEndpoint,
-        VerificationMethod,
+        CryptoSuite, DataIntegrityProof, DidController, OanMetadata, ProtocolBinding,
+        ResourceDescription, ServiceEndpoint, VerificationMethod,
     };
     use oan_crypto::{public_key_jwk, public_key_multibase, VerifyingKey};
     use oan_package::RootProof;
@@ -8047,11 +8061,11 @@ mod tests {
     use tempfile::tempdir;
 
     fn resource_did() -> String {
-        "did:oan:SKLG:5HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned()
+        "did:oan:K7mQ9:5HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned()
     }
 
     fn discovery_did() -> String {
-        "did:oan:AGDS:5HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned()
+        "did:oan:P9aBc:5HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned()
     }
 
     fn sample_resource_package() -> ResourcePackage {
@@ -8059,6 +8073,7 @@ mod tests {
         let did_document = DidDocument {
             context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
             id: did.clone(),
+            controller: Some(DidController::Did(did.clone())),
             verification_method: vec![VerificationMethod {
                 id: format!("{did}#key-1"),
                 method_type: "Ed25519VerificationKey2020".to_owned(),
@@ -8080,13 +8095,23 @@ mod tests {
                 server_type: None,
                 port: None,
             }],
+            proof: Some(DataIntegrityProof {
+                proof_type: "Ed25519Signature2020".to_owned(),
+                creator: format!("{did}#key-1"),
+                created: Utc::now(),
+                proof_purpose: "assertionMethod".to_owned(),
+                proof_value: "fixture".to_owned(),
+                crypto_suite: Some(CryptoSuite::Ed25519Sha256),
+                hash_algorithm: Some("sha256".to_owned()),
+                verification_method: Some(format!("{did}#key-1")),
+            }),
             oan_metadata: Some(OanMetadata {
-                subject_type: ResourceType::Skill,
+                subject_type: SubjectType::Skill,
                 resource_type: ResourceType::Skill,
-                node_role: None,
+                external_identifiers: vec![],
                 identity_type: None,
                 controller_did: None,
-                publisher_did: Some("did:oan:AGUS:5HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned()),
+                publisher_did: Some("did:oan:R4tYu:5HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned()),
                 issuer_did: None,
                 ttl: None,
                 resource_description: Some(ResourceDescription {
@@ -8142,8 +8167,8 @@ mod tests {
             metadata: ResourceMetadata {
                 resource_did: did.clone(),
                 resource_type: ResourceType::Skill,
-                subject_type: ResourceType::Skill,
-                publisher_did: Some("did:oan:AGUS:5HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned()),
+                subject_type: SubjectType::Skill,
+                publisher_did: Some("did:oan:R4tYu:5HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned()),
                 subject_did: Some(did),
                 name: "Contract Review Skill".to_owned(),
                 description: "Review contracts and highlight risky clauses".to_owned(),
@@ -8167,7 +8192,7 @@ mod tests {
                 updated_at: Utc::now(),
             },
             root_proof: RootProof {
-                root_did: "did:oan:AGRT:5HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned(),
+                root_did: "did:oan:QwErT:5HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned(),
                 bulletin_event_hash: None,
                 signature: None,
                 package_claims: None,
@@ -8187,14 +8212,25 @@ mod tests {
 
     fn sample_resource_package_with_did(resource_did: &str) -> ResourcePackage {
         let mut package = sample_resource_package();
-        package.resource_did = resource_did.to_owned();
-        package.did_document.id = resource_did.to_owned();
-        package.did_document.verification_method[0].id = format!("{resource_did}#key-1");
-        package.did_document.verification_method[0].controller = resource_did.to_owned();
-        package.did_document.authentication = vec![format!("{resource_did}#key-1")];
-        package.did_document.assertion_method = vec![format!("{resource_did}#key-1")];
-        package.metadata.resource_did = resource_did.to_owned();
-        package.metadata.subject_did = Some(resource_did.to_owned());
+        let normalized_did = if resource_did.len() == 46
+            && resource_did.starts_with("did:oan:")
+            && resource_did.as_bytes().get(13) == Some(&b':')
+        {
+            resource_did.to_owned()
+        } else {
+            let suffix = "7YpQm9Kx2VnRb6Ts3WfHa4Cd5Ej8LgNz";
+            format!("did:oan:K7mQ9:{suffix}")
+        };
+        package.resource_did = normalized_did.clone();
+        package.did_document.id = normalized_did.clone();
+        package.did_document.controller =
+            Some(oan_core::DidController::Did(normalized_did.clone()));
+        package.did_document.verification_method[0].id = format!("{normalized_did}#key-1");
+        package.did_document.verification_method[0].controller = normalized_did.clone();
+        package.did_document.authentication = vec![format!("{normalized_did}#key-1")];
+        package.did_document.assertion_method = vec![format!("{normalized_did}#key-1")];
+        package.metadata.resource_did = normalized_did.clone();
+        package.metadata.subject_did = Some(normalized_did);
         refresh_hashes(&mut package);
         package
     }
@@ -8246,15 +8282,17 @@ mod tests {
         let document = DidDocument {
             context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
             id: did.clone(),
+            controller: Some(DidController::Did(did.clone())),
             verification_method: vec![],
             authentication: vec![],
             assertion_method: vec![],
             capability_invocation: vec![],
             service: vec![],
+            proof: None,
             oan_metadata: Some(OanMetadata {
-                subject_type: ResourceType::InfrastructureNode,
-                resource_type: ResourceType::InfrastructureNode,
-                node_role: Some("discovery".to_owned()),
+                subject_type: SubjectType::InfrastructureNode,
+                resource_type: ResourceType::DiscoveryNode,
+                external_identifiers: vec![],
                 identity_type: Some("discovery".to_owned()),
                 controller_did: None,
                 publisher_did: None,
@@ -8291,10 +8329,30 @@ mod tests {
     fn set_package_type(package: &mut ResourcePackage, resource_type: ResourceType) {
         package.resource_type = resource_type.clone();
         package.metadata.resource_type = resource_type.clone();
-        package.metadata.subject_type = resource_type.clone();
+        package.metadata.subject_type = match resource_type {
+            ResourceType::Skill => SubjectType::Skill,
+            ResourceType::AgentService => SubjectType::AgentService,
+            ResourceType::AgentInstance => SubjectType::AgentInstance,
+            ResourceType::AgentProduct => SubjectType::AgentProduct,
+            ResourceType::Organization => SubjectType::Organization,
+            ResourceType::Developer => SubjectType::Developer,
+            ResourceType::McpServer => SubjectType::McpServer,
+            ResourceType::ToolApi => SubjectType::ToolApi,
+            _ => SubjectType::InfrastructureNode,
+        };
         let metadata = package.did_document.oan_metadata.as_mut().unwrap();
         metadata.resource_type = resource_type.clone();
-        metadata.subject_type = resource_type;
+        metadata.subject_type = match resource_type {
+            ResourceType::Skill => SubjectType::Skill,
+            ResourceType::AgentService => SubjectType::AgentService,
+            ResourceType::AgentInstance => SubjectType::AgentInstance,
+            ResourceType::AgentProduct => SubjectType::AgentProduct,
+            ResourceType::Organization => SubjectType::Organization,
+            ResourceType::Developer => SubjectType::Developer,
+            ResourceType::McpServer => SubjectType::McpServer,
+            ResourceType::ToolApi => SubjectType::ToolApi,
+            _ => SubjectType::InfrastructureNode,
+        };
         refresh_hashes(package);
     }
 
@@ -8382,6 +8440,7 @@ mod tests {
         DidDocument {
             context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
             id: did.to_owned(),
+            controller: Some(DidController::Did(did.to_owned())),
             verification_method: vec![VerificationMethod {
                 id: key_id.clone(),
                 method_type: "Ed25519VerificationKey2020".to_owned(),
@@ -8393,12 +8452,22 @@ mod tests {
             }],
             authentication: vec![key_id.clone()],
             assertion_method: vec![key_id.clone()],
-            capability_invocation: vec![key_id],
+            capability_invocation: vec![key_id.clone()],
             service: vec![],
+            proof: Some(DataIntegrityProof {
+                proof_type: "Ed25519Signature2020".to_owned(),
+                creator: key_id.clone(),
+                created: Utc::now(),
+                proof_purpose: "assertionMethod".to_owned(),
+                proof_value: "fixture".to_owned(),
+                crypto_suite: Some(CryptoSuite::Ed25519Sha256),
+                hash_algorithm: Some("sha256".to_owned()),
+                verification_method: Some(key_id),
+            }),
             oan_metadata: Some(OanMetadata {
-                subject_type: ResourceType::InfrastructureNode,
-                resource_type: ResourceType::InfrastructureNode,
-                node_role: Some("root".to_owned()),
+                subject_type: SubjectType::InfrastructureNode,
+                resource_type: ResourceType::RootNode,
+                external_identifiers: vec![],
                 identity_type: Some("root".to_owned()),
                 controller_did: None,
                 publisher_did: None,
@@ -8509,7 +8578,7 @@ mod tests {
     fn local_semantic_ranking_matches_chinese_query_to_english_metadata() {
         let contract = sample_resource_package();
         let mut weather =
-            sample_resource_package_with_did("did:oan:SKLG:44444444444444444444444444444444");
+            sample_resource_package_with_did("did:oan:K7mQ9:44444444444444444444444444444444");
         set_package_description(
             &mut weather,
             "Weather Forecast Skill",
@@ -8553,7 +8622,7 @@ mod tests {
     #[test]
     fn local_semantic_ranking_keeps_explicit_type_and_protocol_hard() {
         let mut mcp =
-            sample_resource_package_with_did("did:oan:MCDM:55555555555555555555555555555555");
+            sample_resource_package_with_did("did:oan:K7mQ9:55555555555555555555555555555555");
         set_package_type(&mut mcp, ResourceType::McpServer);
         set_package_description(
             &mut mcp,
@@ -8581,7 +8650,7 @@ mod tests {
     fn hybrid_semantic_hits_merges_vector_and_lexical_candidates() {
         let vector_only = sample_resource_package();
         let mut lexical_only =
-            sample_resource_package_with_did("did:oan:MCDM:88888888888888888888888888888888");
+            sample_resource_package_with_did("did:oan:K7mQ9:88888888888888888888888888888888");
         set_package_type(&mut lexical_only, ResourceType::McpServer);
         set_package_description(
             &mut lexical_only,
@@ -8663,7 +8732,7 @@ mod tests {
     fn no_resource_type_query_prefers_tag_aligned_result() {
         let contract = sample_resource_package();
         let mut weather =
-            sample_resource_package_with_did("did:oan:SKLG:77777777777777777777777777777777");
+            sample_resource_package_with_did("did:oan:K7mQ9:77777777777777777777777777777777");
         set_package_description(
             &mut weather,
             "Weather Forecast Skill",
@@ -8722,7 +8791,7 @@ mod tests {
         let state = app_state(dir.path());
         let contract = sample_resource_package();
         let mut weather =
-            sample_resource_package_with_did("did:oan:SKLG:66666666666666666666666666666666");
+            sample_resource_package_with_did("did:oan:K7mQ9:66666666666666666666666666666666");
         set_package_description(
             &mut weather,
             "Weather Forecast Skill",
@@ -8800,7 +8869,7 @@ mod tests {
             SemanticRebuildStage::Context,
             "running",
             Some(3),
-            Some("did:oan:SKLG:context".to_owned()),
+            Some("did:oan:K7mQ9:context".to_owned()),
             10,
             1,
             0,
@@ -8814,7 +8883,7 @@ mod tests {
             SemanticRebuildStage::Intent,
             "running",
             Some(8),
-            Some("did:oan:SKLG:intent".to_owned()),
+            Some("did:oan:K7mQ9:intent".to_owned()),
             10,
             2,
             1,
@@ -8847,7 +8916,7 @@ mod tests {
             &state,
             SemanticRebuildStage::Context,
             11,
-            "did:oan:SKLG:context".to_owned(),
+            "did:oan:K7mQ9:context".to_owned(),
             "context failure".to_owned(),
         )
         .await
@@ -8856,7 +8925,7 @@ mod tests {
             &state,
             SemanticRebuildStage::Intent,
             22,
-            "did:oan:SKLG:intent".to_owned(),
+            "did:oan:K7mQ9:intent".to_owned(),
             "intent failure".to_owned(),
         )
         .await
@@ -8872,15 +8941,15 @@ mod tests {
 
         assert_eq!(context.len(), 1);
         assert_eq!(context[0].stage, "context");
-        assert_eq!(context[0].resource_did, "did:oan:SKLG:context");
+        assert_eq!(context[0].resource_did, "did:oan:K7mQ9:context");
         assert_eq!(intent.len(), 1);
         assert_eq!(intent[0].stage, "intent");
-        assert_eq!(intent[0].resource_did, "did:oan:SKLG:intent");
+        assert_eq!(intent[0].resource_did, "did:oan:K7mQ9:intent");
 
         clear_semantic_rebuild_skip_record(
             &state,
             SemanticRebuildStage::Context,
-            "did:oan:SKLG:context",
+            "did:oan:K7mQ9:context",
         )
         .await
         .unwrap();
@@ -8896,7 +8965,7 @@ mod tests {
 
         assert!(context_after.is_empty());
         assert_eq!(intent_after.len(), 1);
-        assert_eq!(intent_after[0].resource_did, "did:oan:SKLG:intent");
+        assert_eq!(intent_after[0].resource_did, "did:oan:K7mQ9:intent");
     }
 
     #[tokio::test]
@@ -8921,7 +8990,7 @@ mod tests {
         let state = app_state(dir.path());
         let target = sample_resource_package();
         let mut other =
-            sample_resource_package_with_did("did:oan:MCDM:33333333333333333333333333333333");
+            sample_resource_package_with_did("did:oan:K7mQ9:33333333333333333333333333333333");
         other.resource_type = ResourceType::McpServer;
         write_indexed_resource_packages(&state, &[target.clone(), other])
             .await
@@ -8950,7 +9019,7 @@ mod tests {
         let response = resource_query(
             State(state.clone()),
             Json(ResourceDiscoveryQuery {
-                query: Some("did:oan:MCDM:33333333333333333333333333333333".to_owned()),
+                query: Some("did:oan:K7mQ9:33333333333333333333333333333333".to_owned()),
                 resource_type: Some(ResourceType::Skill),
                 capability_tags: vec![],
                 protocol: None,
@@ -8965,7 +9034,7 @@ mod tests {
         assert!(candidates.is_empty());
 
         let mut out_of_scope =
-            sample_resource_package_with_did("did:oan:SKLG:77777777777777777777777777777777");
+            sample_resource_package_with_did("did:oan:K7mQ9:77777777777777777777777777777777");
         set_package_authorized_domains(&mut out_of_scope, vec!["finance".to_owned()]);
         write_indexed_resource_packages(&state, &[out_of_scope.clone()])
             .await
@@ -8994,7 +9063,7 @@ mod tests {
         let state = app_state(dir.path());
         let skill = sample_resource_package();
         let mut node =
-            sample_resource_package_with_did("did:oan:AGDS:33333333333333333333333333333333");
+            sample_resource_package_with_did("did:oan:P9aBc:33333333333333333333333333333333");
         set_package_type(&mut node, ResourceType::InfrastructureNode);
         write_indexed_resource_packages(&state, &[skill.clone(), node])
             .await
@@ -9165,7 +9234,7 @@ mod tests {
         let state = app_state_with_sqlite(dir.path()).await;
         let first = sample_resource_package();
         let mut second = sample_resource_package();
-        let second_did = "did:oan:SKLG:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned();
+        let second_did = "did:oan:K7mQ9:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned();
         second.resource_did = second_did.clone();
         second.did_document.id = second_did.clone();
         second.metadata.resource_did = second_did.clone();
@@ -9231,7 +9300,7 @@ mod tests {
                     "reason": "package_version_mismatch"
                 }),
                 json!({
-                    "resourceDid": "did:oan:SKLG:other",
+                    "resourceDid": "did:oan:K7mQ9:other",
                     "cursor": 8,
                     "reason": "package_hash_mismatch"
                 }),
@@ -9246,7 +9315,7 @@ mod tests {
 
         let rejected = read_rejected_packages(&state).await.unwrap();
         assert_eq!(rejected.len(), 1);
-        assert_eq!(rejected[0]["resourceDid"], "did:oan:SKLG:other");
+        assert_eq!(rejected[0]["resourceDid"], "did:oan:K7mQ9:other");
     }
 
     #[tokio::test]
@@ -9303,7 +9372,7 @@ mod tests {
                     "reason": "unauthorized_domains"
                 }),
                 json!({
-                    "resourceDid": "did:oan:SKLG:not-visible",
+                    "resourceDid": "did:oan:K7mQ9:not-visible",
                     "cursor": 9,
                     "reason": "package_version_mismatch"
                 }),
@@ -9332,7 +9401,7 @@ mod tests {
             .any(|item| item["reason"] == "unauthorized_domains"));
         assert!(rejected
             .iter()
-            .any(|item| item["resourceDid"] == "did:oan:SKLG:not-visible"));
+            .any(|item| item["resourceDid"] == "did:oan:K7mQ9:not-visible"));
     }
 
     #[tokio::test]
@@ -9481,7 +9550,7 @@ mod tests {
         write_discovery_document(&state, vec!["legal".to_owned()]);
         let legal = sample_resource_package();
         let mut finance =
-            sample_resource_package_with_did("did:oan:SKLG:33333333333333333333333333333333");
+            sample_resource_package_with_did("did:oan:K7mQ9:33333333333333333333333333333333");
         set_package_authorized_domains(&mut finance, vec!["finance".to_owned()]);
         upsert_indexed_resource_package(&state, 1, &legal)
             .await
@@ -9526,7 +9595,7 @@ mod tests {
             ],
         );
         let mut finance =
-            sample_resource_package_with_did("did:oan:SKLG:44444444444444444444444444444444");
+            sample_resource_package_with_did("did:oan:K7mQ9:44444444444444444444444444444444");
         set_package_tags(&mut finance, vec!["finance.invoice.audit".to_owned()]);
         upsert_indexed_resource_package(&state, 1, &legal)
             .await
@@ -9574,7 +9643,7 @@ mod tests {
             .unwrap();
         assert_eq!(found.resource_did, package.resource_did);
         assert!(
-            read_indexed_resource_package(&state, "did:oan:SKLG:not-found")
+            read_indexed_resource_package(&state, "did:oan:K7mQ9:not-found")
                 .await
                 .unwrap()
                 .is_none()
@@ -9595,7 +9664,7 @@ mod tests {
             Json(IndexedResourceVisibilityRequest {
                 resource_dids: vec![
                     package.resource_did.clone(),
-                    "did:oan:SKLG:not-found".to_owned(),
+                    "did:oan:K7mQ9:not-found".to_owned(),
                 ],
             }),
         )
@@ -9611,11 +9680,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let state = app_state_with_sqlite(dir.path()).await;
         let first =
-            sample_resource_package_with_did("did:oan:SKLG:11111111111111111111111111111111");
+            sample_resource_package_with_did("did:oan:K7mQ9:11111111111111111111111111111111");
         let second =
-            sample_resource_package_with_did("did:oan:SKLG:22222222222222222222222222222222");
+            sample_resource_package_with_did("did:oan:K7mQ9:22222222222222222222222222222222");
         let third =
-            sample_resource_package_with_did("did:oan:SKLG:33333333333333333333333333333333");
+            sample_resource_package_with_did("did:oan:K7mQ9:33333333333333333333333333333333");
         upsert_indexed_resource_package(&state, 1, &first)
             .await
             .unwrap();
@@ -9701,7 +9770,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let state = app_state_with_sqlite(dir.path()).await;
         let mut package =
-            sample_resource_package_with_did("did:oan:SKLG:44444444444444444444444444444444");
+            sample_resource_package_with_did("did:oan:K7mQ9:44444444444444444444444444444444");
         package.metadata.description = "x".repeat(DISCOVERY_INDEX_PACKAGE_BYTES);
         upsert_indexed_resource_package(&state, 1, &package)
             .await
@@ -9728,7 +9797,7 @@ mod tests {
         let description = "x".repeat(6_900_000);
 
         for cursor in 1..=5 {
-            let did = format!("did:oan:SKLG:{:0>32}", cursor);
+            let did = format!("did:oan:K7mQ9:{:0>32}", cursor);
             let mut package = sample_resource_package_with_did(&did);
             package.metadata.description = description.clone();
             upsert_indexed_resource_package(&state, cursor, &package)
@@ -9754,13 +9823,13 @@ mod tests {
     async fn sqlite_index_page_stops_before_an_oversized_extra_row() {
         let dir = tempdir().unwrap();
         let state = app_state_with_sqlite(dir.path()).await;
-        for (cursor, did) in [(1, "did:oan:SKLG:stream-a"), (2, "did:oan:SKLG:stream-b")] {
+        for (cursor, did) in [(1, "did:oan:K7mQ9:stream-a"), (2, "did:oan:K7mQ9:stream-b")] {
             upsert_indexed_resource_package(&state, cursor, &sample_resource_package_with_did(did))
                 .await
                 .unwrap();
         }
 
-        let mut oversized = sample_resource_package_with_did("did:oan:SKLG:stream-c");
+        let mut oversized = sample_resource_package_with_did("did:oan:K7mQ9:stream-c");
         oversized.metadata.description = "x".repeat(DISCOVERY_INDEX_PACKAGE_BYTES);
         let package_json = serde_json::to_string(&oversized).unwrap();
         sqlx::query(&format!(
@@ -9799,9 +9868,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let state = app_state_with_sqlite(dir.path()).await;
         let first =
-            sample_resource_package_with_did("did:oan:SKLG:11111111111111111111111111111111");
+            sample_resource_package_with_did("did:oan:K7mQ9:11111111111111111111111111111111");
         let second =
-            sample_resource_package_with_did("did:oan:SKLG:22222222222222222222222222222222");
+            sample_resource_package_with_did("did:oan:K7mQ9:22222222222222222222222222222222");
         upsert_indexed_resource_package(&state, 7, &first)
             .await
             .unwrap();
@@ -9822,7 +9891,7 @@ mod tests {
         assert_eq!(first_page.0["nextCursor"], 7);
         assert_eq!(
             first_page.0["nextResourceDid"],
-            "did:oan:SKLG:11111111111111111111111111111111"
+            "did:oan:K7mQ9:11111111111111111111111111111111"
         );
         assert_eq!(first_page.0["hasMore"], true);
 
@@ -9841,7 +9910,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             second_page.0["items"][0]["resourceDid"],
-            "did:oan:SKLG:22222222222222222222222222222222"
+            "did:oan:K7mQ9:22222222222222222222222222222222"
         );
         assert_eq!(second_page.0["hasMore"], false);
     }
@@ -9850,8 +9919,8 @@ mod tests {
     async fn json_index_resources_preserves_cursor_pagination_has_more() {
         let dir = tempdir().unwrap();
         let state = app_state(dir.path());
-        let first = sample_resource_package_with_did("did:oan:SKLG:json-page-first");
-        let second = sample_resource_package_with_did("did:oan:SKLG:json-page-second");
+        let first = sample_resource_package_with_did("did:oan:K7mQ9:json-page-first");
+        let second = sample_resource_package_with_did("did:oan:K7mQ9:json-page-second");
         state
             .index
             .write("resource-capabilities.json", &vec![first, second])
@@ -9961,17 +10030,17 @@ mod tests {
             &state,
             &[
                 json!({
-                    "resourceDid": "did:oan:SKLG:late-1",
+                    "resourceDid": "did:oan:K7mQ9:late-1",
                     "reason": REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE,
                     "status": REJECT_STATUS_LATE
                 }),
                 json!({
-                    "resourceDid": "did:oan:SKLG:dead-1",
+                    "resourceDid": "did:oan:K7mQ9:dead-1",
                     "reason": REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE,
                     "status": REJECT_STATUS_DEAD
                 }),
                 json!({
-                    "resourceDid": "did:oan:SKLG:invalid",
+                    "resourceDid": "did:oan:K7mQ9:invalid",
                     "reason": "invalid_package",
                     "status": REJECT_STATUS_LATE
                 }),
@@ -10004,7 +10073,7 @@ mod tests {
         write_rejected_packages(
             &state,
             &[json!({
-                "resourceDid": "did:oan:SKLG:legacy-late",
+                "resourceDid": "did:oan:K7mQ9:legacy-late",
                 "reason": REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE
             })],
         )
@@ -10024,9 +10093,9 @@ mod tests {
         let state = app_state_with_sqlite(dir.path()).await;
         write_discovery_document(&state, vec!["legal".to_owned()]);
         let legal =
-            sample_resource_package_with_did("did:oan:SKLG:11111111111111111111111111111111");
+            sample_resource_package_with_did("did:oan:K7mQ9:11111111111111111111111111111111");
         let mut finance =
-            sample_resource_package_with_did("did:oan:SKLG:22222222222222222222222222222222");
+            sample_resource_package_with_did("did:oan:K7mQ9:22222222222222222222222222222222");
         set_package_authorized_domains(&mut finance, vec!["finance".to_owned()]);
         upsert_indexed_resource_package(&state, 1, &legal)
             .await
@@ -10795,10 +10864,10 @@ mod tests {
     async fn sync_resources_from_authorized_summary_skips_unavailable_package_without_blocking() {
         let dir = tempdir().unwrap();
         let first =
-            sample_resource_package_with_did("did:oan:SKLG:11111111111111111111111111111111");
+            sample_resource_package_with_did("did:oan:K7mQ9:11111111111111111111111111111111");
         let third =
-            sample_resource_package_with_did("did:oan:SKLG:33333333333333333333333333333333");
-        let missing_did = "did:oan:SKLG:22222222222222222222222222222222".to_owned();
+            sample_resource_package_with_did("did:oan:K7mQ9:33333333333333333333333333333333");
+        let missing_did = "did:oan:K7mQ9:22222222222222222222222222222222".to_owned();
         let app = Router::new().route(
             "/cdn/resources/{*did}",
             get({
@@ -10904,10 +10973,10 @@ mod tests {
     async fn sync_resources_from_authorized_summary_records_5xx_as_late_without_blocking() {
         let dir = tempdir().unwrap();
         let first =
-            sample_resource_package_with_did("did:oan:SKLG:11111111111111111111111111111111");
+            sample_resource_package_with_did("did:oan:K7mQ9:11111111111111111111111111111111");
         let third =
-            sample_resource_package_with_did("did:oan:SKLG:33333333333333333333333333333333");
-        let failing_did = "did:oan:SKLG:22222222222222222222222222222222".to_owned();
+            sample_resource_package_with_did("did:oan:K7mQ9:33333333333333333333333333333333");
+        let failing_did = "did:oan:K7mQ9:22222222222222222222222222222222".to_owned();
         let app = Router::new().route(
             "/cdn/resources/{*did}",
             get({
@@ -11015,7 +11084,7 @@ mod tests {
     async fn backfill_rejected_packages_indexes_transiently_unavailable_package() {
         let dir = tempdir().unwrap();
         let missing =
-            sample_resource_package_with_did("did:oan:SKLG:22222222222222222222222222222222");
+            sample_resource_package_with_did("did:oan:K7mQ9:22222222222222222222222222222222");
         let available = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let app = Router::new().route(
             "/cdn/resources/{*did}",
@@ -11105,7 +11174,7 @@ mod tests {
     async fn late_package_retry_marks_dead_after_three_failed_attempts() {
         let dir = tempdir().unwrap();
         let missing =
-            sample_resource_package_with_did("did:oan:SKLG:22222222222222222222222222222222");
+            sample_resource_package_with_did("did:oan:K7mQ9:22222222222222222222222222222222");
         let app = Router::new().route(
             "/cdn/resources/{*did}",
             get(|| async {
@@ -11168,7 +11237,7 @@ mod tests {
     async fn late_package_retry_recovers_when_package_becomes_available() {
         let dir = tempdir().unwrap();
         let missing =
-            sample_resource_package_with_did("did:oan:SKLG:22222222222222222222222222222222");
+            sample_resource_package_with_did("did:oan:K7mQ9:22222222222222222222222222222222");
         let available = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let app = Router::new().route(
             "/cdn/resources/{*did}",
@@ -11247,9 +11316,9 @@ mod tests {
     async fn late_package_retry_recovery_removes_only_stale_same_did_rejections() {
         let dir = tempdir().unwrap();
         let recovered =
-            sample_resource_package_with_did("did:oan:SKLG:33333333333333333333333333333333");
+            sample_resource_package_with_did("did:oan:K7mQ9:33333333333333333333333333333333");
         let other =
-            sample_resource_package_with_did("did:oan:SKLG:44444444444444444444444444444444");
+            sample_resource_package_with_did("did:oan:K7mQ9:44444444444444444444444444444444");
         let app = Router::new().route(
             "/cdn/resources/{*did}",
             get({
@@ -11348,7 +11417,7 @@ mod tests {
     async fn already_indexed_recovery_removes_stale_same_did_rejections() {
         let dir = tempdir().unwrap();
         let indexed =
-            sample_resource_package_with_did("did:oan:SKLG:55555555555555555555555555555555");
+            sample_resource_package_with_did("did:oan:K7mQ9:55555555555555555555555555555555");
         let state = app_state_with_sqlite(dir.path()).await;
         upsert_indexed_resource_package(&state, 5, &indexed)
             .await
@@ -11414,7 +11483,7 @@ mod tests {
         let rejected = (0..=LATE_PACKAGE_MAX_ITEMS)
             .map(|index| {
                 json!({
-                    "resourceDid": format!("did:oan:SKLG:late-limit-{index:032}"),
+                    "resourceDid": format!("did:oan:K7mQ9:late-limit-{index:032}"),
                     "cursor": index as i64,
                     "packageVersion": "1.0.0",
                     "reason": REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE,
@@ -11448,7 +11517,7 @@ mod tests {
         write_rejected_packages(
             &state,
             &[json!({
-                "resourceDid": "did:oan:SKLG:not-transient",
+                "resourceDid": "did:oan:K7mQ9:not-transient",
                 "cursor": 7,
                 "reason": "unauthorized_domains"
             })],
@@ -11479,7 +11548,7 @@ mod tests {
     async fn backfill_rejected_packages_keeps_legacy_record_without_notification_context() {
         let dir = tempdir().unwrap();
         let mut package =
-            sample_resource_package_with_did("did:oan:SKLG:22222222222222222222222222222222");
+            sample_resource_package_with_did("did:oan:K7mQ9:22222222222222222222222222222222");
         set_package_authorized_domains(&mut package, vec!["blocked".to_owned()]);
         let app = Router::new().route(
             "/cdn/resources/{*did}",
@@ -11551,7 +11620,7 @@ mod tests {
             .unwrap();
         write_rejected_packages(
             &state,
-            &[json!({"resourceDid": "did:oan:SKLG:reject", "reason": "invalid"})],
+            &[json!({"resourceDid": "did:oan:K7mQ9:reject", "reason": "invalid"})],
         )
         .await
         .unwrap();
@@ -11608,14 +11677,14 @@ mod tests {
     fn root_document_fixture_is_did_oan_only() {
         let key = oan_crypto::generate_ed25519_keypair();
         let document =
-            root_document_with_key("did:oan:AGRT:5HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu", &key);
+            root_document_with_key("did:oan:QwErT:5HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu", &key);
         assert!(document.id.starts_with("did:oan:"));
         assert_eq!(
             document
                 .oan_metadata
                 .as_ref()
                 .map(|metadata| metadata.resource_type.clone()),
-            Some(ResourceType::InfrastructureNode)
+            Some(ResourceType::RootNode)
         );
     }
 }

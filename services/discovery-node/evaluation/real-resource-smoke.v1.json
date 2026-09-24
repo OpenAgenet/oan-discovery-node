@@ -1,8 +1,8 @@
-﻿{
+{
   "suite": "real-oan-resource-smoke.v1",
   "seedResources": [
     {
-      "resourceDid": "did:oan:SKDM:2ftSobUkN63sLPjXPuc4rNAB8zBJF6qR",
+      "resourceDid": "did:oan:K7mQ9:2ftSobUkN63sLPjXPuc4rNAB8zBJF6qR",
       "resourceType": "skill",
       "name": "PDF Document Analysis Skill",
       "description": "A reusable OAN Skill for PDF document parsing, text extraction, metadata inspection, and source-oriented document analysis. It is intended for agents that need to read PDF files, extract structured content, and prepare downstream summaries or evidence snippets.",
@@ -22,7 +22,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:MCDM:uj16KsUwTMX7GmBSN6EA7Qi3XMN4P1Pj",
+      "resourceDid": "did:oan:M6dMn:uj16KsUwTMX7GmBSN6EA7Qi3XMN4P1Pj",
       "resourceType": "mcp_server",
       "name": "Everything Local File Search MCP Server",
       "description": "An MCP Server that exposes local file search capabilities through the Model Context Protocol. It is suitable for desktop agents that need to query a Windows Everything index, locate files by keyword, and return paths or file metadata through MCP tools.",
@@ -42,7 +42,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:TLDM:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP",
+      "resourceDid": "did:oan:T6dMn:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP",
       "resourceType": "tool_api",
       "name": "Open-Meteo Forecast Tool API",
       "description": "A Tool/API resource for public weather forecast queries. It provides HTTPS access to current and forecast weather data such as temperature, rainfall, wind speed, and structured JSON responses for agent applications.",
@@ -62,7 +62,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:AGDM:PAmHQoT9Dup4q4GZfgAAv9YaHHgsZgm2",
+      "resourceDid": "did:oan:A6dMn:PAmHQoT9Dup4q4GZfgAAv9YaHHgsZgm2",
       "resourceType": "agent_service",
       "name": "A2A Hello World Agent Service",
       "description": "A minimal Agent Service used to verify Agent2Agent connectivity, agent card inspection, and simple request-response integration. It is useful as a reference resource for checking whether an agent platform can discover and call an A2A endpoint.",
@@ -82,7 +82,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:MCDM:ZSZQ6eLz2huG1JcnJVKeTXyK26x4EbKH",
+      "resourceDid": "did:oan:M6dMn:ZSZQ6eLz2huG1JcnJVKeTXyK26x4EbKH",
       "resourceType": "mcp_server",
       "name": "Inference MCP Server",
       "description": "An MCP Server resource that exposes inference-oriented tool access for agent workflows. It represents a network service that can be discovered by capability and protocol metadata rather than by a fixed vendor-specific integration.",
@@ -101,7 +101,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:SKDM:F5xLwQj7N9pR2sT6uV8yZ3aBcDeFgHkM",
+      "resourceDid": "did:oan:K7mQ9:F5xLwQj7N9pR2sT6uV8yZ3aBcDeFgHkM",
       "resourceType": "skill",
       "name": "中文合同风险审查技能",
       "description": "面向中文合同文本的智能体技能资源，可用于识别付款条款、违约责任、终止条件、保密义务和合规风险。该资源适合需要对中文合同进行初步审查、风险摘要和证据定位的智能体工作流。",
@@ -131,7 +131,7 @@
         "versionMode": "latest",
         "limit": 10
       },
-      "expectedDids": ["did:oan:SKDM:2ftSobUkN63sLPjXPuc4rNAB8zBJF6qR"]
+      "expectedDids": ["did:oan:K7mQ9:2ftSobUkN63sLPjXPuc4rNAB8zBJF6qR"]
     },
     {
       "id": "en-pdf-skill-explicit-type",
@@ -144,7 +144,7 @@
         "versionMode": "latest",
         "limit": 10
       },
-      "expectedDids": ["did:oan:SKDM:2ftSobUkN63sLPjXPuc4rNAB8zBJF6qR"]
+      "expectedDids": ["did:oan:K7mQ9:2ftSobUkN63sLPjXPuc4rNAB8zBJF6qR"]
     },
     {
       "id": "mixed-local-file-mcp",
@@ -156,7 +156,7 @@
         "versionMode": "latest",
         "limit": 10
       },
-      "expectedDids": ["did:oan:MCDM:uj16KsUwTMX7GmBSN6EA7Qi3XMN4P1Pj"]
+      "expectedDids": ["did:oan:M6dMn:uj16KsUwTMX7GmBSN6EA7Qi3XMN4P1Pj"]
     },
     {
       "id": "en-weather-tool-api",
@@ -169,7 +169,7 @@
         "versionMode": "latest",
         "limit": 10
       },
-      "expectedDids": ["did:oan:TLDM:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP"]
+      "expectedDids": ["did:oan:T6dMn:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP"]
     },
     {
       "id": "cn-agent-service-a2a",
@@ -182,7 +182,7 @@
         "versionMode": "latest",
         "limit": 10
       },
-      "expectedDids": ["did:oan:AGDM:PAmHQoT9Dup4q4GZfgAAv9YaHHgsZgm2"]
+      "expectedDids": ["did:oan:A6dMn:PAmHQoT9Dup4q4GZfgAAv9YaHHgsZgm2"]
     },
     {
       "id": "cn-contract-without-type-cross-type-ranking",
@@ -194,7 +194,7 @@
         "versionMode": "latest",
         "limit": 10
       },
-      "expectedDids": ["did:oan:SKDM:F5xLwQj7N9pR2sT6uV8yZ3aBcDeFgHkM"]
+      "expectedDids": ["did:oan:K7mQ9:F5xLwQj7N9pR2sT6uV8yZ3aBcDeFgHkM"]
     },
     {
       "id": "mixed-inference-mcp-without-type",
@@ -206,19 +206,19 @@
         "versionMode": "latest",
         "limit": 10
       },
-      "expectedDids": ["did:oan:MCDM:ZSZQ6eLz2huG1JcnJVKeTXyK26x4EbKH"]
+      "expectedDids": ["did:oan:M6dMn:ZSZQ6eLz2huG1JcnJVKeTXyK26x4EbKH"]
     },
     {
       "id": "did-exact-weather-tool-api",
       "language": "identifier",
       "description": "Exact DID lookup should return the target Tool/API through the same query entrypoint.",
       "query": {
-        "query": "did:oan:TLDM:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP",
+        "query": "did:oan:T6dMn:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP",
         "capabilityTags": [],
         "versionMode": "latest",
         "limit": 10
       },
-      "expectedDids": ["did:oan:TLDM:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP"]
+      "expectedDids": ["did:oan:T6dMn:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP"]
     }
   ]
 }

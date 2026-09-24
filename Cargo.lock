@@ -1475,10 +1475,12 @@ name = "oan-core"
 version = "1.0.1"
 dependencies = [
  "chrono",
+ "oan-did-oan",
  "oan-storage",
  "serde",
  "serde_json",
  "thiserror",
+ "url",
 ]
 
 [[package]]

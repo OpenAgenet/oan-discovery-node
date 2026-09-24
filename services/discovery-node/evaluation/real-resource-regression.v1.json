@@ -2,7 +2,7 @@
   "suite": "real-oan-resource-regression.v1",
   "seedResources": [
     {
-      "resourceDid": "did:oan:SKDM:2ftSobUkN63sLPjXPuc4rNAB8zBJF6qR",
+      "resourceDid": "did:oan:K7mQ9:2ftSobUkN63sLPjXPuc4rNAB8zBJF6qR",
       "resourceType": "skill",
       "name": "PDF Document Analysis Skill",
       "description": "A reusable OAN Skill for PDF document parsing, text extraction, metadata inspection, and source-oriented document analysis. It is intended for agents that need to read PDF files, extract structured content, and prepare downstream summaries or evidence snippets.",
@@ -22,7 +22,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:MCDM:uj16KsUwTMX7GmBSN6EA7Qi3XMN4P1Pj",
+      "resourceDid": "did:oan:M6dMn:uj16KsUwTMX7GmBSN6EA7Qi3XMN4P1Pj",
       "resourceType": "mcp_server",
       "name": "Everything Local File Search MCP Server",
       "description": "An MCP Server that exposes local file search capabilities through the Model Context Protocol. It is suitable for desktop agents that need to query a Windows Everything index, locate files by keyword, and return paths or file metadata through MCP tools.",
@@ -42,7 +42,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:TLDM:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP",
+      "resourceDid": "did:oan:T6dMn:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP",
       "resourceType": "tool_api",
       "name": "Open-Meteo Forecast Tool API",
       "description": "A Tool/API resource for public weather forecast queries. It provides HTTPS access to current and forecast weather data such as temperature, rainfall, wind speed, and structured JSON responses for agent applications.",
@@ -62,7 +62,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:AGDM:PAmHQoT9Dup4q4GZfgAAv9YaHHgsZgm2",
+      "resourceDid": "did:oan:A6dMn:PAmHQoT9Dup4q4GZfgAAv9YaHHgsZgm2",
       "resourceType": "agent_service",
       "name": "A2A Hello World Agent Service",
       "description": "A minimal Agent Service used to verify Agent2Agent connectivity, agent card inspection, and simple request-response integration. It is useful as a reference resource for checking whether an agent platform can discover and call an A2A endpoint.",
@@ -82,7 +82,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:MCDM:ZSZQ6eLz2huG1JcnJVKeTXyK26x4EbKH",
+      "resourceDid": "did:oan:M6dMn:ZSZQ6eLz2huG1JcnJVKeTXyK26x4EbKH",
       "resourceType": "mcp_server",
       "name": "Inference MCP Server",
       "description": "An MCP Server resource that exposes inference-oriented tool access for agent workflows. It represents a network service that can be discovered by capability and protocol metadata rather than by a fixed vendor-specific integration.",
@@ -101,7 +101,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:SKDM:F5xLwQj7N9pR2sT6uV8yZ3aBcDeFgHkM",
+      "resourceDid": "did:oan:K7mQ9:F5xLwQj7N9pR2sT6uV8yZ3aBcDeFgHkM",
       "resourceType": "skill",
       "name": "中文合同风险审查技能",
       "description": "面向中文合同文本的智能体技能资源，可用于识别付款条款、违约责任、终止条件、保密义务和合规风险。该资源适合需要对中文合同进行初步审查、风险摘要和证据定位的智能体工作流。",
@@ -120,7 +120,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:SKDM:Z8K2Tu83rDLEb4276tCo9nswGhQDVcsK",
+      "resourceDid": "did:oan:K7mQ9:Z8K2Tu83rDLEb4276tCo9nswGhQDVcsK",
       "resourceType": "skill",
       "name": "agent-deep-research",
       "description": "Autonomous deep research powered by Google Gemini. This skill helps agents gather information from web search, organize findings, and produce research-oriented answers for broad investigation tasks.",
@@ -139,7 +139,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:SKDM:R7EXKAeWLWLyr6kgjRc5u8fWWG7qzaKV",
+      "resourceDid": "did:oan:K7mQ9:R7EXKAeWLWLyr6kgjRc5u8fWWG7qzaKV",
       "resourceType": "skill",
       "name": "android-transfer-skill",
       "description": "A skill for securely transferring files between macOS and Android devices with checksum-oriented reliability. It is useful when an agent needs to assist with device file movement and verify transfer results.",
@@ -158,7 +158,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:SKDM:4xtWevJt1GVaz26wqebbFnT6hR1B9vDt",
+      "resourceDid": "did:oan:K7mQ9:4xtWevJt1GVaz26wqebbFnT6hR1B9vDt",
       "resourceType": "skill",
       "name": "mac-clean-skill",
       "description": "A macOS cleanup skill that helps remove caches, trash, old downloads, and other storage-consuming files. It is useful for agent workflows that assist users with desktop maintenance.",
@@ -177,7 +177,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:SKDM:Mkf36r141zn9i3ZJj5VEvTNPmRCToJsu",
+      "resourceDid": "did:oan:K7mQ9:Mkf36r141zn9i3ZJj5VEvTNPmRCToJsu",
       "resourceType": "skill",
       "name": "apple-media",
       "description": "A skill for controlling Apple media devices such as HomePod or AirPlay targets through Apple-oriented media workflows. It helps agents trigger playback and manage media devices.",
@@ -196,7 +196,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:SKDM:wxZ5A8VmrbpxozMqFoQCfMtKvYgSbRxf",
+      "resourceDid": "did:oan:K7mQ9:wxZ5A8VmrbpxozMqFoQCfMtKvYgSbRxf",
       "resourceType": "skill",
       "name": "agent-orchestrator",
       "description": "A meta-agent skill for orchestrating complex tasks across multiple agents or sub-workflows. It is useful when a user needs planning, delegation, and coordination rather than one isolated tool call.",
@@ -215,7 +215,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:SKDM:kaRvFd12MKEu7XTD2s8K8799aB7ucJxs",
+      "resourceDid": "did:oan:K7mQ9:kaRvFd12MKEu7XTD2s8K8799aB7ucJxs",
       "resourceType": "skill",
       "name": "adobe-automator",
       "description": "A skill for automating Adobe applications through ExtendScript-oriented workflows. It is suited for agents that need to create, export, or edit media and design assets in Adobe software.",
@@ -234,7 +234,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:SKDM:GEYvqVnz4efCtmi3uQxVxjtQZDM2JBnM",
+      "resourceDid": "did:oan:K7mQ9:GEYvqVnz4efCtmi3uQxVxjtQZDM2JBnM",
       "resourceType": "skill",
       "name": "adversarial-prompting",
       "description": "A skill for adversarial prompt analysis, critique, and prompt hardening. It helps users detect weak assumptions, unsafe phrasing, and prompt injection risks before deploying agent instructions.",
@@ -253,7 +253,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:SKDM:CRUfCGmtEdwciRGn35DBCMs6cpj2wtw8",
+      "resourceDid": "did:oan:K7mQ9:CRUfCGmtEdwciRGn35DBCMs6cpj2wtw8",
       "resourceType": "skill",
       "name": "canva",
       "description": "A skill for creating, exporting, and managing Canva designs through an agent workflow. It is relevant for content creation, presentation drafting, and social media design automation.",
@@ -272,7 +272,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:MCDM:KE3PB1tqGeKPR5hQwugpWCbnd6W6mwZr",
+      "resourceDid": "did:oan:M6dMn:KE3PB1tqGeKPR5hQwugpWCbnd6W6mwZr",
       "resourceType": "mcp_server",
       "name": "0xchron-polymarket-mcp",
       "description": "Read-only Polymarket prediction market data for AI agents through an MCP server. It is suitable for finance or market-analysis workflows that need structured prediction-market data.",
@@ -291,7 +291,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:MCDM:Bi51ktqFNNEJ9YawX51hZCcHK7LJ9XeK",
+      "resourceDid": "did:oan:M6dMn:Bi51ktqFNNEJ9YawX51hZCcHK7LJ9XeK",
       "resourceType": "mcp_server",
       "name": "a-mem",
       "description": "A self-evolving memory system for AI agents with semantic search and knowledge graph capabilities. It includes an MCP server for Claude and other AI assistants.",
@@ -310,7 +310,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:MCDM:oGrGywmcDXyFa9eZ3ivUnwwVEqJc48mb",
+      "resourceDid": "did:oan:M6dMn:oGrGywmcDXyFa9eZ3ivUnwwVEqJc48mb",
       "resourceType": "mcp_server",
       "name": "a2a-governance-bridge-mcp",
       "description": "An A2A Governance Bridge MCP server with tools to verify agent compliance, authorize A2A transactions, and query a trust registry. It is relevant to cross-agent governance and compliance workflows.",
@@ -329,7 +329,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:MCDM:gZGz8GqWcyZFGJMqQiLMHSqXZirJNdFr",
+      "resourceDid": "did:oan:M6dMn:gZGz8GqWcyZFGJMqQiLMHSqXZirJNdFr",
       "resourceType": "mcp_server",
       "name": "abs-mcp",
       "description": "An MCP server for the Australian Bureau of Statistics Data API. It hides SDMX complexity behind plain-English tools so agents can retrieve statistical datasets and structured data.",
@@ -348,7 +348,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:MCDM:PMZPGBQ1UJr6jLBiNU1z1miiTHXfDLGk",
+      "resourceDid": "did:oan:M6dMn:PMZPGBQ1UJr6jLBiNU1z1miiTHXfDLGk",
       "resourceType": "mcp_server",
       "name": "accessibility-ai-mcp",
       "description": "An Accessibility AI MCP server with tools to check accessibility issues such as color contrast and interface compliance concerns. It helps agents review UI accessibility.",
@@ -367,7 +367,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:MCDM:2Z5rwBAHc5pecYuyKWG55bZuVhCz9DB1",
+      "resourceDid": "did:oan:M6dMn:2Z5rwBAHc5pecYuyKWG55bZuVhCz9DB1",
       "resourceType": "mcp_server",
       "name": "accounting-ai-mcp",
       "description": "An MCP server for accounting workflows. It can help agents generate invoices, handle accounting-oriented data, and support finance operations through tool calls.",
@@ -386,7 +386,7 @@
       ]
     },
     {
-      "resourceDid": "did:oan:MCDM:FWjA94Xm7ZYNneiTZYHQkHoXEm9HzDZJ",
+      "resourceDid": "did:oan:M6dMn:FWjA94Xm7ZYNneiTZYHQkHoXEm9HzDZJ",
       "resourceType": "mcp_server",
       "name": "agent-audit-logger-mcp",
       "description": "An MCP server for hash-chained and HMAC-signed audit logging of agent activity. It supports monitoring, security review, and traceability for agent runtime operations.",
@@ -411,210 +411,210 @@
       "language": "zh",
       "description": "Chinese natural-language task without resourceType should find the published PDF skill example.",
       "query": {"query": "我需要一个可以帮助智能体处理 PDF 文档、提取内容并做文档分析的技能", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:SKDM:2ftSobUkN63sLPjXPuc4rNAB8zBJF6qR"]
+      "expectedDids": ["did:oan:K7mQ9:2ftSobUkN63sLPjXPuc4rNAB8zBJF6qR"]
     },
     {
       "id": "en-pdf-skill-explicit-type",
       "language": "en",
       "description": "English task with explicit Skill filter should find the PDF skill example.",
       "query": {"query": "skill for PDF document analysis extraction and source inspection", "resourceType": "skill", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:SKDM:2ftSobUkN63sLPjXPuc4rNAB8zBJF6qR"]
+      "expectedDids": ["did:oan:K7mQ9:2ftSobUkN63sLPjXPuc4rNAB8zBJF6qR"]
     },
     {
       "id": "mixed-local-file-mcp",
       "language": "mixed",
       "description": "Mixed Chinese-English query should find the Everything File Search MCP Server.",
       "query": {"query": "需要一个 MCP server，在 Windows 上通过 Everything 做 local file search", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:MCDM:uj16KsUwTMX7GmBSN6EA7Qi3XMN4P1Pj"]
+      "expectedDids": ["did:oan:M6dMn:uj16KsUwTMX7GmBSN6EA7Qi3XMN4P1Pj"]
     },
     {
       "id": "en-weather-tool-api",
       "language": "en",
       "description": "English task with Tool/API filter should find the Open-Meteo Forecast API.",
       "query": {"query": "public HTTPS API for weather forecast current temperature wind speed JSON", "resourceType": "tool_api", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:TLDM:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP"]
+      "expectedDids": ["did:oan:T6dMn:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP"]
     },
     {
       "id": "cn-weather-cross-type",
       "language": "zh",
       "description": "Chinese weather query without resourceType should still find the Tool/API weather resource.",
       "query": {"query": "我想查询未来几天的天气预报、降雨概率和风速数据", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:TLDM:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP"]
+      "expectedDids": ["did:oan:T6dMn:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP"]
     },
     {
       "id": "cn-agent-service-a2a",
       "language": "zh",
       "description": "Chinese task should find the A2A Hello World agent service.",
       "query": {"query": "找一个可以用于连通性测试的 A2A 智能体服务，最好有 agent card", "resourceType": "agent_service", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:AGDM:PAmHQoT9Dup4q4GZfgAAv9YaHHgsZgm2"]
+      "expectedDids": ["did:oan:A6dMn:PAmHQoT9Dup4q4GZfgAAv9YaHHgsZgm2"]
     },
     {
       "id": "cn-contract-without-type-cross-type-ranking",
       "language": "zh",
       "description": "Chinese contract-risk query without resourceType should rank the contract Skill ahead of unrelated resources.",
       "query": {"query": "帮我审查一份中文合同里的付款风险、违约责任和终止条款", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:SKDM:F5xLwQj7N9pR2sT6uV8yZ3aBcDeFgHkM"]
+      "expectedDids": ["did:oan:K7mQ9:F5xLwQj7N9pR2sT6uV8yZ3aBcDeFgHkM"]
     },
     {
       "id": "mixed-inference-mcp-without-type",
       "language": "mixed",
       "description": "Mixed inference query without resourceType should find the inference MCP server.",
       "query": {"query": "找一个 MCP 服务给 agent workflow 调用模型 inference tool", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:MCDM:ZSZQ6eLz2huG1JcnJVKeTXyK26x4EbKH"]
+      "expectedDids": ["did:oan:M6dMn:ZSZQ6eLz2huG1JcnJVKeTXyK26x4EbKH"]
     },
     {
       "id": "en-deep-research-skill",
       "language": "en",
       "description": "OpenClaw deep research skill should be found from an English task description.",
       "query": {"query": "autonomous deep research skill that searches the web and synthesizes findings", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:SKDM:Z8K2Tu83rDLEb4276tCo9nswGhQDVcsK"]
+      "expectedDids": ["did:oan:K7mQ9:Z8K2Tu83rDLEb4276tCo9nswGhQDVcsK"]
     },
     {
       "id": "cn-deep-research-skill",
       "language": "zh",
       "description": "Chinese deep research task should find the OpenClaw deep research skill.",
       "query": {"query": "我需要一个能自动做深度研究、搜索网页并汇总资料的技能", "resourceType": "skill", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:SKDM:Z8K2Tu83rDLEb4276tCo9nswGhQDVcsK"]
+      "expectedDids": ["did:oan:K7mQ9:Z8K2Tu83rDLEb4276tCo9nswGhQDVcsK"]
     },
     {
       "id": "cn-mac-android-transfer",
       "language": "zh",
       "description": "Chinese file-transfer query should find Android transfer skill.",
       "query": {"query": "把 Mac 上的文档传到 Android 手机，并且校验文件完整性", "resourceType": "skill", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:SKDM:R7EXKAeWLWLyr6kgjRc5u8fWWG7qzaKV"]
+      "expectedDids": ["did:oan:K7mQ9:R7EXKAeWLWLyr6kgjRc5u8fWWG7qzaKV"]
     },
     {
       "id": "en-macos-cleanup",
       "language": "en",
       "description": "English cleanup query should find mac-clean-skill.",
       "query": {"query": "clean macOS caches trash and old downloads to free disk space", "resourceType": "skill", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:SKDM:4xtWevJt1GVaz26wqebbFnT6hR1B9vDt"]
+      "expectedDids": ["did:oan:K7mQ9:4xtWevJt1GVaz26wqebbFnT6hR1B9vDt"]
     },
     {
       "id": "cn-apple-media-control",
       "language": "zh",
       "description": "Chinese media-control query should find Apple media skill.",
       "query": {"query": "控制 HomePod 或 AirPlay 设备播放音乐的智能体技能", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:SKDM:Mkf36r141zn9i3ZJj5VEvTNPmRCToJsu"]
+      "expectedDids": ["did:oan:K7mQ9:Mkf36r141zn9i3ZJj5VEvTNPmRCToJsu"]
     },
     {
       "id": "mixed-agent-orchestration",
       "language": "mixed",
       "description": "Mixed orchestration query should find agent-orchestrator.",
       "query": {"query": "需要 meta-agent skill 来 orchestrate 多个智能体完成复杂任务", "resourceType": "skill", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:SKDM:wxZ5A8VmrbpxozMqFoQCfMtKvYgSbRxf"]
+      "expectedDids": ["did:oan:K7mQ9:wxZ5A8VmrbpxozMqFoQCfMtKvYgSbRxf"]
     },
     {
       "id": "en-adobe-automation",
       "language": "en",
       "description": "English Adobe automation query should find adobe-automator.",
       "query": {"query": "automate Adobe applications using ExtendScript for design export workflows", "resourceType": "skill", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:SKDM:kaRvFd12MKEu7XTD2s8K8799aB7ucJxs"]
+      "expectedDids": ["did:oan:K7mQ9:kaRvFd12MKEu7XTD2s8K8799aB7ucJxs"]
     },
     {
       "id": "cn-prompt-security",
       "language": "zh",
       "description": "Chinese prompt-injection query should find adversarial prompting skill.",
       "query": {"query": "检查智能体提示词是否存在 prompt injection 风险并给出改进建议", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:SKDM:GEYvqVnz4efCtmi3uQxVxjtQZDM2JBnM"]
+      "expectedDids": ["did:oan:K7mQ9:GEYvqVnz4efCtmi3uQxVxjtQZDM2JBnM"]
     },
     {
       "id": "en-canva-design",
       "language": "en",
       "description": "English design query should find Canva skill.",
       "query": {"query": "create and export Canva presentation or social media design assets", "resourceType": "skill", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:SKDM:CRUfCGmtEdwciRGn35DBCMs6cpj2wtw8"]
+      "expectedDids": ["did:oan:K7mQ9:CRUfCGmtEdwciRGn35DBCMs6cpj2wtw8"]
     },
     {
       "id": "cn-polymarket-mcp",
       "language": "zh",
       "description": "Chinese prediction-market query should find Polymarket MCP.",
       "query": {"query": "读取 Polymarket 预测市场数据，给金融智能体做分析", "resourceType": "mcp_server", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:MCDM:KE3PB1tqGeKPR5hQwugpWCbnd6W6mwZr"]
+      "expectedDids": ["did:oan:M6dMn:KE3PB1tqGeKPR5hQwugpWCbnd6W6mwZr"]
     },
     {
       "id": "en-agent-memory-mcp",
       "language": "en",
       "description": "English memory query should find a-mem.",
       "query": {"query": "MCP server for long term agent memory semantic search and knowledge graph recall", "resourceType": "mcp_server", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:MCDM:Bi51ktqFNNEJ9YawX51hZCcHK7LJ9XeK"]
+      "expectedDids": ["did:oan:M6dMn:Bi51ktqFNNEJ9YawX51hZCcHK7LJ9XeK"]
     },
     {
       "id": "cn-agent-memory-mcp-cross-type",
       "language": "zh",
       "description": "Chinese memory query without resourceType should find a-mem.",
       "query": {"query": "给智能体提供长期记忆、语义检索和知识图谱能力", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:MCDM:Bi51ktqFNNEJ9YawX51hZCcHK7LJ9XeK"]
+      "expectedDids": ["did:oan:M6dMn:Bi51ktqFNNEJ9YawX51hZCcHK7LJ9XeK"]
     },
     {
       "id": "mixed-a2a-governance-mcp",
       "language": "mixed",
       "description": "Mixed A2A governance query should find governance bridge MCP.",
       "query": {"query": "A2A 治理 bridge MCP，verify agent compliance and trust registry", "resourceType": "mcp_server", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:MCDM:oGrGywmcDXyFa9eZ3ivUnwwVEqJc48mb"]
+      "expectedDids": ["did:oan:M6dMn:oGrGywmcDXyFa9eZ3ivUnwwVEqJc48mb"]
     },
     {
       "id": "en-statistics-data-mcp",
       "language": "en",
       "description": "English statistics query should find ABS MCP.",
       "query": {"query": "query Australian Bureau of Statistics data through an MCP server", "resourceType": "mcp_server", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:MCDM:gZGz8GqWcyZFGJMqQiLMHSqXZirJNdFr"]
+      "expectedDids": ["did:oan:M6dMn:gZGz8GqWcyZFGJMqQiLMHSqXZirJNdFr"]
     },
     {
       "id": "cn-accessibility-mcp",
       "language": "zh",
       "description": "Chinese accessibility query should find accessibility MCP.",
       "query": {"query": "检查网页界面的无障碍问题、颜色对比度和可访问性", "resourceType": "mcp_server", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:MCDM:PMZPGBQ1UJr6jLBiNU1z1miiTHXfDLGk"]
+      "expectedDids": ["did:oan:M6dMn:PMZPGBQ1UJr6jLBiNU1z1miiTHXfDLGk"]
     },
     {
       "id": "en-accounting-invoice-mcp",
       "language": "en",
       "description": "English accounting query should find accounting MCP.",
       "query": {"query": "generate invoices and run accounting workflow operations through MCP", "resourceType": "mcp_server", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:MCDM:2Z5rwBAHc5pecYuyKWG55bZuVhCz9DB1"]
+      "expectedDids": ["did:oan:M6dMn:2Z5rwBAHc5pecYuyKWG55bZuVhCz9DB1"]
     },
     {
       "id": "cn-agent-audit-log-mcp",
       "language": "zh",
       "description": "Chinese audit-log query should find agent audit logger MCP.",
       "query": {"query": "记录智能体运行过程的审计日志，最好支持签名或哈希链", "resourceType": "mcp_server", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:MCDM:FWjA94Xm7ZYNneiTZYHQkHoXEm9HzDZJ"]
+      "expectedDids": ["did:oan:M6dMn:FWjA94Xm7ZYNneiTZYHQkHoXEm9HzDZJ"]
     },
     {
       "id": "explicit-tag-contract",
       "language": "en",
       "description": "Explicit capability tag should act as a hard filter and find the contract review skill.",
       "query": {"query": "risk list for a commercial contract", "capabilityTags": ["legal.contract.review"], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:SKDM:F5xLwQj7N9pR2sT6uV8yZ3aBcDeFgHkM"]
+      "expectedDids": ["did:oan:K7mQ9:F5xLwQj7N9pR2sT6uV8yZ3aBcDeFgHkM"]
     },
     {
       "id": "explicit-tag-weather",
       "language": "en",
       "description": "Explicit weather tag should find weather resource.",
       "query": {"query": "rainfall forecast", "capabilityTags": ["weather.forecast"], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:TLDM:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP"]
+      "expectedDids": ["did:oan:T6dMn:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP"]
     },
     {
       "id": "explicit-tag-mcp-memory",
       "language": "en",
       "description": "Explicit memory tag should find a-mem.",
       "query": {"query": "agent semantic memory", "capabilityTags": ["knowledge.graph"], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:MCDM:Bi51ktqFNNEJ9YawX51hZCcHK7LJ9XeK"]
+      "expectedDids": ["did:oan:M6dMn:Bi51ktqFNNEJ9YawX51hZCcHK7LJ9XeK"]
     },
     {
       "id": "did-exact-weather-tool-api",
       "language": "identifier",
       "description": "Exact DID lookup should return the target Tool/API through the same query entrypoint.",
-      "query": {"query": "did:oan:TLDM:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:TLDM:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP"]
+      "query": {"query": "did:oan:T6dMn:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP", "capabilityTags": [], "versionMode": "latest", "limit": 10},
+      "expectedDids": ["did:oan:T6dMn:yZTNUGtZNu78fwPMe8N8ZLqAEwtVohFP"]
     },
     {
       "id": "did-exact-audit-mcp",
       "language": "identifier",
       "description": "Exact DID lookup should return the audit logger MCP resource.",
-      "query": {"query": "did:oan:MCDM:FWjA94Xm7ZYNneiTZYHQkHoXEm9HzDZJ", "capabilityTags": [], "versionMode": "latest", "limit": 10},
-      "expectedDids": ["did:oan:MCDM:FWjA94Xm7ZYNneiTZYHQkHoXEm9HzDZJ"]
+      "query": {"query": "did:oan:M6dMn:FWjA94Xm7ZYNneiTZYHQkHoXEm9HzDZJ", "capabilityTags": [], "versionMode": "latest", "limit": 10},
+      "expectedDids": ["did:oan:M6dMn:FWjA94Xm7ZYNneiTZYHQkHoXEm9HzDZJ"]
     }
   ]
 }
