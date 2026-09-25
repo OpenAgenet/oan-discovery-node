@@ -6886,7 +6886,16 @@ fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<Resour
         assertion_method: vec![format!("{did}#key-1")],
         capability_invocation: vec![format!("{did}#key-1")],
         service: vec![service.clone()],
-        proof: None,
+        proof: Some(oan_core::DataIntegrityProof {
+            proof_type: "Ed25519Signature2020".to_owned(),
+            creator: format!("{did}#key-1"),
+            created: Utc::now(),
+            proof_purpose: "assertionMethod".to_owned(),
+            proof_value: "evaluation-fixture".to_owned(),
+            crypto_suite: Some(CryptoSuite::Ed25519Sha256),
+            hash_algorithm: Some("sha256".to_owned()),
+            verification_method: Some(format!("{did}#key-1")),
+        }),
         oan_metadata: Some(OanMetadata {
             subject_type: match seed.resource_type {
                 ResourceType::AgentService => SubjectType::AgentService,
@@ -8218,7 +8227,16 @@ mod tests {
         {
             resource_did.to_owned()
         } else {
-            let suffix = "7YpQm9Kx2VnRb6Ts3WfHa4Cd5Ej8LgNz";
+            const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+            let digest = sha256_hex(resource_did.as_bytes());
+            let suffix = digest
+                .as_bytes()
+                .iter()
+                .cycle()
+                .take(32)
+                .enumerate()
+                .map(|(index, byte)| BASE58[(*byte as usize + index) % BASE58.len()] as char)
+                .collect::<String>();
             format!("did:oan:K7mQ9:{suffix}")
         };
         package.resource_did = normalized_did.clone();
@@ -8229,6 +8247,11 @@ mod tests {
         package.did_document.verification_method[0].controller = normalized_did.clone();
         package.did_document.authentication = vec![format!("{normalized_did}#key-1")];
         package.did_document.assertion_method = vec![format!("{normalized_did}#key-1")];
+        package.did_document.capability_invocation = vec![format!("{normalized_did}#key-1")];
+        if let Some(proof) = package.did_document.proof.as_mut() {
+            proof.creator = format!("{normalized_did}#key-1");
+            proof.verification_method = Some(format!("{normalized_did}#key-1"));
+        }
         package.metadata.resource_did = normalized_did.clone();
         package.metadata.subject_did = Some(normalized_did);
         refresh_hashes(&mut package);
