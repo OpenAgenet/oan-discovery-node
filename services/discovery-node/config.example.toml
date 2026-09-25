@@ -14,7 +14,6 @@ allowed_origins = [
 [node]
 name = "Discovery Node"
 role = "discovery"
-did_semantic_code = "AGDS"
 
 [upstream]
 root_endpoint = "http://localhost:8000"
