@@ -1494,6 +1494,12 @@ async fn initialize_discovery_postgres(postgres: &PostgresJsonStore) -> Result<(
             ALTER TABLE {DISCOVERY_SYNC_STATE_TABLE} ADD COLUMN IF NOT EXISTS state_value JSONB;
             ALTER TABLE {DISCOVERY_SYNC_STATE_TABLE} ADD COLUMN IF NOT EXISTS sync_key TEXT;
             ALTER TABLE {DISCOVERY_SYNC_STATE_TABLE} ADD COLUMN IF NOT EXISTS sync_value JSONB;
+            ALTER TABLE {DISCOVERY_SYNC_STATE_TABLE}
+                ALTER COLUMN state_value TYPE JSONB
+                USING state_value::jsonb;
+            ALTER TABLE {DISCOVERY_SYNC_STATE_TABLE}
+                ALTER COLUMN sync_value TYPE JSONB
+                USING sync_value::jsonb;
             UPDATE {DISCOVERY_SYNC_STATE_TABLE}
             SET state_key = COALESCE(state_key, sync_key),
                 state_value = COALESCE(state_value, sync_value),
@@ -1592,6 +1598,8 @@ async fn initialize_semantic_postgres(
                 embedding_version TEXT NOT NULL DEFAULT '1',
                 updated_at TIMESTAMPTZ NOT NULL
             );
+            ALTER TABLE {DISCOVERY_SEMANTIC_INDEX_TABLE}
+                ADD COLUMN IF NOT EXISTS tag_text TEXT NOT NULL DEFAULT '';
             CREATE INDEX IF NOT EXISTS idx_discovery_semantic_cursor
             ON {DISCOVERY_SEMANTIC_INDEX_TABLE}(cursor DESC);
             CREATE INDEX IF NOT EXISTS idx_discovery_semantic_type_state
