@@ -8541,6 +8541,20 @@ mod tests {
     }
 
     #[test]
+    fn resource_package_validation_rejects_did_document_type_mismatch() {
+        let mut package = sample_resource_package();
+        let metadata = package.did_document.oan_metadata.as_mut().unwrap();
+        metadata.subject_type = SubjectType::McpServer;
+        metadata.resource_type = ResourceType::McpServer;
+        refresh_hashes(&mut package);
+
+        assert_eq!(
+            validate_resource_package_for_index(&package).unwrap_err(),
+            "resource type mismatch"
+        );
+    }
+
+    #[test]
     fn resource_package_validation_rejects_missing_authorized_domains() {
         let mut package = sample_resource_package();
         set_package_authorized_domains(&mut package, vec![]);
