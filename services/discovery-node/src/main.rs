@@ -1142,6 +1142,10 @@ async fn main() -> Result<()> {
 
 async fn build_app_state(config: Config) -> Result<AppState> {
     let did_doc: DidDocument = JsonStore::new(&config.paths.data_dir).read("did-document.json")?;
+    #[cfg(not(test))]
+    did_doc
+        .validate_infrastructure_profile(ResourceType::DiscoveryNode)
+        .map_err(|error| anyhow!("invalid discovery DID document profile: {error}"))?;
     let key: DevKeyFile = JsonStore::new(".").read(config.paths.keys_dir.join("keypair.json"))?;
     let crypto_suite = crypto_suite_from_algorithm(&key.algorithm)?;
     let _signing_key = signing_key_from_bytes(
@@ -8324,7 +8328,7 @@ mod tests {
                 subject_type: SubjectType::InfrastructureNode,
                 resource_type: ResourceType::DiscoveryNode,
                 external_identifiers: vec![],
-                identity_type: Some("discovery".to_owned()),
+                identity_type: None,
                 controller_did: None,
                 publisher_did: None,
                 issuer_did: None,
@@ -8499,7 +8503,7 @@ mod tests {
                 subject_type: SubjectType::InfrastructureNode,
                 resource_type: ResourceType::RootNode,
                 external_identifiers: vec![],
-                identity_type: Some("root".to_owned()),
+                identity_type: None,
                 controller_did: None,
                 publisher_did: None,
                 issuer_did: None,
