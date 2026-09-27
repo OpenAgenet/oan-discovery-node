@@ -10253,7 +10253,10 @@ mod tests {
             });
         let changed_projection = discovery_package_projection(&changed);
         let changed_document = search_document_from_package(42, &changed, &changed_projection);
-        assert_eq!(baseline.semantic_source_hash, changed_document.semantic_source_hash);
+        assert_eq!(
+            baseline.semantic_source_hash,
+            changed_document.semantic_source_hash
+        );
         assert_eq!(baseline.search_text, changed_document.search_text);
     }
 
