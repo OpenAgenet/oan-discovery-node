@@ -10235,6 +10235,29 @@ mod tests {
     }
 
     #[test]
+    fn non_semantic_did_fields_do_not_change_embedding_source() {
+        let package = sample_resource_package();
+        let projection = discovery_package_projection(&package);
+        let baseline = search_document_from_package(42, &package, &projection);
+        let mut changed = package.clone();
+        changed.did_document.proof.as_mut().unwrap().proof_value = "changed-proof".to_owned();
+        changed
+            .did_document
+            .oan_metadata
+            .as_mut()
+            .unwrap()
+            .external_identifiers
+            .push(oan_core::ExternalIdentifier {
+                id: "urn:example:changed".to_owned(),
+                resolution_service_endpoint: Some("https://resolver.example".to_owned()),
+            });
+        let changed_projection = discovery_package_projection(&changed);
+        let changed_document = search_document_from_package(42, &changed, &changed_projection);
+        assert_eq!(baseline.semantic_source_hash, changed_document.semantic_source_hash);
+        assert_eq!(baseline.search_text, changed_document.search_text);
+    }
+
+    #[test]
     fn semantic_filter_defaults_keep_explicit_metadata_as_hard_constraints() {
         let config = SemanticSearchConfig::default();
 
