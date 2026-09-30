@@ -6898,15 +6898,12 @@ fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<Resour
         assertion_method: vec![format!("{did}#key-1")],
         capability_invocation: vec![format!("{did}#key-1")],
         service: vec![service.clone()],
-        proof: Some(oan_core::DataIntegrityProof {
+        proof: Some(oan_core::ProfileV2DataIntegrityProof {
             proof_type: "Ed25519Signature2020".to_owned(),
-            creator: format!("{did}#key-1"),
             created: Utc::now(),
             proof_purpose: "assertionMethod".to_owned(),
-            proof_value: "evaluation-fixture".to_owned(),
-            crypto_suite: Some(CryptoSuite::Ed25519Sha256),
-            hash_algorithm: Some("sha256".to_owned()),
-            verification_method: Some(format!("{did}#key-1")),
+            proof_value: "z4HnYnN6MCvEhMhcjUKpVYCaqXyP714jVJXJVTJprdb9wdTGsY5dkRWPf2wXNJuRWA1XiMZFPizD9PGEM3ZV4vNYF".to_owned(),
+            verification_method: format!("{did}#key-1"),
         }),
         oan_metadata: Some(OanMetadata {
             subject_type: match seed.resource_type {
@@ -8073,7 +8070,7 @@ mod tests {
     };
     use chrono::Utc;
     use oan_core::{
-        CryptoSuite, DataIntegrityProof, DidController, OanMetadata, ProtocolBinding,
+        CryptoSuite, DataIntegrityProof, DidController, OanMetadata, ProfileV2DataIntegrityProof, ProtocolBinding,
         ResourceDescription, ServiceEndpoint, VerificationMethod,
     };
     use oan_crypto::{public_key_jwk, public_key_multibase, VerifyingKey};
@@ -8116,15 +8113,12 @@ mod tests {
                 server_type: None,
                 port: None,
             }],
-            proof: Some(DataIntegrityProof {
+            proof: Some(ProfileV2DataIntegrityProof {
                 proof_type: "Ed25519Signature2020".to_owned(),
-                creator: format!("{did}#key-1"),
                 created: Utc::now(),
                 proof_purpose: "assertionMethod".to_owned(),
-                proof_value: "fixture".to_owned(),
-                crypto_suite: Some(CryptoSuite::Ed25519Sha256),
-                hash_algorithm: Some("sha256".to_owned()),
-                verification_method: Some(format!("{did}#key-1")),
+                proof_value: "z4HnYnN6MCvEhMhcjUKpVYCaqXyP714jVJXJVTJprdb9wdTGsY5dkRWPf2wXNJuRWA1XiMZFPizD9PGEM3ZV4vNYF".to_owned(),
+                verification_method: format!("{did}#key-1"),
             }),
             oan_metadata: Some(OanMetadata {
                 subject_type: SubjectType::Skill,
@@ -8489,15 +8483,12 @@ mod tests {
             assertion_method: vec![key_id.clone()],
             capability_invocation: vec![key_id.clone()],
             service: vec![],
-            proof: Some(DataIntegrityProof {
+            proof: Some(ProfileV2DataIntegrityProof {
                 proof_type: "Ed25519Signature2020".to_owned(),
-                creator: key_id.clone(),
                 created: Utc::now(),
                 proof_purpose: "assertionMethod".to_owned(),
-                proof_value: "fixture".to_owned(),
-                crypto_suite: Some(CryptoSuite::Ed25519Sha256),
-                hash_algorithm: Some("sha256".to_owned()),
-                verification_method: Some(key_id),
+                proof_value: "z4HnYnN6MCvEhMhcjUKpVYCaqXyP714jVJXJVTJprdb9wdTGsY5dkRWPf2wXNJuRWA1XiMZFPizD9PGEM3ZV4vNYF".to_owned(),
+                verification_method: key_id,
             }),
             oan_metadata: Some(OanMetadata {
                 subject_type: SubjectType::InfrastructureNode,
