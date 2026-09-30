@@ -8676,6 +8676,22 @@ mod tests {
     }
 
     #[test]
+    fn resource_package_validation_rejects_tampered_did_document_proof() {
+        let mut package = sample_resource_package();
+        package
+            .did_document
+            .proof
+            .as_mut()
+            .unwrap()
+            .proof_value = "z1111111111111111111111111111111111111111111111111111111111111111"
+            .to_owned();
+        assert_eq!(
+            validate_resource_package_for_index(&package).unwrap_err(),
+            "did_document_proof_invalid"
+        );
+    }
+
+    #[test]
     fn resource_package_validation_rejects_did_document_type_mismatch() {
         let mut package = sample_resource_package();
         let metadata = package.did_document.oan_metadata.as_mut().unwrap();
