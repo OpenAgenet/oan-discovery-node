@@ -8264,6 +8264,10 @@ mod tests {
 
     fn resign_did_document(document: &mut DidDocument) {
         let did = document.id.clone();
+        let method_controller = match document.controller.as_ref() {
+            Some(oan_core::DidController::Did(value)) => value.clone(),
+            _ => did.clone(),
+        };
         let key = generate_ed25519_keypair();
         let signing_key = SigningKey::Ed25519 {
             suite: CryptoSuite::Ed25519Sha256,
@@ -8277,7 +8281,7 @@ mod tests {
         document.verification_method = vec![VerificationMethod {
             id: key_id.clone(),
             method_type: "Ed25519VerificationKey2020".to_owned(),
-            controller: did.clone(),
+            controller: method_controller,
             crypto_suite: Some(CryptoSuite::Ed25519Sha256),
             public_key_format: Some("multibase".to_owned()),
             public_key_multibase: Some(public_key_multibase(&verifying_key)),
@@ -8398,8 +8402,8 @@ mod tests {
                 id: key_id.clone(),
                 method_type: "Ed25519VerificationKey2020".to_owned(),
                 controller: did.clone(),
-                crypto_suite: Some(CryptoSuite::Ed25519Sha256),
-                public_key_format: Some("multibase".to_owned()),
+                crypto_suite: None,
+                public_key_format: None,
                 public_key_multibase: Some(public_key_multibase(&verifying_key)),
                 public_key_jwk: Some(public_key_jwk(&verifying_key)),
             }],
@@ -8588,8 +8592,8 @@ mod tests {
                 id: key_id.clone(),
                 method_type: "Ed25519VerificationKey2020".to_owned(),
                 controller: did.to_owned(),
-                crypto_suite: Some(CryptoSuite::Ed25519Sha256),
-                public_key_format: Some("multibase".to_owned()),
+            crypto_suite: None,
+            public_key_format: None,
                 public_key_multibase: Some(public_key_multibase(&verifying_key)),
                 public_key_jwk: Some(public_key_jwk(&verifying_key)),
             }],
@@ -8645,6 +8649,23 @@ mod tests {
     #[test]
     fn resource_package_validation_accepts_complete_oan_resource() {
         let package = sample_resource_package();
+        assert!(validate_resource_package_for_index(&package).is_ok());
+    }
+
+    #[test]
+    fn resource_package_validation_accepts_external_controller_resource() {
+        let mut package = sample_resource_package();
+        let controller = "did:oan:HmxwA:t3yMumZwExeFcRy3QHk8KnWMTNkgFj26".to_owned();
+        package.did_document.controller = Some(oan_core::DidController::Did(controller.clone()));
+        package
+            .did_document
+            .oan_metadata
+            .as_mut()
+            .unwrap()
+            .controller_did = Some(controller);
+        resign_did_document(&mut package.did_document);
+        refresh_hashes(&mut package);
+
         assert!(validate_resource_package_for_index(&package).is_ok());
     }
 
