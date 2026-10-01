@@ -14,15 +14,15 @@ use axum::{
 use chrono::{Datelike, Utc};
 use futures::TryStreamExt;
 use jieba_rs::Jieba;
-use oan_credentials::OanIdentity;
 use oan_core::{
     CryptoSuite, DidDocument, ImplementationLink, OanMetadata, ProtocolBinding,
     ResourceDescription, ResourceType, ServiceEndpoint, SubjectType, VerificationMethod,
 };
+use oan_credentials::OanIdentity;
 use oan_crypto::{
     did_document_signature_input, generate_ed25519_keypair, hash_json_with_suite, public_key_jwk,
-    public_key_multibase, sha256_hex, sign_bytes_multibase,
-    verify_did_document_proof, SigningKey, VerifyingKey,
+    public_key_multibase, sha256_hex, sign_bytes_multibase, verify_did_document_proof, SigningKey,
+    VerifyingKey,
 };
 use oan_package::{
     hash_resource_metadata_with_suite, ResourceMetadata, ResourcePackage, ResourcePackageClaims,
@@ -1132,7 +1132,8 @@ async fn main() -> Result<()> {
 async fn build_app_state(config: Config) -> Result<AppState> {
     let identity: OanIdentity = JsonStore::new(".").read(&config.paths.identity_file)?;
     identity
-        .validate()
+        .validate_data_integrity()
+        .await
         .map_err(|err| anyhow!("invalid OAN Identity: {err}"))?;
     let did_doc: DidDocument = identity.did_document.clone();
     #[cfg(not(test))]
@@ -8189,8 +8190,8 @@ mod tests {
                 extra: Default::default(),
             }),
         };
-        let input = did_document_signature_input(&did_document, CryptoSuite::Ed25519Sha256)
-            .unwrap();
+        let input =
+            did_document_signature_input(&did_document, CryptoSuite::Ed25519Sha256).unwrap();
         did_document.proof = Some(DataIntegrityProof {
             proof_type: "Ed25519Signature2020".to_owned(),
             creator: String::new(),
@@ -8288,8 +8289,7 @@ mod tests {
         document.assertion_method = vec![key_id.clone()];
         document.capability_invocation = vec![key_id.clone()];
         document.proof = None;
-        let input =
-            did_document_signature_input(document, CryptoSuite::Ed25519Sha256).unwrap();
+        let input = did_document_signature_input(document, CryptoSuite::Ed25519Sha256).unwrap();
         document.proof = Some(DataIntegrityProof {
             proof_type: "Ed25519Signature2020".to_owned(),
             creator: String::new(),
@@ -8663,13 +8663,8 @@ mod tests {
     #[test]
     fn resource_package_validation_rejects_tampered_did_document_proof() {
         let mut package = sample_resource_package();
-        package
-            .did_document
-            .proof
-            .as_mut()
-            .unwrap()
-            .proof_value = "z1111111111111111111111111111111111111111111111111111111111111111"
-            .to_owned();
+        package.did_document.proof.as_mut().unwrap().proof_value =
+            "z1111111111111111111111111111111111111111111111111111111111111111".to_owned();
         assert_eq!(
             validate_resource_package_for_index(&package).unwrap_err(),
             "did_document_proof_invalid"
