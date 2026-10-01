@@ -1140,8 +1140,6 @@ async fn build_app_state(config: Config) -> Result<AppState> {
     did_doc
         .validate_infrastructure_profile(ResourceType::DiscoveryNode)
         .map_err(|error| anyhow!("invalid discovery DID document profile: {error}"))?;
-    verify_did_document_proof(&did_doc)
-        .map_err(|error| anyhow!("invalid discovery DID document proof: {error}"))?;
     // Public projection used by existing discovery paths; identity.json remains authoritative.
     JsonStore::new(&config.paths.data_dir).write("did-document.json", &did_doc)?;
     let mut semantic = SemanticRuntimeState::disabled("semantic_disabled", &config.semantic_search);
