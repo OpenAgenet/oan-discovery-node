@@ -23,7 +23,7 @@ cdn_endpoint = "http://localhost:8003"
 data_dir = "../../data/discovery"
 index_dir = "../../data/discovery/index"
 database_url = "postgres://postgres:postgres@127.0.0.1:5432/oan_discovery"
-keys_dir = "../../data/discovery/keys"
+identity_file = "../../data/discovery/identity.json"
 
 [stats_report]
 enabled = false

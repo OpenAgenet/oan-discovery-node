@@ -11,17 +11,17 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{Datelike, Utc};
 use futures::TryStreamExt;
 use jieba_rs::Jieba;
+use oan_credentials::OanIdentity;
 use oan_core::{
     CryptoSuite, DidDocument, ImplementationLink, OanMetadata, ProtocolBinding,
     ResourceDescription, ResourceType, ServiceEndpoint, SubjectType, VerificationMethod,
 };
 use oan_crypto::{
     did_document_signature_input, generate_ed25519_keypair, hash_json_with_suite, public_key_jwk,
-    public_key_multibase, sha256_hex, sign_bytes_multibase, signing_key_from_bytes,
+    public_key_multibase, sha256_hex, sign_bytes_multibase,
     verify_did_document_proof, SigningKey, VerifyingKey,
 };
 use oan_package::{
@@ -235,9 +235,14 @@ struct UpstreamConfig {
 struct PathConfig {
     data_dir: PathBuf,
     index_dir: PathBuf,
-    keys_dir: PathBuf,
+    #[serde(default = "default_identity_file")]
+    identity_file: PathBuf,
     #[serde(default)]
     database_url: Option<String>,
+}
+
+fn default_identity_file() -> PathBuf {
+    PathBuf::from("../../data/discovery/identity.json")
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -466,18 +471,6 @@ fn default_semantic_capability_tags_filter() -> String {
 
 fn default_semantic_protocol_filter() -> String {
     "hard".to_owned()
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct DevKeyFile {
-    algorithm: String,
-    #[serde(rename = "privateKeyJwk")]
-    private_key_jwk: PrivateKeyJwk,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct PrivateKeyJwk {
-    d: String,
 }
 
 #[derive(Clone)]
@@ -919,14 +912,6 @@ struct ApiError {
     message: String,
 }
 
-fn crypto_suite_from_algorithm(value: &str) -> Result<CryptoSuite> {
-    match value {
-        "Ed25519" => Ok(CryptoSuite::Ed25519Sha256),
-        "SM2" => Ok(CryptoSuite::Sm2Sm3),
-        other => Err(anyhow::anyhow!("unsupported_algorithm: {other}")),
-    }
-}
-
 impl ApiError {
     fn internal(error: anyhow::Error) -> Self {
         Self {
@@ -1145,19 +1130,19 @@ async fn main() -> Result<()> {
 }
 
 async fn build_app_state(config: Config) -> Result<AppState> {
-    let did_doc: DidDocument = JsonStore::new(&config.paths.data_dir).read("did-document.json")?;
+    let identity: OanIdentity = JsonStore::new(".").read(&config.paths.identity_file)?;
+    identity
+        .validate()
+        .map_err(|err| anyhow!("invalid OAN Identity: {err}"))?;
+    let did_doc: DidDocument = identity.did_document.clone();
     #[cfg(not(test))]
     did_doc
         .validate_infrastructure_profile(ResourceType::DiscoveryNode)
         .map_err(|error| anyhow!("invalid discovery DID document profile: {error}"))?;
     verify_did_document_proof(&did_doc)
         .map_err(|error| anyhow!("invalid discovery DID document proof: {error}"))?;
-    let key: DevKeyFile = JsonStore::new(".").read(config.paths.keys_dir.join("keypair.json"))?;
-    let crypto_suite = crypto_suite_from_algorithm(&key.algorithm)?;
-    let _signing_key = signing_key_from_bytes(
-        crypto_suite,
-        &URL_SAFE_NO_PAD.decode(key.private_key_jwk.d)?,
-    )?;
+    // Public projection used by existing discovery paths; identity.json remains authoritative.
+    JsonStore::new(&config.paths.data_dir).write("did-document.json", &did_doc)?;
     let mut semantic = SemanticRuntimeState::disabled("semantic_disabled", &config.semantic_search);
     let (sqlite, postgres) = match config.paths.database_url.as_deref() {
         Some(url) if !url.is_empty() => {
@@ -1196,7 +1181,7 @@ async fn build_app_state(config: Config) -> Result<AppState> {
         data: JsonStore::new(&config.paths.data_dir),
         index: JsonStore::new(&config.paths.index_dir),
         config: config.clone(),
-        did: did_doc.id,
+        did: identity.did,
         sqlite,
         postgres,
         semantic,
@@ -1216,7 +1201,7 @@ fn load_config(path: String) -> Result<Config> {
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     config.paths.data_dir = resolve_relative(base, &config.paths.data_dir);
     config.paths.index_dir = resolve_relative(base, &config.paths.index_dir);
-    config.paths.keys_dir = resolve_relative(base, &config.paths.keys_dir);
+    config.paths.identity_file = resolve_relative(base, &config.paths.identity_file);
     if let Some(database_url) = config.paths.database_url.as_mut() {
         *database_url = resolve_database_url(base, database_url);
     }
@@ -8373,7 +8358,7 @@ mod tests {
                 paths: PathConfig {
                     data_dir: dir.join("data"),
                     index_dir: dir.join("index"),
-                    keys_dir: dir.join("keys"),
+                    identity_file: dir.join("identity.json"),
                     database_url: None,
                 },
             },
