@@ -989,8 +989,15 @@ fn semantic_rebuild_skip_prefix(stage: Option<SemanticRebuildStage>) -> String {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?
+        .block_on(async { tokio::spawn(async_main()).await? })
+}
+
+async fn async_main() -> Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args
         .first()
@@ -6940,8 +6947,9 @@ fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<Resour
     };
     let proof_input = did_document_signature_input(&did_document, CryptoSuite::Ed25519Sha256)?;
     did_document.proof = Some(oan_core::DataIntegrityProof {
+        context: None,
         proof_type: "Ed25519Signature2020".to_owned(),
-        creator: String::new(),
+        creator: key_id.clone(),
         created: Utc::now(),
         proof_purpose: "assertionMethod".to_owned(),
         proof_value: sign_bytes_multibase(&signing_key, &proof_input)?,
@@ -8191,8 +8199,9 @@ mod tests {
         let input =
             did_document_signature_input(&did_document, CryptoSuite::Ed25519Sha256).unwrap();
         did_document.proof = Some(DataIntegrityProof {
+            context: None,
             proof_type: "Ed25519Signature2020".to_owned(),
-            creator: String::new(),
+            creator: key_id.clone(),
             created: Utc::now(),
             proof_purpose: "assertionMethod".to_owned(),
             proof_value: sign_bytes_multibase(
@@ -8293,8 +8302,9 @@ mod tests {
         document.proof = None;
         let input = did_document_signature_input(document, CryptoSuite::Ed25519Sha256).unwrap();
         document.proof = Some(DataIntegrityProof {
+            context: None,
             proof_type: "Ed25519Signature2020".to_owned(),
-            creator: String::new(),
+            creator: key_id.clone(),
             created: Utc::now(),
             proof_purpose: "assertionMethod".to_owned(),
             proof_value: sign_bytes_multibase(&signing_key, &input).unwrap(),
@@ -8437,8 +8447,9 @@ mod tests {
         };
         let input = did_document_signature_input(&document, CryptoSuite::Ed25519Sha256).unwrap();
         document.proof = Some(DataIntegrityProof {
+            context: None,
             proof_type: "Ed25519Signature2020".to_owned(),
-            creator: String::new(),
+            creator: key_id.clone(),
             created: Utc::now(),
             proof_purpose: "assertionMethod".to_owned(),
             proof_value: sign_bytes_multibase(
@@ -8592,8 +8603,8 @@ mod tests {
                 id: key_id.clone(),
                 method_type: "Ed25519VerificationKey2020".to_owned(),
                 controller: did.to_owned(),
-            crypto_suite: None,
-            public_key_format: None,
+                crypto_suite: None,
+                public_key_format: None,
                 public_key_multibase: Some(public_key_multibase(&verifying_key)),
                 public_key_jwk: Some(public_key_jwk(&verifying_key)),
             }],
@@ -8627,8 +8638,9 @@ mod tests {
         };
         let input = did_document_signature_input(&document, CryptoSuite::Ed25519Sha256).unwrap();
         document.proof = Some(DataIntegrityProof {
+            context: None,
             proof_type: "Ed25519Signature2020".to_owned(),
-            creator: String::new(),
+            creator: key_id.clone(),
             created: Utc::now(),
             proof_purpose: "assertionMethod".to_owned(),
             proof_value: sign_bytes_multibase(
