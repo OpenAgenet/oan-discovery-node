@@ -21,8 +21,8 @@ use oan_core::{
 use oan_credentials::OanIdentity;
 use oan_crypto::{
     did_document_signature_input, generate_ed25519_keypair, hash_json_with_suite, public_key_jwk,
-    public_key_multibase, sha256_hex, sign_bytes_multibase, verify_did_document_proof, SigningKey,
-    VerifyingKey,
+    public_key_multibase, sha256_hex, sign_bytes_multibase, verify_did_document_proof,
+    verify_did_document_proof_standard_blocking, SigningKey, VerifyingKey,
 };
 use oan_package::{
     hash_resource_metadata_with_suite, ResourceMetadata, ResourcePackage, ResourcePackageClaims,
@@ -7982,8 +7982,10 @@ fn validate_resource_package_for_index(
         .did_document
         .validate_oan_resource()
         .map_err(|err| err.to_string())?;
-    verify_did_document_proof(&package.did_document)
-        .map_err(|_| "did_document_proof_invalid".to_owned())?;
+    if verify_did_document_proof_standard_blocking(&package.did_document).is_err() {
+        verify_did_document_proof(&package.did_document)
+            .map_err(|_| "did_document_proof_invalid".to_owned())?;
+    }
     package
         .verify_did_document_hash()
         .and_then(|_| package.verify_metadata_hash())
