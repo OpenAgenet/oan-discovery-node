@@ -2746,10 +2746,6 @@ async fn sync_resources_from_cdn_items(
         if item.publication_cursor > target_cursor {
             break;
         }
-        if cursor > 0 && item.publication_cursor > cursor + 1 {
-            blocked_cursor.get_or_insert(cursor + 1);
-            break;
-        }
         fetched_count += 1;
         cursor = cursor.max(item.publication_cursor);
         let fetched = if let Some(package) = batch_packages.get(&item.resource_did) {
@@ -10791,7 +10787,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_resources_from_authorized_summary_does_not_advance_over_cursor_gap() {
+    async fn sync_resources_from_authorized_summary_allows_authorized_cursor_gap() {
         let dir = tempdir().unwrap();
         let first =
             sample_resource_package_with_did("did:oan:K7mQ9:55555555555555555555555555555555");
@@ -10849,13 +10845,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(gap_response.0["syncedResourceCount"], 0);
-        assert_eq!(gap_response.0["blockedCursor"], 2);
-        assert_eq!(gap_response.0["cursorLag"], 2);
-        assert_eq!(read_sync_cursor(&state).await.unwrap(), 1);
+        assert_eq!(gap_response.0["syncedResourceCount"], 1);
+        assert_eq!(gap_response.0["blockedCursor"], Value::Null);
+        assert_eq!(gap_response.0["cursorLag"], 0);
+        assert_eq!(read_sync_cursor(&state).await.unwrap(), 3);
         let indexed = read_indexed_resource_packages(&state).await.unwrap();
-        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed.len(), 2);
         assert_eq!(indexed[0].resource_did, first.resource_did);
+        assert_eq!(indexed[1].resource_did, third.resource_did);
     }
 
     #[tokio::test]
