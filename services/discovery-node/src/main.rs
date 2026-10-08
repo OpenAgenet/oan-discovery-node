@@ -73,6 +73,7 @@ const LATE_PACKAGE_MAX_ITEMS: usize = 100;
 const DISCOVERY_DEFAULT_PAGE_SIZE: u32 = 100;
 const DISCOVERY_MAX_PAGE_SIZE: u32 = 500;
 const DISCOVERY_SEMANTIC_REBUILD_PAGE_SIZE: u32 = 100;
+const DISCOVERY_SEMANTIC_RESOURCE_BATCH_SIZE: usize = 40;
 const DISCOVERY_INDEX_PACKAGE_BYTES: usize = 8 * 1024 * 1024;
 const DISCOVERY_INDEX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 #[cfg(not(test))]
@@ -457,7 +458,7 @@ fn default_semantic_embedding_timeout_ms() -> u64 {
 }
 
 fn default_semantic_embedding_batch_size() -> usize {
-    32
+    8
 }
 
 fn default_semantic_embedding_max_input_chars() -> usize {
@@ -1708,6 +1709,7 @@ fn semantic_status_json(
         "dimension": diagnostics.dimension,
         "timeoutMs": state.config.semantic_search.embedding.timeout_ms,
         "batchSize": state.config.semantic_search.embedding.batch_size,
+        "embeddingRequestBatchSize": state.config.semantic_search.embedding.batch_size,
         "filters": {
             "resourceType": state.config.semantic_search.filters.resource_type,
             "capabilityTags": state.config.semantic_search.filters.capability_tags,
@@ -2087,67 +2089,94 @@ async fn embed_semantic_text(
     client: &reqwest::Client,
     text: &str,
 ) -> Result<Vec<f32>> {
-    let text = bounded_embedding_text(text, config.embedding.max_input_chars);
+    embed_semantic_texts(config, client, &[text.to_owned()])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("embedding_vector_missing"))
+}
+
+async fn embed_semantic_texts(
+    config: &SemanticSearchConfig,
+    client: &reqwest::Client,
+    texts: &[String],
+) -> Result<Vec<Vec<f32>>> {
+    if texts.is_empty() {
+        return Ok(vec![]);
+    }
+    let texts = texts
+        .iter()
+        .map(|text| bounded_embedding_text(text, config.embedding.max_input_chars))
+        .collect::<Vec<_>>();
     match EmbeddingProviderKind::from_config(&config.embedding)? {
-        EmbeddingProviderKind::DeterministicLocal => {
-            Ok(deterministic_embedding(&text, config.embedding.dimension))
-        }
+        EmbeddingProviderKind::DeterministicLocal => Ok(texts
+            .iter()
+            .map(|text| deterministic_embedding(text, config.embedding.dimension))
+            .collect()),
         EmbeddingProviderKind::HttpEmbedding => {
             let endpoint = config
                 .embedding
                 .endpoint
                 .as_deref()
                 .ok_or_else(|| anyhow!("http_embedding_endpoint_required"))?;
-            let response = client
-                .post(endpoint)
-                .timeout(StdDuration::from_millis(config.embedding.timeout_ms))
-                .json(&HttpEmbeddingRequest {
-                    model: config.embedding.model_name.clone(),
-                    input: vec![text],
-                })
-                .send()
-                .await?
-                .error_for_status()?
-                .json::<HttpEmbeddingResponse>()
-                .await?;
-            if response.model != config.embedding.model_name {
-                return Err(anyhow!("http_embedding_model_mismatch:{}", response.model));
-            }
-            if response.dimension != config.embedding.dimension {
-                return Err(anyhow!(
-                    "http_embedding_dimension_mismatch:{}",
-                    response.dimension
-                ));
-            }
-            if config.embedding.strict_model_version {
-                let expected = config
-                    .embedding
-                    .model_version
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("strict_model_version_requires_modelVersion"))?;
-                if response.embedding_version != expected {
+            let mut vectors = Vec::with_capacity(texts.len());
+            for chunk in texts.chunks(config.embedding.batch_size.max(1)) {
+                let response = client
+                    .post(endpoint)
+                    .timeout(StdDuration::from_millis(config.embedding.timeout_ms))
+                    .json(&HttpEmbeddingRequest {
+                        model: config.embedding.model_name.clone(),
+                        input: chunk.to_vec(),
+                    })
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json::<HttpEmbeddingResponse>()
+                    .await?;
+                if response.model != config.embedding.model_name {
+                    return Err(anyhow!("http_embedding_model_mismatch:{}", response.model));
+                }
+                if response.dimension != config.embedding.dimension {
                     return Err(anyhow!(
-                        "http_embedding_version_mismatch:{}",
-                        response.embedding_version
+                        "http_embedding_dimension_mismatch:{}",
+                        response.dimension
                     ));
                 }
-            }
-            if let Some(expected) = config.embedding.dtype.as_deref() {
-                let actual = response
-                    .dtype
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("http_embedding_response_dtype_missing"))?;
-                if actual != expected {
-                    return Err(anyhow!("http_embedding_response_dtype_mismatch:{actual}"));
+                if config.embedding.strict_model_version {
+                    let expected = config
+                        .embedding
+                        .model_version
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("strict_model_version_requires_modelVersion"))?;
+                    if response.embedding_version != expected {
+                        return Err(anyhow!(
+                            "http_embedding_version_mismatch:{}",
+                            response.embedding_version
+                        ));
+                    }
+                }
+                if let Some(expected) = config.embedding.dtype.as_deref() {
+                    let actual = response
+                        .dtype
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("http_embedding_response_dtype_missing"))?;
+                    if actual != expected {
+                        return Err(anyhow!("http_embedding_response_dtype_mismatch:{actual}"));
+                    }
+                }
+                if response.vectors.len() != chunk.len() {
+                    return Err(anyhow!(
+                        "http_embedding_vectors_count_mismatch:{}:{}",
+                        response.vectors.len(),
+                        chunk.len()
+                    ));
+                }
+                for vector in response.vectors {
+                    validate_embedding_vector(&vector, config.embedding.dimension)?;
+                    vectors.push(normalize_vector(vector));
                 }
             }
-            let vector = response
-                .vectors
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow!("http_embedding_vector_missing"))?;
-            validate_embedding_vector(&vector, config.embedding.dimension)?;
-            Ok(normalize_vector(vector))
+            Ok(vectors)
         }
     }
 }
@@ -4876,34 +4905,32 @@ async fn upsert_pgvector_semantic_index_batch(
         .iter()
         .map(|item| search_document_from_package(item.cursor, item.package, &item.projection))
         .collect::<Vec<_>>();
-    let existing_hashes = read_semantic_source_hashes(state, &docs).await?;
 
-    for chunk in docs.chunks(100) {
-        let changed = chunk
-            .iter()
-            .filter(|doc| {
-                existing_hashes
-                    .get(&doc.resource_did)
-                    .map(|hash| hash != &doc.semantic_source_hash)
-                    .unwrap_or(true)
-            })
-            .collect::<Vec<_>>();
-        if changed.is_empty() {
-            continue;
-        }
-        let mut embedded = Vec::new();
-        for doc in changed {
-            let embedding = embed_semantic_text(
-                &state.config.semantic_search,
-                &state.client,
-                &semantic_document_text(doc),
-            )
-            .await?;
-            embedded.push((doc, embedding));
-        }
+    if stage.includes_context() {
+        let existing_hashes = read_semantic_source_hashes(state, &docs).await?;
+        for chunk in docs.chunks(100) {
+            let changed = chunk
+                .iter()
+                .filter(|doc| {
+                    existing_hashes
+                        .get(&doc.resource_did)
+                        .map(|hash| hash != &doc.semantic_source_hash)
+                        .unwrap_or(true)
+                })
+                .collect::<Vec<_>>();
+            if changed.is_empty() {
+                continue;
+            }
+            let texts = changed
+                .iter()
+                .map(|doc| semantic_document_text(doc))
+                .collect::<Vec<_>>();
+            let embeddings =
+                embed_semantic_texts(&state.config.semantic_search, &state.client, &texts).await?;
+            let embedded = changed.into_iter().zip(embeddings).collect::<Vec<_>>();
 
-        let mut builder = QueryBuilder::<Postgres>::new(format!(
-            r#"
+            let mut builder = QueryBuilder::<Postgres>::new(format!(
+                r#"
             INSERT INTO {DISCOVERY_SEMANTIC_INDEX_TABLE}(
                 resource_did, cursor, package_version, did_document_hash, metadata_hash,
                 package_hash, resource_type, lifecycle_state, capability_tags, protocols,
@@ -4912,33 +4939,33 @@ async fn upsert_pgvector_semantic_index_batch(
                 semantic_source_hash, embedding, embedding_model, embedding_version, updated_at
             )
             "#
-        ));
-        builder.push_values(embedded, |mut row, (doc, embedding)| {
-            row.push_bind(&doc.resource_did)
-                .push_bind(doc.cursor)
-                .push_bind(&doc.package_version)
-                .push_bind(&doc.did_document_hash)
-                .push_bind(&doc.metadata_hash)
-                .push_bind(&doc.package_hash)
-                .push_bind(&doc.resource_type)
-                .push_bind(&doc.lifecycle_state)
-                .push_bind(&doc.capability_tags)
-                .push_bind(&doc.protocols)
-                .push_bind(&doc.service_endpoints)
-                .push_bind(&doc.name)
-                .push_bind(&doc.description)
-                .push_bind(serde_json::to_value(&doc.examples).unwrap_or_else(|_| json!([])))
-                .push_bind(serde_json::to_value(&doc.use_cases).unwrap_or_else(|_| json!([])))
-                .push_bind(&doc.tag_text)
-                .push_bind(&doc.search_text)
-                .push_bind(&doc.semantic_source_hash)
-                .push(format!("{}::vector", pgvector_literal(&embedding)))
-                .push_bind(&state.semantic.embedding_model)
-                .push_bind(&state.semantic.embedding_version)
-                .push_bind(updated_at);
-        });
-        builder.push(
-            r#"
+            ));
+            builder.push_values(embedded, |mut row, (doc, embedding)| {
+                row.push_bind(&doc.resource_did)
+                    .push_bind(doc.cursor)
+                    .push_bind(&doc.package_version)
+                    .push_bind(&doc.did_document_hash)
+                    .push_bind(&doc.metadata_hash)
+                    .push_bind(&doc.package_hash)
+                    .push_bind(&doc.resource_type)
+                    .push_bind(&doc.lifecycle_state)
+                    .push_bind(&doc.capability_tags)
+                    .push_bind(&doc.protocols)
+                    .push_bind(&doc.service_endpoints)
+                    .push_bind(&doc.name)
+                    .push_bind(&doc.description)
+                    .push_bind(serde_json::to_value(&doc.examples).unwrap_or_else(|_| json!([])))
+                    .push_bind(serde_json::to_value(&doc.use_cases).unwrap_or_else(|_| json!([])))
+                    .push_bind(&doc.tag_text)
+                    .push_bind(&doc.search_text)
+                    .push_bind(&doc.semantic_source_hash)
+                    .push(format!("{}::vector", pgvector_literal(&embedding)))
+                    .push_bind(&state.semantic.embedding_model)
+                    .push_bind(&state.semantic.embedding_version)
+                    .push_bind(updated_at);
+            });
+            builder.push(
+                r#"
             ON CONFLICT(resource_did)
             DO UPDATE SET
                 cursor = excluded.cursor,
@@ -4963,8 +4990,9 @@ async fn upsert_pgvector_semantic_index_batch(
                 embedding_version = excluded.embedding_version,
                 updated_at = excluded.updated_at
             "#,
-        );
-        builder.build().execute(postgres.pool()).await?;
+            );
+            builder.build().execute(postgres.pool()).await?;
+        }
     }
     if stage.includes_intent() {
         upsert_pgvector_intent_index_batch(state, &docs).await?;
@@ -4984,34 +5012,37 @@ async fn upsert_pgvector_intent_index_batch(
     }
     let updated_at = Utc::now();
     for chunk in docs.chunks(50) {
+        let mut intents = Vec::new();
+        for doc in chunk {
+            for intent in semantic_intent_documents(doc) {
+                intents.push(intent);
+            }
+        }
+        if intents.is_empty() {
+            continue;
+        }
+        let texts = intents
+            .iter()
+            .map(|intent| intent.intent_text.clone())
+            .collect::<Vec<_>>();
+        let embeddings =
+            embed_semantic_texts(&state.config.semantic_search, &state.client, &texts).await?;
+        let embedded = intents.into_iter().zip(embeddings).collect::<Vec<_>>();
         let resource_dids = chunk
             .iter()
             .map(|doc| doc.resource_did.clone())
             .collect::<Vec<_>>();
+
+        let mut transaction = postgres.pool().begin().await?;
         sqlx::query(&format!(
             "DELETE FROM {DISCOVERY_INTENT_INDEX_TABLE} WHERE resource_did = ANY($1) AND embedding_model = $2 AND embedding_version = $3"
         ))
         .bind(&resource_dids)
         .bind(&state.semantic.embedding_model)
         .bind(&state.semantic.embedding_version)
-        .execute(postgres.pool())
+        .execute(&mut *transaction)
         .await?;
 
-        let mut embedded = Vec::new();
-        for doc in chunk {
-            for intent in semantic_intent_documents(doc) {
-                let embedding = embed_semantic_text(
-                    &state.config.semantic_search,
-                    &state.client,
-                    &intent.intent_text,
-                )
-                .await?;
-                embedded.push((intent, embedding));
-            }
-        }
-        if embedded.is_empty() {
-            continue;
-        }
         let mut builder = QueryBuilder::<Postgres>::new(format!(
             r#"
             INSERT INTO {DISCOVERY_INTENT_INDEX_TABLE}(
@@ -5047,7 +5078,8 @@ async fn upsert_pgvector_intent_index_batch(
                 updated_at = excluded.updated_at
             "#,
         );
-        builder.build().execute(postgres.pool()).await?;
+        builder.build().execute(&mut *transaction).await?;
+        transaction.commit().await?;
     }
     Ok(())
 }
@@ -5378,7 +5410,7 @@ async fn rebuild_semantic_indexes(
     let mut last_resource_did = progress
         .as_ref()
         .and_then(|record| record.last_resource_did.clone());
-    let mut batch_size = state.config.semantic_search.embedding.batch_size.max(1);
+    let resource_batch_size = DISCOVERY_SEMANTIC_RESOURCE_BATCH_SIZE;
     if cursor > 0 {
         skipped_packages = 0;
         retries = 0;
@@ -5388,7 +5420,7 @@ async fn rebuild_semantic_indexes(
         clear_semantic_rebuild_skip_records(state, Some(stage)).await?;
     }
     loop {
-        let page_limit = batch_size
+        let page_limit = resource_batch_size
             .min(DISCOVERY_SEMANTIC_REBUILD_PAGE_SIZE as usize)
             .max(1) as u32;
         let page = read_visible_indexed_resource_page(
@@ -5401,7 +5433,7 @@ async fn rebuild_semantic_indexes(
         if page.items.is_empty() {
             break;
         }
-        match process_semantic_rebuild_batch(state, stage, &page.items, batch_size).await {
+        match process_semantic_rebuild_batch(state, stage, &page.items, resource_batch_size).await {
             Ok(done) => {
                 processed += done;
                 last_cursor = page.items.last().map(|(cursor, _)| *cursor);
@@ -5417,28 +5449,13 @@ async fn rebuild_semantic_indexes(
                     total,
                     skipped_packages,
                     retries,
-                    batch_size,
+                    resource_batch_size,
                 )
                 .await?;
             }
             Err(err) => {
-                if is_embedding_timeout_error(&err) && batch_size > 1 {
+                if is_embedding_timeout_error(&err) {
                     retries += 1;
-                    batch_size = (batch_size / 2).max(1);
-                    store_semantic_rebuild_progress(
-                        state,
-                        stage,
-                        "throttled",
-                        last_cursor,
-                        last_resource_did.clone(),
-                        processed,
-                        total,
-                        skipped_packages,
-                        retries,
-                        batch_size,
-                    )
-                    .await?;
-                    continue;
                 }
                 processed += process_semantic_rebuild_skip_batch(
                     state,
@@ -5461,7 +5478,7 @@ async fn rebuild_semantic_indexes(
                         total,
                         skipped_packages,
                         retries,
-                        batch_size,
+                        resource_batch_size,
                     )
                     .await?;
                 }
@@ -5486,7 +5503,7 @@ async fn rebuild_semantic_indexes(
         total,
         skipped_packages,
         retries,
-        batch_size,
+        resource_batch_size,
     )
     .await?;
     Ok(SemanticRebuildReport {
@@ -9670,6 +9687,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_intent_stage_rebuilds_intents_when_context_hash_is_unchanged() {
+        let dir = tempdir().unwrap();
+        let Some(state) = app_state_with_semantic_postgres(dir.path()).await else {
+            eprintln!(
+                "skipping pgvector intent stage test; set OAN_DISCOVERY_SEMANTIC_TEST_DATABASE_URL"
+            );
+            return;
+        };
+        upsert_indexed_resource_package(&state, 1, &sample_resource_package())
+            .await
+            .unwrap();
+        assert!(
+            count_intent_indexed_rows(&state)
+                .await
+                .unwrap()
+                .unwrap_or_default()
+                > 0
+        );
+
+        sqlx::query(&format!("DELETE FROM {DISCOVERY_INTENT_INDEX_TABLE}"))
+            .execute(state.postgres.as_ref().unwrap().pool())
+            .await
+            .unwrap();
+        assert_eq!(count_intent_indexed_rows(&state).await.unwrap(), Some(0));
+
+        let report = rebuild_semantic_indexes(&state, false, SemanticRebuildStage::Intent)
+            .await
+            .unwrap();
+
+        assert_eq!(report.phase, "completed");
+        assert!(
+            count_intent_indexed_rows(&state)
+                .await
+                .unwrap()
+                .unwrap_or_default()
+                > 0,
+            "intent rebuild must not be skipped just because context hash is unchanged"
+        );
+    }
+
+    #[tokio::test]
     async fn postgres_pgvector_semantic_query_ranks_verified_packages_when_available() {
         let dir = tempdir().unwrap();
         let Some(state) = app_state_with_semantic_postgres(dir.path()).await else {
@@ -10573,6 +10631,122 @@ mod tests {
             .unwrap();
         assert_eq!(vector.len(), 4);
         assert!((vector[0] - 1.0).abs() < 0.0001);
+    }
+
+    #[tokio::test]
+    async fn http_embedding_provider_batches_texts_without_reordering() {
+        let observed_batches = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let batches = observed_batches.clone();
+        let app = Router::new().route(
+            "/embed",
+            post(move |Json(body): Json<Value>| {
+                let batches = batches.clone();
+                async move {
+                    let input = body["input"].as_array().unwrap();
+                    batches.lock().unwrap().push(input.len());
+                    let vectors = input
+                        .iter()
+                        .map(|value| {
+                            let index = value
+                                .as_str()
+                                .and_then(|text| text.rsplit_once(' '))
+                                .and_then(|(_, index)| index.parse::<usize>().ok())
+                                .unwrap();
+                            let mut vector = vec![0.0, 0.0, 0.0, 0.0];
+                            vector[index % 4] = 1.0;
+                            vector
+                        })
+                        .collect::<Vec<_>>();
+                    Json(json!({
+                        "model": "gte-multilingual-base",
+                        "embeddingVersion": "test-revision",
+                        "dtype": "q8",
+                        "dimension": 4,
+                        "vectors": vectors
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = SemanticSearchConfig {
+            embedding: SemanticEmbeddingConfig {
+                provider: "http-embedding".to_owned(),
+                endpoint: Some(format!("http://{addr}/embed")),
+                model_name: "gte-multilingual-base".to_owned(),
+                model_version: Some("test-revision".to_owned()),
+                strict_model_version: true,
+                dtype: Some("q8".to_owned()),
+                dimension: 4,
+                batch_size: 8,
+                ..SemanticEmbeddingConfig::default()
+            },
+            ..SemanticSearchConfig::default()
+        };
+        let texts = (0..17)
+            .map(|index| format!("text {index}"))
+            .collect::<Vec<_>>();
+        let vectors = embed_semantic_texts(&config, &reqwest::Client::new(), &texts)
+            .await
+            .unwrap();
+
+        assert_eq!(vectors.len(), 17);
+        assert_eq!(*observed_batches.lock().unwrap(), vec![8, 8, 1]);
+        assert!(vectors.iter().all(|vector| vector.len() == 4));
+        assert_eq!(vectors[0], vec![1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(vectors[1], vec![0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(vectors[8], vec![1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(vectors[16], vec![1.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn http_embedding_provider_rejects_vector_count_mismatch() {
+        let app = Router::new().route(
+            "/embed",
+            post(|Json(_body): Json<Value>| async move {
+                Json(json!({
+                    "model": "gte-multilingual-base",
+                    "embeddingVersion": "test-revision",
+                    "dtype": "q8",
+                    "dimension": 4,
+                    "vectors": [[1.0, 0.0, 0.0, 0.0]]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = SemanticSearchConfig {
+            embedding: SemanticEmbeddingConfig {
+                provider: "http-embedding".to_owned(),
+                endpoint: Some(format!("http://{addr}/embed")),
+                model_name: "gte-multilingual-base".to_owned(),
+                model_version: Some("test-revision".to_owned()),
+                strict_model_version: true,
+                dtype: Some("q8".to_owned()),
+                dimension: 4,
+                batch_size: 8,
+                ..SemanticEmbeddingConfig::default()
+            },
+            ..SemanticSearchConfig::default()
+        };
+
+        let error = embed_semantic_texts(
+            &config,
+            &reqwest::Client::new(),
+            &["first".to_owned(), "second".to_owned()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("http_embedding_vectors_count_mismatch:1:2"));
     }
 
     #[tokio::test]

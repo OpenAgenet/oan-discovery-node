@@ -46,7 +46,9 @@ provider = "deterministic-local"
 modelName = "oan-deterministic-local-v1"
 dimension = 64
 timeoutMs = 2000
-batchSize = 32
+# Maximum number of texts sent in a single embedding-service request.
+# This is intentionally independent from Root -> Discovery distribution batches.
+batchSize = 8
 maxInputChars = 6000
 
 # Production semantic discovery can use services/embedding-service as an

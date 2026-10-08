@@ -6,7 +6,7 @@ import type { EmbeddingServiceConfig } from "../src/config.js";
 
 let server: Server | undefined;
 
-function testConfig(): EmbeddingServiceConfig {
+function testConfig(batchSize = 2): EmbeddingServiceConfig {
   return {
     host: "127.0.0.1",
     port: 0,
@@ -16,13 +16,13 @@ function testConfig(): EmbeddingServiceConfig {
     embeddingVersion: "deterministic-v1",
     dimension: 16,
     maxInputChars: 20,
-    batchSize: 2,
+    batchSize,
     dtype: "q8",
   };
 }
 
-async function startServer(): Promise<string> {
-  server = createEmbeddingServer(testConfig());
+async function startServer(config = testConfig()): Promise<string> {
+  server = createEmbeddingServer(config);
   await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   if (!address || typeof address === "string") {
@@ -75,6 +75,43 @@ describe("embedding HTTP service", () => {
     assert.equal(body.dimension, 16);
     assert.equal(body.vectors.length, 1);
     assert.equal(body.vectors[0].length, 16);
+  });
+
+  it("keeps batched embedding output count and order for batch sizes 8 and 16", async () => {
+    for (const batchSize of [8, 16]) {
+      const baseUrl = await startServer(testConfig(batchSize));
+      const input = Array.from({ length: batchSize }, (_, index) => `query-${index}`);
+      const response = await fetch(`${baseUrl}/embed`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "oan-deterministic-local-v1",
+          input,
+        }),
+      });
+      const body = await response.json();
+
+      assert.equal(response.status, 200);
+      assert.equal(body.vectors.length, batchSize);
+      assert.notDeepEqual(body.vectors[0], body.vectors[1]);
+      const reversed = await fetch(`${baseUrl}/embed`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "oan-deterministic-local-v1",
+          input: [...input].reverse(),
+        }),
+      });
+      const reversedBody = await reversed.json();
+      assert.equal(reversed.status, 200);
+      assert.deepEqual(reversedBody.vectors[batchSize - 1], body.vectors[0]);
+      assert.deepEqual(reversedBody.vectors[0], body.vectors[batchSize - 1]);
+
+      await new Promise<void>((resolve, reject) =>
+        server!.close((error) => (error ? reject(error) : resolve())),
+      );
+      server = undefined;
+    }
   });
 
   it("rejects model mismatches and oversized batches", async () => {
