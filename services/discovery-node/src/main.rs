@@ -2799,8 +2799,6 @@ async fn sync_resources_from_cdn_items(
             continue;
         }
         if !authorized_domains_cover(&discovery_domains, &package.metadata.authorized_domains) {
-            rejected.push(rejected_package_with_reason(&item, "unauthorized_domains"));
-            blocked_cursor.get_or_insert(item.publication_cursor);
             continue;
         }
         if let Err(reason) =
@@ -11140,7 +11138,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_resources_from_authorized_summary_rejects_domains_outside_discovery_grant() {
+    async fn sync_resources_from_authorized_summary_skips_domains_outside_discovery_grant() {
         let dir = tempdir().unwrap();
         let mut package = sample_resource_package();
         set_package_authorized_domains(&mut package, vec!["finance".to_owned()]);
@@ -11185,17 +11183,102 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.0["syncedResourceCount"], 0);
-        assert_eq!(response.0["rejectedCount"], 1);
-        assert_eq!(response.0["rejected"][0]["reason"], "unauthorized_domains");
-        assert!(response.0["rejected"][0].get("status").is_none());
+        assert_eq!(response.0["rejectedCount"], 0);
+        assert_eq!(response.0["toCursor"], 9);
+        assert_eq!(response.0["blockedCursor"], Value::Null);
+        assert_eq!(response.0["cursorLag"], 0);
+        assert_eq!(response.0["rejected"].as_array().unwrap().len(), 0);
         let rejected = read_rejected_packages(&state).await.unwrap();
-        assert_eq!(rejected.len(), 1);
-        assert_eq!(rejected[0]["reason"], "unauthorized_domains");
-        assert!(rejected[0].get("status").is_none());
+        assert_eq!(rejected.len(), 0);
         assert_eq!(
             read_indexed_resource_packages(&state).await.unwrap().len(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn sync_resources_from_authorized_summary_continues_after_unauthorized_domain_skip() {
+        let dir = tempdir().unwrap();
+        let mut skipped =
+            sample_resource_package_with_did("did:oan:K7mQ9:11111111111111111111111111111111");
+        set_package_authorized_domains(&mut skipped, vec!["finance".to_owned()]);
+        let mut accepted =
+            sample_resource_package_with_did("did:oan:K7mQ9:22222222222222222222222222222222");
+        set_package_authorized_domains(&mut accepted, vec!["legal".to_owned()]);
+        let app = Router::new().route(
+            "/cdn/resources/{*did}",
+            get({
+                let skipped = skipped.clone();
+                let accepted = accepted.clone();
+                move |AxumPath(did): AxumPath<String>| {
+                    let skipped = skipped.clone();
+                    let accepted = accepted.clone();
+                    async move {
+                        let did = did.trim_start_matches('/');
+                        if did == skipped.resource_did {
+                            Json(skipped).into_response()
+                        } else if did == accepted.resource_did {
+                            Json(accepted).into_response()
+                        } else {
+                            (StatusCode::NOT_FOUND, Json(json!({"error": "missing"})))
+                                .into_response()
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut state = app_state_with_sqlite(dir.path()).await;
+        write_discovery_document(&state, vec!["legal".to_owned()]);
+        state.config.upstream.cdn_endpoint = Some(format!("http://{addr}"));
+        let response = sync_resources_from_authorized_summary(
+            State(state.clone()),
+            Json(DiscoverySyncRequest {
+                max_publications: Some(10),
+                cursor_hint: Some(10),
+                items: vec![
+                    DiscoveryNotificationItem {
+                        resource_did: skipped.resource_did.clone(),
+                        package_version: skipped.package_version.clone(),
+                        publication_cursor: 9,
+                        package_hash: skipped.package_hash.clone(),
+                        metadata_hash: skipped.metadata_hash.clone(),
+                        did_document_hash: skipped.did_document_hash.clone(),
+                        resource_type: Some("skill".to_owned()),
+                        capability_tags: skipped.metadata.capability_tags.clone(),
+                        authorized_domains: skipped.metadata.authorized_domains.clone(),
+                    },
+                    DiscoveryNotificationItem {
+                        resource_did: accepted.resource_did.clone(),
+                        package_version: accepted.package_version.clone(),
+                        publication_cursor: 10,
+                        package_hash: accepted.package_hash.clone(),
+                        metadata_hash: accepted.metadata_hash.clone(),
+                        did_document_hash: accepted.did_document_hash.clone(),
+                        resource_type: Some("skill".to_owned()),
+                        capability_tags: accepted.metadata.capability_tags.clone(),
+                        authorized_domains: accepted.metadata.authorized_domains.clone(),
+                    },
+                ],
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0["syncedResourceCount"], 1);
+        assert_eq!(response.0["rejectedCount"], 0);
+        assert_eq!(response.0["toCursor"], 10);
+        assert_eq!(response.0["blockedCursor"], Value::Null);
+        assert_eq!(response.0["cursorLag"], 0);
+        assert_eq!(read_rejected_packages(&state).await.unwrap().len(), 0);
+        let indexed = read_indexed_resource_packages(&state).await.unwrap();
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].resource_did, accepted.resource_did);
     }
 
     #[tokio::test]
