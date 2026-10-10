@@ -1073,7 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "discovery-node"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2915,7 +2915,7 @@ dependencies = [
 
 [[package]]
 name = "oan-bulletin"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "chrono",
  "ed25519-dalek",
@@ -2928,7 +2928,7 @@ dependencies = [
 
 [[package]]
 name = "oan-core"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "base64 0.22.1",
  "bs58 0.5.1",
@@ -2946,7 +2946,7 @@ dependencies = [
 
 [[package]]
 name = "oan-credentials"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "bs58 0.5.1",
  "chrono",
@@ -2960,7 +2960,7 @@ dependencies = [
 
 [[package]]
 name = "oan-crypto"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "base64 0.22.1",
  "bs58 0.5.1",
@@ -2991,7 +2991,7 @@ dependencies = [
 
 [[package]]
 name = "oan-did-oan"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "bs58 0.5.1",
  "rand 0.8.6",
@@ -3003,7 +3003,7 @@ dependencies = [
 
 [[package]]
 name = "oan-package"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "chrono",
  "oan-core",
@@ -3015,7 +3015,7 @@ dependencies = [
 
 [[package]]
 name = "oan-protocol"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "chrono",
  "oan-core",
@@ -3027,7 +3027,7 @@ dependencies = [
 
 [[package]]
 name = "oan-semantic-recommender"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "oan-core",
  "regex",
@@ -3038,7 +3038,7 @@ dependencies = [
 
 [[package]]
 name = "oan-storage"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "futures-util",
  "serde",
